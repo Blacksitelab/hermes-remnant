@@ -1,11 +1,13 @@
 """Memory search: BM25 keyword, cosine semantic, RRF hybrid fusion, and graph.
 
 Strategies:
-- ``keyword`` (default): BM25 over the FTS5 index. The Phase 1 behavior.
+- ``keyword``: BM25 over the FTS5 index. The Phase 1 behavior.
 - ``semantic``: cosine similarity over stored embeddings. To avoid scanning
   the whole database, embeddings are only loaded for a BM25-pre-filtered
   candidate set (capped by ``SEMANTIC_CANDIDATE_LIMIT``).
-- ``auto``: Reciprocal Rank Fusion (RRF, k=60) of BM25 + semantic.
+- ``auto`` (default): Reciprocal Rank Fusion (RRF, k=60) of BM25 + semantic.
+  Results below ``min_semantic_score`` (top semantic score) are dropped to
+  avoid returning keyword-dominated noise for semantically unrelated queries.
 - ``graph``: pure-SQLite entity-graph traversal. Extracts entity names from
   the query, resolves them, BFS over `relations` up to N hops, and returns
   linked active memories. No LLM, no embeddings.
@@ -112,7 +114,7 @@ def search(
     agent_id: str | None = None,
     visibility: str | None = None,
     limit: int | None = None,
-    strategy: str = "keyword",
+    strategy: str | None = None,
     embedder: Embedder | None = None,
     profile_scope: list[str] | None = None,
 ) -> list[dict[str, Any]]:
@@ -120,17 +122,23 @@ def search(
 
     - ``keyword``: BM25 only.
     - ``semantic``: cosine over embeddings, BM25-pre-filtered candidates.
-    - ``auto``: RRF fusion of keyword + semantic.
+    - ``auto`` (default): RRF fusion of keyword + semantic.
 
     ``profile_scope`` (Phase 4) restricts ``document``/``vault`` memories to
     those whose ``source_id`` starts with one of the allowed prefixes. When
     None/empty, no additional filtering is applied. Locked vault notes have
     their content masked for any viewer that is not the memory's owner agent.
+
+    For ``semantic`` and ``auto``, if the top semantic cosine score is below
+    ``config.min_semantic_score`` (default 0.5), an empty list is returned
+    rather than keyword-dominated noise.
     """
     if limit is None:
         limit = config.search_limit
+    if strategy is None:
+        strategy = config.default_search_strategy
     if strategy not in ("keyword", "semantic", "auto", "graph"):
-        strategy = "keyword"
+        strategy = config.default_search_strategy
 
     # Resolve the effective scope: explicit arg overrides config.profile_scope.
     scope = profile_scope if profile_scope is not None else (config.profile_scope or [])
@@ -161,6 +169,10 @@ def search(
 
     if strategy == "semantic":
         ranked = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
+        # Drop noise: if the top semantic cosine score is below the configured
+        # minimum, there are no strong matches.
+        if ranked and ranked[0].get("score", 0.0) < config.min_semantic_score:
+            return []
         ranked = _attach_source(db, ranked)
         ranked = _profile_scope_filter(ranked, scope)
         ranked = _scope_filter(ranked, visibility)
@@ -170,6 +182,11 @@ def search(
     # auto: RRF fusion
     kw = db.search_bm25(query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
     sem = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
+    # Drop noise: if the top semantic cosine score is below the configured
+    # minimum, the query is not semantically related to any memory. Return an
+    # empty list instead of keyword-dominated BM25 noise.
+    if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
+        return []
     fused = _rrf_fuse(kw, sem)
     fused = _attach_source(db, fused)
     fused = _profile_scope_filter(fused, scope)

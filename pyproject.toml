@@ -35,3 +35,6 @@ select = ["E", "F", "I", "W", "UP"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Ensure the worktree's own `remnant` package takes precedence over any
+# editable install pointing at a different checkout/worktree.
+pythonpath = ["."]
