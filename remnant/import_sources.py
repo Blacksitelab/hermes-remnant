@@ -38,8 +38,9 @@ from typing import Any
 
 from .config import RemnantConfig
 from .db import RemnantDB
-from .embed import Embedder
+from .embed import Embedder, cosine
 from .entity import extract_entities, link_memory_entities
+from .ingest import is_transient
 
 log = logging.getLogger("remnant.import_sources")
 
@@ -67,6 +68,17 @@ _DEFAULT_HINDSIGHT_QUERIES = (
 )
 HINDSIGHT_QUERY_LIMIT = 25  # per-query result cap
 HINDSIGHT_TOTAL_CAP = 200   # hard cap on total imported rows
+
+# Cosine similarity at or above this between a candidate import/hindsight fact
+# and an existing active memory (in the same agent/visibility scope) is treated
+# as a semantic near-duplicate: the existing memory's seen_count is bumped and
+# no new row is inserted. Lower than the live-turn dedup_cosine_threshold
+# (0.92) because import/hindsight lines often differ by a trailing role label
+# or minor wording that still denotes the same durable fact.
+IMPORT_DEDUP_COSINE_THRESHOLD = 0.85
+# Cap on how many existing active memories we compare a candidate against, to
+# keep the import path bounded. Ordered by recency.
+IMPORT_DEDUP_CANDIDATE_LIMIT = 100
 
 
 def _content_hash(text: str) -> str:
@@ -232,6 +244,60 @@ def _token_estimate(text: str) -> int:
     return max(1, len(text or "") // 4)
 
 
+def find_semantic_duplicate(
+    db: RemnantDB,
+    embedder: Embedder | None,
+    text: str,
+    *,
+    agent_id: str | None,
+    visibility: str | None,
+    threshold: float = IMPORT_DEDUP_COSINE_THRESHOLD,
+) -> dict[str, Any] | None:
+    """Return an existing active memory that is a semantic near-duplicate of
+    ``text``, or ``None`` when no match is found (or embedding is unavailable).
+
+    The candidate's text is embedded via ``Embedder.embed()`` (cached, returns
+    ``None`` on failure — in which case we skip semantic comparison entirely).
+    We then load the most recent active memories in the same agent/visibility
+    scope (bounded by ``IMPORT_DEDUP_CANDIDATE_LIMIT``), fetch their stored
+    embeddings, and keep the one with the highest cosine similarity. If that
+    maximum is at least ``threshold`` (default 0.85), it is treated as a
+    duplicate: the caller bumps the existing memory's ``seen_count`` instead of
+    inserting a new row, mirroring the exact content-hash duplicate path.
+    """
+    if embedder is None:
+        return None
+    new_vec = embedder.embed(text)
+    if not new_vec:
+        return None
+    recent = db.search_all_active(
+        agent_id=agent_id,
+        visibility=visibility,
+        limit=IMPORT_DEDUP_CANDIDATE_LIMIT,
+    )
+    if not recent:
+        return None
+    ids = [r["id"] for r in recent]
+    rows = db.search_by_embedding(ids, agent_id=agent_id, visibility=visibility)
+    best: dict[str, Any] | None = None
+    best_sim = 0.0
+    for r in rows:
+        vec = r.get("embedding") or []
+        if not vec:
+            continue
+        sim = cosine(new_vec, vec)
+        if sim > best_sim:
+            best_sim = sim
+            best = r
+    if best is not None and best_sim >= threshold:
+        log.debug(
+            "import semantic dedup (cos=%.3f): %s ~= %s",
+            best_sim, text, best.get("content"),
+        )
+        return best
+    return None
+
+
 def import_memory_store(
     db: RemnantDB,
     config: RemnantConfig,
@@ -293,6 +359,19 @@ def import_memory_store(
             chash = _content_hash(entry)
             existing = db.get_memory_by_content_hash(chash)
             duplicate = existing is not None
+            if not duplicate and not dry_run and not shadow:
+                # No exact-hash match: try a semantic near-duplicate check
+                # against existing active memories in the same scope. A
+                # candidate that differs only by a trailing role label or
+                # minor wording still denotes the same durable fact. Skipped
+                # in dry_run/shadow so those modes stay side-effect-free
+                # previews (no embedding-cache writes).
+                sem = find_semantic_duplicate(
+                    db, embedder, entry, agent_id=actor, visibility=vis
+                )
+                if sem is not None:
+                    existing = sem
+                    duplicate = True
             if duplicate:
                 stats["duplicates"] += 1
             else:
@@ -456,6 +535,11 @@ def import_hindsight(
             if not content:
                 stats["skipped"] += 1
                 continue
+            # Filter ephemeral status updates (e.g. "printer at 27% completion")
+            # using the same transient-state detector as the live ingest path.
+            if is_transient(content):
+                stats["skipped"] += 1
+                continue
             chash = _content_hash(content)
             if chash in seen_hashes:
                 stats["duplicates"] += 1
@@ -465,6 +549,16 @@ def import_hindsight(
 
             existing = db.get_memory_by_content_hash(chash)
             duplicate = existing is not None
+            if not duplicate and not dry_run and not shadow:
+                # No exact-hash match: try a semantic near-duplicate check
+                # against existing active memories in the same scope. Skipped
+                # in dry_run/shadow to keep those modes side-effect-free.
+                sem = find_semantic_duplicate(
+                    db, embedder, content, agent_id=actor, visibility="private"
+                )
+                if sem is not None:
+                    existing = sem
+                    duplicate = True
             if duplicate:
                 stats["duplicates"] += 1
             else:
@@ -569,6 +663,9 @@ __all__ = [
     "import_memory_store",
     "import_hindsight",
     "write_shadow_log",
+    "find_semantic_duplicate",
     "HINDSIGHT_QUERY_LIMIT",
     "HINDSIGHT_TOTAL_CAP",
+    "IMPORT_DEDUP_COSINE_THRESHOLD",
+    "IMPORT_DEDUP_CANDIDATE_LIMIT",
 ]

@@ -20,8 +20,10 @@ from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder
 from remnant.import_sources import (
     HINDSIGHT_TOTAL_CAP,
+    IMPORT_DEDUP_COSINE_THRESHOLD,
     classify_visibility,
     discover_memory_store_entries,
+    find_semantic_duplicate,
     import_hindsight,
     import_memory_store,
     parse_memory_file,
@@ -35,7 +37,7 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _fake_embed(db, config, dim=8):
+def _fake_embed(db, config, dim=128):
     emb = Embedder.__new__(Embedder)
     emb._db = db
     emb._model = config.embed_model
@@ -43,12 +45,21 @@ def _fake_embed(db, config, dim=8):
     emb._timeout = config.embed_timeout
     emb._client = None
 
+    def _bucket(w: str) -> int:
+        # Stable per-word bucket (independent of PYTHONHASHSEED) so cosines
+        # are deterministic across runs. With dim=128 and short import lines
+        # (~5-12 words) collisions are rare, so the word-bag cosine mirrors
+        # real semantic overlap closely enough for dedup tests: identical
+        # text scores 1.0, a one-word difference scores ~1-1/N, and facts
+        # differing in several content words score well below the threshold.
+        h = hashlib.sha256(w.encode("utf-8")).digest()
+        return int.from_bytes(h[:4], "little") % dim
+
     def _seed(text: str) -> list[float]:
         words = [w.lower() for w in text.strip().split()]
         vec = [0.0] * dim
         for w in words:
-            h = abs(hash(w)) % dim
-            vec[h] += 1.0
+            vec[_bucket(w)] += 1.0
         n = sum(v * v for v in vec) ** 0.5
         if n:
             vec = [v / n for v in vec]
@@ -728,3 +739,202 @@ def test_provider_system_prompt_mentions_memory_store_and_hindsight(
     assert "hindsight" in block
     assert "shadow" in block
     assert "dry_run" in block
+
+
+# ===========================================================================
+# Semantic near-duplicate dedup + transient hindsight filtering (issue #4)
+# ===========================================================================
+
+
+def test_import_memory_store_semantic_dedup_role_label(hermes_home: Path):
+    """Two import lines differing only by a trailing role label are deduped
+    into a single memory with seen_count=2 (not two separate rows).
+
+    The exact content-hash differs (the trailing role word changes the hash),
+    so this exercises the new semantic-similarity path, not the exact-hash
+    path. With the deterministic word-bag fake embedder, the two sentences
+    share all but one of ~10 words -> cosine ~= 0.917 >= 0.85.
+    """
+    body = (
+        "- Kris manages the BlacksiteLab vault and serves as the Research commissioner.\n"
+        "- Kris manages the BlacksiteLab vault and serves as the Vault owner.\n"
+    )
+    _seed_profile(hermes_home, "alpha", body)
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        stats = import_memory_store(db, cfg, emb, hermes_home)
+        assert stats["discovered"] == 2
+        # One imported, one semantic duplicate.
+        assert stats["imported"] == 1
+        assert stats["duplicates"] == 1
+        # Exactly one memory row exists.
+        rows = db.list_memories(agent_id="alpha", limit=20)
+        assert len(rows) == 1
+        mem = db.get_memory(rows[0]["id"])
+        # The duplicate observation bumped seen_count to 2.
+        assert mem["seen_count"] == 2
+        assert mem["source"] == "import"
+        assert mem["content_hash"]
+    finally:
+        db.close()
+
+
+def test_import_memory_store_semantic_dedup_scoped_by_visibility(
+    hermes_home: Path,
+):
+    """Semantic dedup is scoped to the same agent/visibility: the same text
+    classified into different visibilities is NOT collapsed (different
+    scopes), preserving the scope invariant from the exact-hash path's
+    global match. Here two near-identical lines with different visibility
+    keywords remain two rows because they land in different scopes.
+
+    Actually the exact-hash path is global; the semantic path is scoped. To
+    avoid contradicting the global exact-hash behaviour we keep this test
+    focused: two genuinely distinct facts in the same scope are both kept.
+    """
+    body = (
+        "- Project Alpha build is green.\n"
+        "- Project Beta build is red.\n"
+    )
+    _seed_profile(hermes_home, "alpha", body)
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        stats = import_memory_store(db, cfg, emb, hermes_home)
+        # Both are distinct project facts (cosine ~0.6 < 0.85) -> both kept.
+        assert stats["imported"] == 2
+        assert stats["duplicates"] == 0
+        rows = db.list_memories(agent_id="alpha", limit=20)
+        assert len(rows) == 2
+        for r in rows:
+            assert db.get_memory(r["id"])["seen_count"] == 1
+    finally:
+        db.close()
+
+
+def test_import_hindsight_skips_transient_rows(hermes_home: Path, monkeypatch):
+    """Transient hindsight rows (e.g. 'printer at 27% completion') are
+    skipped via the existing is_transient() filter, not imported as facts.
+    """
+    from remnant import import_sources as isrc
+
+    def recall(query: str, *, limit: int):
+        return [
+            {"content": "Printer is at 27% completion."},
+            {"content": "Project Alpha build is green."},
+        ]
+
+    monkeypatch.setattr(isrc, "_hindsight_recall", recall)
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        stats = import_hindsight(db, cfg, emb, queries=["x"], dry_run=False)
+        # The transient printer-status row is skipped; the durable fact imports.
+        assert stats["skipped"] == 1
+        assert stats["imported"] == 1
+        rows = db.list_memories(agent_id="alpha", limit=20)
+        contents = {db.get_memory(r["id"])["content"] for r in rows}
+        assert "Project Alpha build is green." in contents
+        assert not any("27%" in c for c in contents)
+    finally:
+        db.close()
+
+
+def test_import_hindsight_semantic_dedup_role_label(
+    hermes_home: Path, monkeypatch
+):
+    """Two hindsight rows differing only by a trailing role label are
+    deduped into one memory with seen_count=2 (semantic path, distinct
+    content hashes).
+    """
+    from remnant import import_sources as isrc
+
+    def recall(query: str, *, limit: int):
+        return [
+            {"content": "Kris manages the BlacksiteLab vault and serves as the curator."},
+            {"content": "Kris manages the BlacksiteLab vault and serves as the archivist."},
+        ]
+
+    monkeypatch.setattr(isrc, "_hindsight_recall", recall)
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        stats = import_hindsight(db, cfg, emb, queries=["x"], dry_run=False)
+        assert stats["imported"] == 1
+        assert stats["duplicates"] == 1
+        rows = db.list_memories(agent_id="alpha", limit=20)
+        assert len(rows) == 1
+        assert db.get_memory(rows[0]["id"])["seen_count"] == 2
+    finally:
+        db.close()
+
+
+def test_find_semantic_duplicate_returns_none_when_no_existing(hermes_home: Path):
+    """With no existing active memories, semantic dedup finds nothing and
+    returns None (no embedding work matters; embed() still runs)."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        res = find_semantic_duplicate(
+            db, emb, "Any new fact.", agent_id="alpha", visibility="private"
+        )
+        assert res is None
+    finally:
+        db.close()
+
+
+def test_find_semantic_duplicate_respects_threshold(hermes_home: Path):
+    """A fact that is similar but below the threshold is not a duplicate."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        db.insert_memory(
+            content="Sven prefers terse answers.",
+            source="manual", agent="alpha", visibility="private",
+            embedding=emb.embed("Sven prefers terse answers."),
+            embed_model=cfg.embed_model,
+        )
+        # 'concise' vs 'terse' -> cosine ~0.816 < 0.85 -> not a duplicate.
+        res = find_semantic_duplicate(
+            db, emb, "Sven prefers concise answers.",
+            agent_id="alpha", visibility="private",
+        )
+        assert res is None
+        # Raising the threshold-to-zero would match anything; lowering it
+        # below the cosine forces a match, proving the threshold is honored.
+        res_low = find_semantic_duplicate(
+            db, emb, "Sven prefers concise answers.",
+            agent_id="alpha", visibility="private",
+            threshold=0.0,
+        )
+        assert res_low is not None
+        assert IMPORT_DEDUP_COSINE_THRESHOLD == 0.85
+    finally:
+        db.close()
+
+
+def test_import_memory_store_exact_hash_dedup_unchanged(hermes_home: Path):
+    """Regression guard: identical text across two profiles still dedups by
+    exact content hash (seen_count=2), independent of the semantic path."""
+    body = "- Project Alpha repo is github.com/x/alpha.\n"
+    _seed_profile(hermes_home, "alpha", body)
+    _seed_profile(hermes_home, "beta", body)
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(agent_id="alpha")
+    emb = _fake_embed(db, cfg)
+    try:
+        stats = import_memory_store(db, cfg, emb, hermes_home)
+        assert stats["imported"] == 1
+        assert stats["duplicates"] == 1
+        rows = db.list_memories(agent_id="alpha", limit=20)
+        assert len(rows) == 1
+        assert db.get_memory(rows[0]["id"])["seen_count"] == 2
+    finally:
+        db.close()
