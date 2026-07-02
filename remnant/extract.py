@@ -37,12 +37,14 @@ _EXTRACT_PROMPT = (
     "- DO NOT extract transient state (current percentages, right-now status, "
     '"is at", "currently", "today", timestamps).\n'
     "- One fact per line, as a complete declarative sentence.\n"
-    "- Also list the entities (proper nouns / names of people, projects, "
-    "devices) that each fact is about.\n"
+    "- Also list the entities each fact is about, with a type drawn from: "
+    "person, service, project, concept, place, tool.\n"
+    "- Include aliases (alternate names / spellings) for each entity.\n"
     "\n"
     "Return STRICT JSON only, no prose:\n"
-    '{"facts": [{"entity": "<entity name>", "fact": "<one-sentence fact>", '
-    '"visibility": "private"}]}\n'
+    '{"facts": [{"entity": "<primary entity name>", "fact": "<one-sentence fact>", '
+    '"visibility": "private", "entities": [{"name": "<name>", "type": "<type>", '
+    '"aliases": ["<alias>", ...]}]}]}\n'
     "\n"
     "Visibility must be one of: private, shared, fleet. Default to private."
 )
@@ -120,17 +122,23 @@ class ExtractionWorker:
             if is_transient(fact_text):
                 log.debug("rejected transient fact: %s", fact_text)
                 continue
-            canonical = self._db.resolve_entity(entity, job["agent_id"])
+            # Typed entities from the LLM parse (optional). When present these
+            # drive entity-graph linking + relation seeding. We keep the
+            # legacy single `entity` subject as the tag/metadata subject.
+            typed_entities = f.get("entities") or []
+            if not typed_entities and entity and entity != "general":
+                typed_entities = [{"name": entity, "type": None, "aliases": []}]
             store_memory(
                 self._db,
                 self._embedder,
                 self._config,
                 fact=fact_text,
-                entity=canonical,
+                entity=entity,
                 session_id=job["session_id"],
                 agent_id=job["agent_id"],
                 visibility=visibility,
                 source_turn_id=int(job["turn_id"]),
+                entities=typed_entities,
             )
 
     def _extract(self, user_text: str, assistant_text: str) -> list[dict[str, Any]]:

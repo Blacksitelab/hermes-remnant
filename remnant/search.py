@@ -1,4 +1,4 @@
-"""Memory search: BM25 keyword, cosine semantic, and RRF hybrid fusion.
+"""Memory search: BM25 keyword, cosine semantic, RRF hybrid fusion, and graph.
 
 Strategies:
 - ``keyword`` (default): BM25 over the FTS5 index. The Phase 1 behavior.
@@ -6,6 +6,9 @@ Strategies:
   the whole database, embeddings are only loaded for a BM25-pre-filtered
   candidate set (capped by ``SEMANTIC_CANDIDATE_LIMIT``).
 - ``auto``: Reciprocal Rank Fusion (RRF, k=60) of BM25 + semantic.
+- ``graph``: pure-SQLite entity-graph traversal. Extracts entity names from
+  the query, resolves them, BFS over `relations` up to N hops, and returns
+  linked active memories. No LLM, no embeddings.
 """
 
 from __future__ import annotations
@@ -47,8 +50,15 @@ def search(
     """
     if limit is None:
         limit = config.search_limit
-    if strategy not in ("keyword", "semantic", "auto"):
+    if strategy not in ("keyword", "semantic", "auto", "graph"):
         strategy = "keyword"
+
+    if strategy == "graph":
+        from .graph import graph_search
+
+        results = graph_search(db, query, agent_id=agent_id, limit=limit)
+        results = _scope_filter(results, visibility)
+        return results[:limit]
 
     if strategy == "keyword":
         results = db.search_bm25(query, agent_id=agent_id, limit=limit * 3 if visibility else limit)

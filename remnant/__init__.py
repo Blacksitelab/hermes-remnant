@@ -100,9 +100,14 @@ except Exception:  # pragma: no cover - fallback for standalone/test envs
 _SYSTEM_PROMPT_BLOCK = (
     "## Remnant Memory Provider\n"
     "You have durable long-term memory via the Remnant provider.\n"
-    "Use the `memory_search` tool to recall facts (keyword, semantic, or auto hybrid).\n"
+    "Use the `memory_search` tool to recall facts (keyword, semantic, auto hybrid, "
+    "or graph entity-traversal strategies).\n"
     "Use the `memory_store` tool to save a durable fact explicitly.\n"
     "Use the `memory_reflect` tool to synthesize an answer across stored memories.\n"
+    "Use the `memory_graph` tool to explore entities and their connected memories.\n"
+    "Use the `memory_edit` tool to update, merge, forget, score, or share memories. "
+    "Nothing is ever deleted: forgotten memories stay in the DB but are hidden from "
+    "search; updates supersede the old version while preserving it.\n"
     "Transient state (percentages, current status, timestamps) is rejected.\n"
     "Memories are scoped by agent and visibility (private/shared/fleet).\n"
 )

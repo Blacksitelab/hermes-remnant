@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -73,18 +73,32 @@ CREATE TABLE IF NOT EXISTS entities (
     name TEXT,
     type TEXT,
     aliases TEXT,
+    agent TEXT,
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
+CREATE INDEX IF NOT EXISTS idx_entities_agent ON entities(agent);
+
+CREATE TABLE IF NOT EXISTS entity_aliases (
+    entity_id TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    agent TEXT,
+    PRIMARY KEY(entity_id, alias, agent),
+    FOREIGN KEY(entity_id) REFERENCES entities(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_aliases_alias ON entity_aliases(alias);
 
 CREATE TABLE IF NOT EXISTS memory_entities (
     memory_id TEXT NOT NULL,
     entity_id TEXT NOT NULL,
     relation_role TEXT,
+    agent TEXT,
     PRIMARY KEY(memory_id, entity_id),
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_me_entity ON memory_entities(entity_id);
+CREATE INDEX IF NOT EXISTS idx_me_agent ON memory_entities(agent);
+CREATE INDEX IF NOT EXISTS idx_me_memory ON memory_entities(memory_id);
 
 CREATE TABLE IF NOT EXISTS relations (
     entity_a TEXT NOT NULL,
@@ -130,6 +144,17 @@ CREATE TABLE IF NOT EXISTS embedding_cache (
     created_at REAL NOT NULL,
     PRIMARY KEY(model, text_hash)
 );
+
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    memory_id TEXT,
+    details TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_memory ON audit_log(memory_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -200,10 +225,60 @@ class RemnantDB:
             cur = self._conn.cursor()
             cur.executescript(_SCHEMA)
             cur.executescript(_FTS_TRIGGERS)
+            self._apply_migrations(cur)
             cur.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?,?)",
                 ("version", str(SCHEMA_VERSION)),
             )
+
+    def _apply_migrations(self, cur: sqlite3.Cursor) -> None:
+        """Idempotent column additions for tables created in earlier phases.
+
+        CREATE TABLE IF NOT EXISTS never alters existing tables, so we add
+        new columns explicitly and ignore the OperationalError if they exist.
+        """
+        cur.execute("PRAGMA table_info(memory_entities)")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "agent" not in cols:
+            try:
+                cur.execute("ALTER TABLE memory_entities ADD COLUMN agent TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_me_agent ON memory_entities(agent)"
+                )
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_me_memory ON memory_entities(memory_id)"
+                )
+            except sqlite3.OperationalError:
+                pass
+        cur.execute("PRAGMA table_info(entities)")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "agent" not in cols:
+            try:
+                cur.execute("ALTER TABLE entities ADD COLUMN agent TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_entities_agent ON entities(agent)"
+                )
+            except sqlite3.OperationalError:
+                pass
+        # entity_aliases.agent scopes aliases per agent (agent-scoped
+        # resolution). Added for Phase 3; CREATE TABLE IF NOT EXISTS won't
+        # alter an existing table, so backfill the column for old DBs.
+        cur.execute("PRAGMA table_info(entity_aliases)")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "agent" not in cols:
+            try:
+                cur.execute("ALTER TABLE entity_aliases ADD COLUMN agent TEXT")
+            except sqlite3.OperationalError:
+                pass
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Cursor]:
@@ -522,30 +597,459 @@ class RemnantDB:
 
     # -- entities --------------------------------------------------------------
 
-    def resolve_entity(self, name: str, agent_id: str) -> str:
-        """Return canonical form for `name` within this agent's scope.
+    def resolve_entity(
+        self,
+        name: str,
+        agent_id: str | None = None,
+        *,
+        entity_type: str | None = None,
+        aliases: list[str] | None = None,
+    ) -> str:
+        """Return canonical entity id for `name` within this agent's scope.
 
-        For Phase 1 we keep the previous behavior: return a stripped canonical
-        name. An entity row is created (or reused) so the entity graph is
-        populated for later phases. The agent scope is recorded via the
-        `metadata` field on the memory, not as a separate column, per the
-        Phase 1 schema.
+        Resolution is fuzzy on name + aliases (case-insensitive, punctuation
+        stripped). The first existing match wins; otherwise a new entity row
+        is created. `agent_id` scopes the canonical form per agent so two
+        agents can have distinct entities that happen to share a name. When
+        `agent_id` is None the entity is global (legacy Phase 1 path).
+
+        Returns the entity *id* (UUID). Use ``find_entity_by_name`` for a
+        read-only lookup, and ``entity_name_for`` to map an id back to a name.
         """
-        key = name.strip()
+        key = _normalize_entity_name(name)
         if not key:
-            return key
+            return ""
+        normalized_aliases = [_normalize_entity_name(a) for a in (aliases or [])]
+        normalized_aliases = [a for a in normalized_aliases if a]
         with self.transaction() as cur:
-            cur.execute("SELECT id, name FROM entities WHERE name=?", (key,))
+            # Look for an existing entity matching name or any alias, scoped to
+            # the agent when one is given. Entities created without an agent
+            # (Phase 1) remain global and are matched by name only.
+            match_sql = (
+                "SELECT id FROM entities WHERE LOWER(name) = ? "
+                "AND (agent IS NULL OR agent = ?) "
+                "ORDER BY agent IS NULL LIMIT 1"
+            )
+            cur.execute(match_sql, (key, agent_id))
             row = cur.fetchone()
             if row is not None:
-                return row["name"]
+                eid = row["id"]
+                # Merge any newly supplied aliases / type into the row.
+                self._merge_entity_meta(cur, eid, entity_type, normalized_aliases, agent_id)
+                return eid
+            # Try alias match across the agent scope. We JOIN instead of using
+            # an EXISTS subquery so the alias row's `agent` column stays in
+            # scope for the ORDER BY (a correlated subquery alias is not visible
+            # in the outer ORDER BY, which previously raised OperationalError).
+            if normalized_aliases:
+                for alias in normalized_aliases:
+                    cur.execute(
+                        "SELECT e.id FROM entities e JOIN entity_aliases ea "
+                        "ON ea.entity_id = e.id "
+                        "WHERE ea.alias = ? AND (ea.agent IS NULL OR ea.agent = ?) "
+                        "ORDER BY ea.agent IS NULL LIMIT 1",
+                        (alias, agent_id),
+                    )
+                    row = cur.fetchone()
+                    if row is not None:
+                        eid = row["id"]
+                        self._merge_entity_meta(cur, eid, entity_type, normalized_aliases, agent_id)
+                        return eid
+            # No match: create a new entity.
             eid = _uuid()
             cur.execute(
-                "INSERT OR IGNORE INTO entities(id, name, type, aliases, created_at) "
-                "VALUES(?,?,?,?,?)",
-                (eid, key, None, json.dumps([]), _now_iso()),
+                "INSERT OR IGNORE INTO entities(id, name, type, aliases, agent, created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (eid, key, entity_type, json.dumps(normalized_aliases), agent_id, _now_iso()),
             )
-            return key
+            for alias in normalized_aliases:
+                cur.execute(
+                    "INSERT OR IGNORE INTO entity_aliases(entity_id, alias, agent) VALUES(?,?,?)",
+                    (eid, alias, agent_id),
+                )
+            return eid
+
+    def _merge_entity_meta(
+        self,
+        cur: sqlite3.Cursor,
+        entity_id: str,
+        entity_type: str | None,
+        aliases: list[str],
+        agent_id: str | None = None,
+    ) -> None:
+        """Update type/aliases on an existing entity without clobbering data."""
+        if entity_type:
+            cur.execute(
+                "UPDATE entities SET type=COALESCE(type, ?) WHERE id=? AND type IS NULL",
+                (entity_type, entity_id),
+            )
+        if aliases:
+            for alias in aliases:
+                cur.execute(
+                    "INSERT OR IGNORE INTO entity_aliases(entity_id, alias, agent) "
+                    "VALUES(?,?,?)",
+                    (entity_id, alias, agent_id),
+                )
+            cur.execute("SELECT aliases FROM entities WHERE id=?", (entity_id,))
+            row = cur.fetchone()
+            existing = set()
+            if row and row["aliases"]:
+                try:
+                    existing = {a.lower() for a in json.loads(row["aliases"])}
+                except (json.JSONDecodeError, TypeError):
+                    existing = set()
+            merged = [a for a in aliases if a.lower() not in existing]
+            if merged:
+                cur.execute("SELECT aliases FROM entities WHERE id=?", (entity_id,))
+                row = cur.fetchone()
+                cur_aliases: list[str] = []
+                if row and row["aliases"]:
+                    try:
+                        cur_aliases = list(json.loads(row["aliases"]))
+                    except (json.JSONDecodeError, TypeError):
+                        cur_aliases = []
+                new_aliases = list(dict.fromkeys(cur_aliases + merged))
+                cur.execute(
+                    "UPDATE entities SET aliases=? WHERE id=?",
+                    (json.dumps(new_aliases), entity_id),
+                )
+
+    def entity_name_for(self, entity_id: str) -> str:
+        """Map an entity id back to its canonical name. '' if unknown."""
+        with self.read() as cur:
+            cur.execute("SELECT name FROM entities WHERE id=?", (entity_id,))
+            row = cur.fetchone()
+        return row["name"] if row and row["name"] else ""
+
+    def link_entity(
+        self,
+        *,
+        memory_id: str,
+        entity_id: str,
+        agent_id: str | None = None,
+        relation_role: str | None = None,
+    ) -> None:
+        """Associate a memory with an entity (idempotent on (memory_id, entity_id))."""
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO memory_entities(memory_id, entity_id, relation_role, agent) "
+                "VALUES(?,?,?,?)",
+                (memory_id, entity_id, relation_role, agent_id),
+            )
+
+    def get_entity(self, entity_id: str) -> dict[str, Any] | None:
+        with self.read() as cur:
+            cur.execute("SELECT * FROM entities WHERE id=?", (entity_id,))
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def find_entity_by_name(self, name: str, agent_id: str | None = None) -> str | None:
+        """Return entity id matching `name` (or any alias) without creating one."""
+        key = _normalize_entity_name(name)
+        if not key:
+            return None
+        with self.read() as cur:
+            cur.execute(
+                "SELECT id FROM entities WHERE LOWER(name)=? "
+                "AND (agent IS NULL OR agent=?) ORDER BY agent IS NULL LIMIT 1",
+                (key, agent_id),
+            )
+            row = cur.fetchone()
+            if row is not None:
+                return row["id"]
+            cur.execute(
+                "SELECT e.id FROM entities e JOIN entity_aliases ea "
+                "ON ea.entity_id = e.id "
+                "WHERE ea.alias=? AND (ea.agent IS NULL OR ea.agent=?) "
+                "ORDER BY ea.agent IS NULL LIMIT 1",
+                (key, agent_id),
+            )
+            row = cur.fetchone()
+            return row["id"] if row is not None else None
+
+    # -- relations -------------------------------------------------------------
+
+    def add_relation(
+        self,
+        *,
+        entity_a: str,
+        entity_b: str,
+        relation_type: str = "related_to",
+        strength: float = 0.5,
+        source_memory_id: str | None = None,
+    ) -> None:
+        """Insert or strengthen a relation between two entities (undirected)."""
+        a, b = sorted((entity_a, entity_b))
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO relations(entity_a, entity_b, relation_type, strength, "
+                "source_memory_id, created_at) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(entity_a, entity_b, relation_type) DO UPDATE SET "
+                "strength=MAX(excluded.strength, relations.strength), "
+                "created_at=excluded.created_at",
+                (a, b, relation_type, strength, source_memory_id, _now_iso()),
+            )
+
+    def get_relations(self, entity_id: str) -> list[dict[str, Any]]:
+        with self.read() as cur:
+            cur.execute(
+                "SELECT entity_a, entity_b, relation_type, strength, source_memory_id, "
+                "created_at FROM relations WHERE entity_a=? OR entity_b=?",
+                (entity_id, entity_id),
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_memories_for_entity(
+        self, entity_id: str, *, agent_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at, m.updated_at, m.status, m.tags, m.metadata "
+            "FROM memory_entities me JOIN memories m ON m.id = me.memory_id "
+            "WHERE me.entity_id=? AND m.status='active'"
+        )
+        params: list[Any] = [entity_id]
+        if agent_id is not None:
+            sql += " AND m.agent=?"
+            params.append(agent_id)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    # -- graph traversal -------------------------------------------------------
+
+    def traverse_graph(
+        self,
+        entity_id: str,
+        *,
+        depth: int = 2,
+        agent_id: str | None = None,
+    ) -> dict[str, Any]:
+        """BFS over `relations` up to `depth` hops. Pure SQLite, no LLM.
+
+        Returns ``{"entities": [...], "memories": [...]}`` where entities are
+        dicts ``{id, name, type, depth}`` (the seed at depth 0) and memories
+        are deduped active memories linked to any visited entity.
+        """
+        visited: dict[str, int] = {entity_id: 0}
+        order: list[str] = [entity_id]
+        frontier: list[str] = [entity_id]
+        for hop in range(1, depth + 1):
+            if not frontier:
+                break
+            placeholders = ",".join("?" for _ in frontier)
+            sql = (
+                f"SELECT entity_a AS other FROM relations WHERE entity_b IN ({placeholders}) "
+                f"UNION SELECT entity_b AS other FROM relations WHERE entity_a IN ({placeholders})"
+            )
+            params = list(frontier) + list(frontier)
+            with self.read() as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            next_frontier: list[str] = []
+            for r in rows:
+                other = r["other"]
+                if other not in visited:
+                    visited[other] = hop
+                    order.append(other)
+                    next_frontier.append(other)
+            frontier = next_frontier
+
+        # Load entity metadata for visited entities.
+        entities_out: list[dict[str, Any]] = []
+        if order:
+            placeholders = ",".join("?" for _ in order)
+            with self.read() as cur:
+                cur.execute(
+                    f"SELECT id, name, type, aliases FROM entities WHERE id IN ({placeholders})",
+                    order,
+                )
+                rows = {r["id"]: dict(r) for r in cur.fetchall()}
+            for eid in order:
+                meta = rows.get(eid, {"id": eid, "name": None, "type": None, "aliases": None})
+                meta = dict(meta)
+                meta["depth"] = visited[eid]
+                entities_out.append(meta)
+
+        # Load active memories linked to any visited entity.
+        memories_out: list[dict[str, Any]] = []
+        if order:
+            placeholders = ",".join("?" for _ in order)
+            sql = (
+                "SELECT DISTINCT m.id, m.content, m.visibility, m.agent AS agent_id, "
+                "m.timestamp AS created_at, m.updated_at "
+                f"FROM memory_entities me JOIN memories m ON m.id = me.memory_id "
+                f"WHERE me.entity_id IN ({placeholders}) AND m.status='active'"
+            )
+            params = list(order)
+            if agent_id is not None:
+                sql += " AND m.agent=?"
+                params.append(agent_id)
+            with self.read() as cur:
+                cur.execute(sql, params)
+                memories_out = [dict(r) for r in cur.fetchall()]
+
+        return {"entities": entities_out, "memories": memories_out}
+
+    def search_graph(
+        self,
+        query_entities: list[str],
+        *,
+        agent_id: str | None = None,
+        depth: int = 2,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Resolve entity names from the query, traverse the graph, and return
+        linked active memories. Pure SQLite (no embedding / LLM work).
+        """
+        seed_ids: list[str] = []
+        for name in query_entities:
+            eid = self.find_entity_by_name(name, agent_id=agent_id)
+            if eid:
+                seed_ids.append(eid)
+        if not seed_ids:
+            return []
+        seen: dict[str, dict[str, Any]] = {}
+        for eid in seed_ids:
+            res = self.traverse_graph(eid, depth=depth, agent_id=agent_id)
+            for m in res["memories"]:
+                mid = m["id"]
+                if mid not in seen:
+                    seen[mid] = m
+        ranked = list(seen.values())
+        ranked.sort(key=lambda r: r.get("updated_at", ""), reverse=True)
+        return ranked[:limit]
+
+    # -- edit helpers ----------------------------------------------------------
+
+    def get_memory(self, memory_id: str) -> dict[str, Any] | None:
+        with self.read() as cur:
+            cur.execute("SELECT * FROM memories WHERE id=?", (memory_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        if d.get("metadata"):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if d.get("tags"):
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return d
+
+    def set_memory_field(
+        self,
+        memory_id: str,
+        field: str,
+        value: Any,
+        *,
+        actor: str = "system",
+        action: str = "update",
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Atomically update one column on a memory and write an audit row.
+
+        `field` must be one of the allowed mutable columns (whitelisted).
+        Returns the updated memory row.
+        """
+        allowed = {
+            "content", "visibility", "trust_score", "confidence",
+            "verified", "status", "superseded_by", "tags", "metadata",
+        }
+        if field not in allowed:
+            raise ValueError(f"field not mutable: {field}")
+        before = self.get_memory(memory_id)
+        if before is None:
+            raise KeyError(memory_id)
+        col_value = value
+        if field in ("tags", "metadata") and isinstance(value, (dict, list)):
+            col_value = json.dumps(value)
+        with self.transaction() as cur:
+            cur.execute(
+                f"UPDATE memories SET {field}=?, updated_at=? WHERE id=?",
+                (col_value, _now_iso(), memory_id),
+            )
+            audit_id = self._write_audit(cur, actor, action, memory_id, details or {})
+        after = self.get_memory(memory_id)
+        return {"memory": after, "audit_id": audit_id, "before": before}
+
+    def supersede(self, old_id: str, new_id: str | None, *, actor: str = "system") -> int:
+        """Mark `old_id` as superseded by `new_id` (or None). Returns audit id."""
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
+                (new_id, _now_iso(), old_id),
+            )
+            return self._write_audit(
+                cur,
+                actor,
+                "supersede",
+                old_id,
+                {"superseded_by": new_id},
+            )
+
+    def _write_audit(
+        self,
+        cur: sqlite3.Cursor,
+        actor: str,
+        action: str,
+        memory_id: str | None,
+        details: dict[str, Any],
+    ) -> int:
+        cur.execute(
+            "INSERT INTO audit_log(actor, action, memory_id, details, created_at) "
+            "VALUES(?,?,?,?,?)",
+            (actor, action, memory_id, json.dumps(details, default=str), _now_iso()),
+        )
+        return int(cur.lastrowid)
+
+    def write_audit(
+        self,
+        *,
+        actor: str,
+        action: str,
+        memory_id: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        """Public audit log writer (runs in its own transaction)."""
+        with self.transaction() as cur:
+            return self._write_audit(cur, actor, action, memory_id, details or {})
+
+    def list_audit(
+        self,
+        *,
+        memory_id: str | None = None,
+        action: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT id, actor, action, memory_id, details, created_at FROM audit_log"
+        where: list[str] = []
+        params: list[Any] = []
+        if memory_id is not None:
+            where.append("memory_id=?")
+            params.append(memory_id)
+        if action is not None:
+            where.append("action=?")
+            params.append(action)
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            rows = [dict(r) for r in cur.fetchall()]
+        for r in rows:
+            if r.get("details"):
+                try:
+                    r["details"] = json.loads(r["details"])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return rows
 
     # -- embedding cache ------------------------------------------------------
 
@@ -591,6 +1095,23 @@ def _to_fts_query(query: str) -> str:
     return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)
 
 
+def _normalize_entity_name(name: str) -> str:
+    """Lowercase, strip surrounding punctuation/whitespace for entity matching.
+
+    Periods are preserved (internal initials/abbreviations like "Sven E." are
+    semantically meaningful); other surrounding punctuation is stripped.
+    """
+    if not name:
+        return ""
+    s = name.strip().lower()
+    # strip surrounding punctuation EXCEPT periods (initials/abbreviations).
+    s = s.strip(",!?;:\"'()[]{}<>/\\|`~@#$%^&*-=+")
+    import re as _re
+
+    s = _re.sub(r"\s+", " ", s).strip()
+    return s
+
+
 def open_db(db_path: str | Path) -> RemnantDB:
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     return RemnantDB(db_path)
@@ -601,4 +1122,5 @@ __all__ = [
     "open_db",
     "_pack_embedding",
     "_unpack_embedding",
+    "_normalize_entity_name",
 ]
