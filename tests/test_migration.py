@@ -16,7 +16,7 @@ import pytest
 
 from remnant import RemnantMemoryProvider
 from remnant.config import RemnantConfig
-from remnant.db import open_db
+from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder
 from remnant.import_sources import (
     HINDSIGHT_TOTAL_CAP,
@@ -112,7 +112,7 @@ def provider(hermes_home: Path) -> RemnantMemoryProvider:
 
 
 def _open_db(hermes_home: Path):
-    return open_db(hermes_home / "remnant" / "remnant.db")
+    return open_db(default_db_path())
 
 
 def _write_memory_file(path: Path, body: str) -> None:

@@ -22,7 +22,7 @@ from remnant.config import (
     DEFAULT_VAULT_REINDEX_INTERVAL_S,
     RemnantConfig,
 )
-from remnant.db import open_db
+from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder
 from remnant.search import search as hybrid_search
 from remnant.vault import (
@@ -133,7 +133,7 @@ def provider(hermes_home: Path, vault: Path) -> RemnantMemoryProvider:
 
 
 def _open_db(hermes_home: Path):
-    return open_db(hermes_home / "remnant" / "remnant.db")
+    return open_db(default_db_path())
 
 
 def _write_note(path: Path, body: str, frontmatter: dict | None = None) -> None:

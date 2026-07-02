@@ -14,7 +14,7 @@ import pytest
 
 from remnant import RemnantMemoryProvider
 from remnant.config import RemnantConfig
-from remnant.db import open_db
+from remnant.db import default_db_path, open_db
 from remnant.edit import memory_edit
 from remnant.embed import Embedder, cosine
 from remnant.entity import (
@@ -117,7 +117,7 @@ def patch_extract(monkeypatch):
 
 
 def _open_db(hermes_home: Path):
-    return open_db(hermes_home / "remnant" / "remnant.db")
+    return open_db(default_db_path())
 
 
 def _store(db, emb, cfg, *, fact, entities, agent_id="default", visibility="private"):

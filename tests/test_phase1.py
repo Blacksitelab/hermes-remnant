@@ -14,7 +14,7 @@ import pytest
 
 from remnant import RemnantMemoryProvider, register
 from remnant.config import RemnantConfig, load_config, save_config
-from remnant.db import open_db
+from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder, cosine
 from remnant.ingest import is_transient, store_memory
 from remnant.search import search as bm25_search
@@ -267,7 +267,7 @@ def test_memory_store_dedup_near_identical(provider: RemnantMemoryProvider):
 
 def test_store_memory_direct(hermes_home: Path):
     """Exercise store_memory directly with the deterministic embedder."""
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
@@ -320,7 +320,7 @@ def test_memory_search_unknown_tool(provider: RemnantMemoryProvider):
 
 def test_search_visibility_filtering(hermes_home: Path):
     """A private-scoped search should not see shared/fleet memories."""
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
@@ -342,7 +342,7 @@ def test_search_visibility_filtering(hermes_home: Path):
 
 def test_search_agent_scoped(hermes_home: Path):
     """Agent A should not see agent B's private memories."""
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
@@ -401,7 +401,7 @@ def test_extraction_queue_persists_across_restart(hermes_home: Path):
     p.shutdown()
 
     # Reopen the DB directly and confirm the row is still there.
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     try:
         with db.read() as cur:
             cur.execute("SELECT COUNT(*) AS c FROM extraction_queue WHERE session_id='restart'")

@@ -13,7 +13,7 @@ import pytest
 
 from remnant import RemnantMemoryProvider
 from remnant.config import RemnantConfig
-from remnant.db import open_db
+from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder, cosine
 from remnant.ingest import store_memory
 from remnant.prefetch import _expand_queries, _needs_memory
@@ -155,7 +155,7 @@ def test_expand_queries_empty():
 
 
 def test_semantic_search_ranks_relevant(hermes_home: Path):
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
@@ -186,7 +186,7 @@ def test_semantic_search_uses_bm25_prefilter(hermes_home: Path):
     reachable via the recency fallback (or BM25). Here we just assert no crash
     and a bounded result count.
     """
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
@@ -229,7 +229,7 @@ def test_rrf_fusion_merges_ranks():
 
 
 def test_auto_strategy_fuses(hermes_home: Path):
-    db = open_db(hermes_home / "remnant" / "remnant.db")
+    db = open_db(default_db_path())
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:

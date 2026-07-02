@@ -7,6 +7,7 @@ in the plugin derive from `hermes_home`, never from a hardcoded `~/.hermes`.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -20,8 +21,12 @@ DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 
 # Phase 4: Obsidian vault indexing. The vault is the single source of truth for
 # notes; we index it as type='document' memories. Excluded folders hold agent
-# scratch/workspace trees that must never be ingested.
-DEFAULT_VAULT_PATH = "/home/jd/obsidian-vaults/BlacksiteLabVault"
+# scratch/workspace trees that must never be ingested. The vault path default
+# can be overridden via the REMNANT_VAULT_PATH env var (useful for tests and
+# deployments that store the vault elsewhere than the hardcoded BSL path).
+DEFAULT_VAULT_PATH = os.environ.get(
+    "REMNANT_VAULT_PATH", "/home/jd/obsidian-vaults/BlacksiteLabVault"
+)
 DEFAULT_VAULT_EXCLUDE = ["90_", "91_", "92_", "93_", "94_", "95_", "99_ARCHIVE"]
 DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
 

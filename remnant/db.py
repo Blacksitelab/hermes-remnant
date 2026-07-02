@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import struct
 import threading
@@ -21,6 +22,24 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 6
+
+# Shared DB home: a single SQLite database used across all Hermes profiles /
+# agents so cross-agent features (shared vault search, dream-loop dedup,
+# graph traversal) work without merging per-profile DBs. The location can be
+# overridden via the REMNANT_DB_HOME env var (used by tests for isolation).
+DEFAULT_DB_HOME = Path("~/.hermes/remnant").expanduser()
+DB_FILENAME = "remnant.db"
+
+
+def default_db_path() -> Path:
+    """Return the shared Remnant DB path.
+
+    Honors the ``REMNANT_DB_HOME`` env var (primarily for tests); defaults to
+    ``~/.hermes/remnant/remnant.db``. Config remains profile-scoped under
+    ``hermes_home``; only the DB is shared.
+    """
+    home = Path(os.environ.get("REMNANT_DB_HOME", str(DEFAULT_DB_HOME)))
+    return home / DB_FILENAME
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -1578,6 +1597,8 @@ def open_db(db_path: str | Path) -> RemnantDB:
 __all__ = [
     "RemnantDB",
     "open_db",
+    "default_db_path",
+    "DEFAULT_DB_HOME",
     "_pack_embedding",
     "_unpack_embedding",
     "_normalize_entity_name",

@@ -96,6 +96,8 @@ memory:
 
 Run `hermes memory setup` to configure endpoints and agent id.
 
+Remnant stores its SQLite database at a **shared** location — `~/.hermes/remnant/remnant.db` — used by every Hermes profile and agent, so cross-agent features (shared vault search, dream-loop cross-agent dedup, entity-graph traversal across agents) work without merging per-profile databases. The location can be overridden with the `REMNANT_DB_HOME` env var. Per-profile **config** stays under each profile's `hermes_home` at `hermes_home/remnant.json`; only the DB is shared.
+
 ---
 
 ## Quick start
@@ -209,7 +211,11 @@ def register(ctx):
 
 ## Configuration
 
-Default config lives at `~/.hermes/remnant/config.yaml` and can be edited or set through `hermes memory setup`.
+Per-profile config lives at `hermes_home/remnant.json` (where `hermes_home` is the active Hermes profile directory, e.g. `~/.hermes/profiles/<profile>`). Edit it directly or set values through `hermes memory setup`. Each profile keeps its own config — `agent_id`, endpoints, vault path, visibility defaults — so multiple agents can share the single DB while remaining independently configured.
+
+The SQLite database is **shared** across all profiles at `~/.hermes/remnant/remnant.db` (override with the `REMNANT_DB_HOME` env var). Config is profile-scoped; storage is shared.
+
+The default vault path can be overridden with the `REMNANT_VAULT_PATH` env var before constructing a `RemnantConfig`.
 
 ```yaml
 agent_id: default
@@ -303,7 +309,7 @@ Shadow entries are appended to `~/.hermes/remnant/shadow.log` as JSON lines for 
 
 ## Backup
 
-The SQLite database at `~/.hermes/remnant/remnant.db` is returned by the provider's backup path list. Include it in normal Hermes workspace backups.
+The shared SQLite database at `~/.hermes/remnant/remnant.db` is returned by the provider's backup path list. Include it in normal Hermes workspace backups. Per-profile config files at `hermes_home/remnant.json` should also be backed up.
 
 ---
 

@@ -1,15 +1,18 @@
 """Remnant memory provider for Hermes Agent.
 
-Implements the Hermes ``MemoryProvider`` ABC. All storage is profile-scoped
-under ``hermes_home`` (passed via ``initialize()``). ``sync_turn`` is
-non-blocking: it persists the raw turn and enqueues extraction in a single
-SQLite transaction, then wakes the background worker.
+Implements the Hermes ``MemoryProvider`` ABC. Configuration stays profile-scoped
+under ``hermes_home`` (loaded from ``hermes_home/remnant.json``), but the SQLite
+database is **shared** across all profiles/agents at
+``~/.hermes/remnant/remnant.db`` (overridable via ``REMNANT_DB_HOME``) so that
+cross-agent features — shared vault search, dream-loop dedup, entity-graph
+traversal — work without merging per-profile DBs. ``sync_turn`` is non-blocking:
+it persists the raw turn and enqueues extraction in a single SQLite
+transaction, then wakes the background worker.
 """
 
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from typing import Any
 
 from .config import (
@@ -20,7 +23,7 @@ from .config import (
     load_config,
     save_config,
 )
-from .db import RemnantDB, open_db
+from .db import RemnantDB, default_db_path, open_db
 from .dream import day_dream, night_dream
 from .embed import Embedder
 from .extract import ExtractionWorker
@@ -259,7 +262,7 @@ class RemnantMemoryProvider(MemoryProvider):
         self._hermes_home = str(hermes_home)
         self._session_id = session_id or "default"
         self._config = load_config(self._hermes_home)
-        db_path = Path(self._hermes_home) / "remnant" / "remnant.db"
+        db_path = default_db_path()
         self._db = open_db(db_path)
         self._embedder = Embedder(self._db, self._config)
         self._worker = ExtractionWorker(self._db, self._embedder, self._config)
