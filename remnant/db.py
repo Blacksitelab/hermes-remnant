@@ -277,6 +277,7 @@ class RemnantDB:
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA temp_store=MEMORY;")
         conn.execute("PRAGMA foreign_keys=ON;")
+        conn.execute("PRAGMA busy_timeout=5000;")
         conn.row_factory = sqlite3.Row
         return conn
 

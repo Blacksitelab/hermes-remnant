@@ -30,6 +30,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from collections.abc import Iterator
 from pathlib import Path
@@ -355,19 +356,45 @@ def import_memory_store(
 
 # -- import: hindsight ------------------------------------------------------
 
-def _hindsight_recall(query: str, *, limit: int) -> list[dict[str, Any]]:
-    """Lazy import + call the Hindsight recall API.
+_HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_BASE_URL", "http://127.0.0.1:9514")
+_HINDSIGHT_BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "hermes-claire")
 
-    ``hindsight_recall`` is imported inside the function so the module loads
-    without the ``hindsight`` package installed (tests monkeypatch this
-    function). Returns a list of ``{"content": str, ...}`` dicts.
+
+def _hindsight_recall(query: str, *, limit: int) -> list[dict[str, Any]]:
+    """Call the Hindsight recall API via the Python client.
+
+    Uses ``HindsightClient`` (the installed ``hindsight`` package's client class)
+    to query the local Hindsight server. Returns a list of
+    ``{"content": str, "type": str, "id": str}`` dicts.
+
+    The server URL and bank ID are configurable via ``HINDSIGHT_BASE_URL`` and
+    ``HINDSIGHT_BANK_ID`` env vars (defaults: ``http://127.0.0.1:9514`` and
+    ``hermes-claire``).
     """
     try:
-        from hindsight import hindsight_recall as _recall  # type: ignore[import]
+        from hindsight import HindsightClient  # type: ignore[import]
     except Exception as e:  # pragma: no cover - tests monkeypatch this fn
-        log.warning("import: hindsight_recall unavailable: %s", e)
+        log.warning("import: HindsightClient unavailable: %s", e)
         return []
-    return list(_recall(query, limit=limit) or [])
+    try:
+        client = HindsightClient(base_url=_HINDSIGHT_BASE_URL)
+        resp = client.recall(
+            bank_id=_HINDSIGHT_BANK_ID,
+            query=query,
+            max_tokens=4096,
+        )
+        results = []
+        for r in (resp.results or []):
+            results.append({
+                "id": r.id,
+                "type": r.type,
+                "content": r.text,
+            })
+        client.close()
+        return results
+    except Exception as e:
+        log.warning("import: hindsight recall failed for query %r: %s", query, e)
+        return []
 
 
 def import_hindsight(
