@@ -16,6 +16,17 @@ manual `memory_store` tool path:
 Entity types (per spec): person, service, project, concept, place, tool.
 Aliases are normalized by lowercasing + stripping punctuation; resolution
 matches on name first, then any alias, scoped to the agent when one is given.
+
+Issue #5 additions:
+- ``_STOPLIST``: a module-level set of capitalized phrases (date/time terms,
+  country/region names, generic tech nouns) dropped from regex extraction. It
+  is configurable by passing a custom ``stoplist`` to ``extract_entities``.
+- ``link_memory_entities(..., min_memories=N)``: a frequency threshold that
+  defers entity creation until a name is sighted in >= N distinct memories.
+  ``min_memories=1`` (default) keeps the original always-link behaviour.
+- ``extract_and_link_entities``: the unified entry point. When typed entities
+  from the LLM are supplied it links them directly and skips the regex pass,
+  preventing double extraction noise.
 """
 
 from __future__ import annotations
@@ -49,6 +60,47 @@ _STOPWORDS = {
     "User", "Assistant", "Remnant",
 }
 
+# Issue #5: a configurable stoplist of capitalized phrases that are NOT entities
+# — they are temporal / geographic / generic-tech context rather than durable
+# subjects worth tracking. Matched on the lowercased extracted phrase (after
+# leading ``_STOPWORDS`` are stripped), so multi-word entries like "new zealand"
+# or "hawke's bay" match the full phrase while a proper noun such as "Proxmox"
+# never matches.
+#
+# Kept module-level (mirroring ``_STOPWORDS``) so callers and tests can extend
+# it without touching the regex. The extraction LLM path is unaffected: typed
+# entities from the model bypass ``extract_entities`` entirely.
+_STOPLIST: set[str] = {
+    # --- date / time terms -------------------------------------------------
+    "january", "february", "march", "april", "may", "june", "july",
+    "august", "september", "october", "november", "december",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "today", "tonight", "tomorrow", "yesterday",
+    "morning", "evening", "afternoon", "night", "midnight",
+    "noon", "dawn", "dusk",
+    # Year-like standalone tokens (the regex only captures capitalized forms,
+    # but a few all-caps / abbreviated variants sneak through).
+    "2024", "2025", "2026",
+    # --- countries / regions / states / cities as location context ----------
+    # Listed when they are merely *where* something happens, not a project or
+    # organisation. A proper-noun lab / project named after a place still wins
+    # because it is a multi-word phrase that does not match these single /
+    # listed entries.
+    "new zealand", "hawke's bay", "hawkes bay", "hawke bay",
+    "pacific", "auckland", "wellington", "christchurch", "dunedin",
+    "australia", "canada", "united states", "united kingdom", "europe",
+    "asia", "africa", "americas",
+    "north island", "south island",
+    # --- generic tech nouns (only matched as the full standalone phrase) ---
+    # "server", "api", "proxy" etc. are not specific systems/tools for this
+    # lab; a proper name like "Proxmox Server" is a multi-word phrase that does
+    # NOT match these single-word entries, so real systems survive.
+    "server", "api", "proxy", "database", "endpoint", "client",
+    "service", "daemon", "agent", "tool", "framework", "library",
+    "plugin", "editor", "ide", "cli", "repository", "build", "pipeline",
+    "migration", "project", "module", "package", "config", "backup",
+}
+
 
 def normalize_aliases(aliases: list[str]) -> list[str]:
     """Lowercase + strip punctuation from each alias, drop empties/dups."""
@@ -71,16 +123,27 @@ def guess_type(name: str, context: str = "") -> str | None:
     return None
 
 
-def extract_entities(text: str) -> list[dict[str, Any]]:
+def extract_entities(
+    text: str,
+    *,
+    stoplist: set[str] | None = None,
+) -> list[dict[str, Any]]:
     """Lightweight local entity extraction. No LLM, pure regex/keywords.
 
     Returns a list of ``{"name": str, "type": str|None, "aliases": [str]}``
     dicts. Proper nouns become entities; type is guessed from context if a
     keyword match exists, otherwise left None for the LLM extraction pass to
     fill in.
+
+    ``stoplist`` (default: the module-level ``_STOPLIST``) drops capitalized
+    phrases that are date/time terms, country/region names used as location
+    context, or generic tech nouns without a proper name. Matching is on the
+    lowercased phrase so multi-word entries like ``"new zealand"`` match while a
+    real system such as ``"Proxmox Server"`` is preserved.
     """
     if not text:
         return []
+    deny = stoplist if stoplist is not None else _STOPLIST
     seen: set[str] = set()
     out: list[dict[str, Any]] = []
     for match in _PROPER_RE.findall(text):
@@ -98,6 +161,9 @@ def extract_entities(text: str) -> list[dict[str, Any]]:
             continue
         key = name.lower()
         if key in seen:
+            continue
+        # Issue #5: drop dates, generic places, and bare tech nouns.
+        if key in deny:
             continue
         seen.add(key)
         out.append({
@@ -176,35 +242,133 @@ def link_memory_entities(
     memory_id: str,
     entities: list[dict[str, Any]],
     agent_id: str | None = None,
+    min_memories: int = 1,
 ) -> list[str]:
     """Resolve + link a list of typed entity dicts to a memory.
 
     Each dict: ``{"name": str, "type": str|None, "aliases": [str]}``.
-    Returns the list of resolved entity ids (for relation seeding).
+    Returns the list of resolved entity ids linked to *this* memory (used for
+    relation seeding).
+
+    ``min_memories`` (issue #5) gates persistence: a newly extracted entity is
+    only created/linked once it has been sighted in at least this many distinct
+    memories. ``min_memories=1`` (the default) restores the original
+    always-link behaviour and is used by the typed LLM path and the low-level
+    API. ``min_memories>1`` defers creation via the ``entity_sightings`` table:
+    the first sighting records a pending row, and the sighting that crosses the
+    threshold creates the entity and links it to every sighted memory.
+    Existing single-mention entities already in the DB are left in place.
     """
-    ids: list[str] = []
+    if min_memories <= 1:
+        ids: list[str] = []
+        for ent in entities:
+            name = (ent.get("name") or "").strip()
+            if not name:
+                continue
+            eid, _ = resolve_and_link(
+                db,
+                memory_id=memory_id,
+                entity_name=name,
+                agent_id=agent_id,
+                entity_type=ent.get("type"),
+                aliases=ent.get("aliases") or [],
+            )
+            if eid:
+                ids.append(eid)
+        if len(ids) >= 2:
+            seed_relations(db, memory_id=memory_id, entity_ids=ids)
+        return ids
+
+    # Threshold path: defer entity creation until >= min_memories sightings.
+    linked_ids: list[str] = []
     for ent in entities:
         name = (ent.get("name") or "").strip()
         if not name:
             continue
-        eid, _ = resolve_and_link(
-            db,
-            memory_id=memory_id,
-            entity_name=name,
-            agent_id=agent_id,
-            entity_type=ent.get("type"),
-            aliases=ent.get("aliases") or [],
-        )
-        if eid:
-            ids.append(eid)
-    if len(ids) >= 2:
-        seed_relations(db, memory_id=memory_id, entity_ids=ids)
-    return ids
+        name_key = _normalize_entity_name(name)
+        if not name_key:
+            continue
+        eid = db.find_entity_by_name(name, agent_id=agent_id)
+        existing = db.count_entity_links(eid) if eid else 0
+        # Linking this memory would bring the total to ``existing + 1``.
+        if existing >= min_memories - 1 or existing + 1 >= min_memories:
+            if not eid:
+                eid = db.resolve_entity(
+                    name, agent_id, entity_type=ent.get("type"),
+                    aliases=ent.get("aliases") or [],
+                )
+            if eid:
+                db.link_entity(
+                    memory_id=memory_id, entity_id=eid,
+                    agent_id=agent_id, relation_role=None,
+                )
+                linked_ids.append(eid)
+                db.clear_entity_sightings(name_key, agent_id)
+            continue
+        # Below threshold: record a sighting and promote only when the count
+        # of distinct sighted memories reaches ``min_memories``.
+        db.record_entity_sighting(name_key, agent_id, memory_id)
+        sight_mids = db.entity_sighting_memory_ids(name_key, agent_id)
+        if len(sight_mids) >= min_memories:
+            if not eid:
+                eid = db.resolve_entity(
+                    name, agent_id, entity_type=ent.get("type"),
+                    aliases=ent.get("aliases") or [],
+                )
+            if eid:
+                for smid in sight_mids:
+                    db.link_entity(
+                        memory_id=smid, entity_id=eid,
+                        agent_id=agent_id, relation_role=None,
+                    )
+                linked_ids.append(eid)
+                db.clear_entity_sightings(name_key, agent_id)
+    if len(linked_ids) >= 2:
+        seed_relations(db, memory_id=memory_id, entity_ids=linked_ids)
+    return linked_ids
+
+
+def extract_and_link_entities(
+    db: RemnantDB,
+    *,
+    memory_id: str,
+    text: str,
+    typed_entities: list[dict[str, Any]] | None = None,
+    agent_id: str | None = None,
+    min_memories: int = 1,
+    stoplist: set[str] | None = None,
+) -> list[str]:
+    """Unified entity linking entry point (issue #5).
+
+    When ``typed_entities`` is supplied (the LLM extraction path), link those
+    directly and DO NOT additionally run the regex ``extract_entities`` pass —
+    the model has already curated the entities, so re-running the regex would
+    only add noise (dates, generic nouns, single-mention proper nouns).
+
+    When ``typed_entities`` is empty/None (the regex fallback path used by
+    ``import_sources`` and ``vault``), extract entities locally with
+    ``extract_entities`` and link them through ``link_memory_entities``.
+
+    ``min_memories`` is forwarded to ``link_memory_entities`` so the regex
+    fallback can be gated by the frequency threshold while the typed path
+    bypasses it.
+    """
+    if typed_entities:
+        entities = typed_entities
+    else:
+        entities = extract_entities(text, stoplist=stoplist)
+    if not entities:
+        return []
+    return link_memory_entities(
+        db, memory_id=memory_id, entities=entities,
+        agent_id=agent_id, min_memories=min_memories,
+    )
 
 
 __all__ = [
     "ENTITY_TYPES",
     "extract_entities",
+    "extract_and_link_entities",
     "guess_type",
     "link_memory_entities",
     "normalize_aliases",

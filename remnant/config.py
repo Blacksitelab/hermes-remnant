@@ -120,6 +120,13 @@ class RemnantConfig:
     vault_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_VAULT_EXCLUDE))
     profile_scope: list[str] = field(default_factory=list)
     vault_reindex_interval_s: int = DEFAULT_VAULT_REINDEX_INTERVAL_S
+    # Entity extraction tuning (issue #5). Newly regex-extracted entities must
+    # be sighted in at least this many distinct memories before being
+    # persisted/linked. The LLM typed-entity path bypasses this threshold (the
+    # extraction model already curates entities). Defaults to 2 so one-off
+    # capitalized phrases (dates, places, generic nouns) do not pollute the
+    # entity graph; set to 1 to restore the old always-link behaviour.
+    entity_min_memories: int = 2
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

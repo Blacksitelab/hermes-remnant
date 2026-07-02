@@ -39,7 +39,7 @@ from typing import Any
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import extract_entities, link_memory_entities
+from .entity import extract_and_link_entities
 
 log = logging.getLogger("remnant.import_sources")
 
@@ -342,9 +342,16 @@ def import_memory_store(
                 embed_model=embed_model,
             )
             if mid:
-                ents = extract_entities(entry)
-                if ents:
-                    link_memory_entities(db, memory_id=mid, entities=ents, agent_id=actor)
+                # Issue #5: prefer typed entities when available (none come from
+                # markdown parsing); otherwise fall back to the regex extractor.
+                # The frequency threshold (config.entity_min_memories, default 2)
+                # defers persistence until a name is sighted in >= 2 memories so
+                # one-off dates / places / generic nouns do not pollute the graph.
+                extract_and_link_entities(
+                    db, memory_id=mid, text=entry,
+                    typed_entities=None, agent_id=actor,
+                    min_memories=getattr(config, "entity_min_memories", 2),
+                )
                 db.write_audit(
                     actor=actor,
                     action="import",
@@ -512,11 +519,12 @@ def import_hindsight(
                     embed_model=embed_model,
                 )
                 if mid:
-                    ents = extract_entities(content)
-                    if ents:
-                        link_memory_entities(
-                            db, memory_id=mid, entities=ents, agent_id=actor
-                        )
+                    # Issue #5: regex fallback gated by the frequency threshold.
+                    extract_and_link_entities(
+                        db, memory_id=mid, text=content,
+                        typed_entities=None, agent_id=actor,
+                        min_memories=getattr(config, "entity_min_memories", 2),
+                    )
                     db.write_audit(
                         actor=actor,
                         action="import",

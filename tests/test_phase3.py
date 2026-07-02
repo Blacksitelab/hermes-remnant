@@ -19,6 +19,7 @@ from remnant.db import default_db_path, open_db
 from remnant.edit import memory_edit
 from remnant.embed import Embedder, cosine
 from remnant.entity import (
+    extract_and_link_entities,
     extract_entities,
     link_memory_entities,
     normalize_aliases,
@@ -991,3 +992,206 @@ def test_memory_edit_schema_actions_enum(provider: RemnantMemoryProvider):
 def test_cosine_phase3_helper():
     assert cosine([1.0, 0.0], [1.0, 0.0]) == pytest.approx(1.0)
     assert cosine([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
+
+
+# ===========================================================================
+# 7. Issue #5: entity-cleanup (stoplist + frequency threshold + typed-first)
+# ===========================================================================
+
+
+def test_extract_entities_drops_date_phrases():
+    """Capitalized date/time terms are NOT extracted as entities."""
+    ents = extract_entities("Sven met the team on June 22 and again Monday morning")
+    names = {e["name"] for e in ents}
+    assert "June" not in names, "month names should be stopped"
+    assert "Monday" not in names, "weekday names should be stopped"
+    # The real proper noun survives.
+    assert "Sven" in names
+
+
+def test_extract_entities_drops_country_region_names():
+    """Country / region / state names used as location context are stopped."""
+    ents = extract_entities(
+        "Sven visited New Zealand and drove through Hawke's Bay last week"
+    )
+    names = {e["name"] for e in ents}
+    assert "New Zealand" not in names
+    assert "Hawke's" not in names
+    assert "Sven" in names  # real entity survives
+
+
+def test_extract_entities_drops_generic_tech_nouns():
+    """Bare generic tech nouns (server/api/proxy) are stopped, but a proper
+    multi-word system name (Proxmox Server) survives."""
+    ents = extract_entities("The Server crashed; the API and Proxy were restarted")
+    names = {e["name"] for e in ents}
+    assert "Server" not in names
+    assert "API" not in names
+    assert "Proxy" not in names
+    # A real proper-noun system keeps its name even with a generic suffix word.
+    ents2 = extract_entities("The Proxmox Server runs in the homelab")
+    names2 = {e["name"] for e in ents2}
+    assert "Proxmox Server" in names2
+
+
+def test_extract_entities_custom_stoplist_extends_default():
+    """Callers can pass their own stoplist to extend suppression."""
+    ents = extract_entities(
+        "Sven runs Proxmox", stoplist={"sven"}
+    )
+    names = {e["name"] for e in ents}
+    assert "Sven" not in names
+    assert "Proxmox" in names
+
+
+def test_entity_mentioned_once_is_not_persisted(hermes_home: Path):
+    """With min_memories=2 a single sighting defers entity creation."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    _fake_embed(db, cfg)
+    try:
+        mid = db.insert_memory(content="Sven runs Proxmox on the homelab", agent="default")
+        ids = link_memory_entities(
+            db, memory_id=mid,
+            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            agent_id="default", min_memories=2,
+        )
+        # No entity was created/linked on the first sighting.
+        assert ids == []
+        assert db.find_entity_by_name("Sven", agent_id="default") is None
+        with db.read() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM memory_entities WHERE memory_id=?", (mid,)
+            )
+            assert cur.fetchone()["c"] == 0
+        # But a sighting was recorded so the second sighting can promote it.
+        assert db.entity_sighting_count("sven", agent_id="default") == 1
+    finally:
+        db.close()
+
+
+def test_entity_persisted_on_second_sighting(hermes_home: Path):
+    """The same entity mentioned in two memories is persisted on the second
+    linking and back-linked to the first memory."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    _fake_embed(db, cfg)
+    try:
+        mid1 = db.insert_memory(content="Sven prefers dark mode", agent="default")
+        ids1 = link_memory_entities(
+            db, memory_id=mid1,
+            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            agent_id="default", min_memories=2,
+        )
+        assert ids1 == [], "first sighting should not persist"
+
+        mid2 = db.insert_memory(content="Sven also likes vim", agent="default")
+        ids2 = link_memory_entities(
+            db, memory_id=mid2,
+            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            agent_id="default", min_memories=2,
+        )
+        # Second sighting promotes the entity and links both memories.
+        assert len(ids2) == 1
+        eid = ids2[0]
+        ent = db.get_entity(eid)
+        assert ent is not None
+        assert ent["name"] == "sven"
+        assert ent["type"] == "person"
+        # Both memories are linked (the sighting for mid1 was back-filled).
+        linked = db.get_memories_for_entity(eid, agent_id="default")
+        linked_ids = {m["id"] for m in linked}
+        assert {mid1, mid2} <= linked_ids
+        # Sighting rows are cleared after promotion.
+        assert db.entity_sighting_count("sven", agent_id="default") == 0
+    finally:
+        db.close()
+
+
+def test_existing_single_mention_entity_remains_in_db(hermes_home: Path):
+    """An entity already linked to one memory (pre-threshold) stays; the
+    threshold only gates *newly* extracted entities."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    _fake_embed(db, cfg)
+    try:
+        mid = db.insert_memory(content="x", agent="default")
+        # Create + link an entity the legacy way (min_memories=1).
+        eid, _ = resolve_and_link(
+            db, memory_id=mid, entity_name="Proxmox", agent_id="default",
+            entity_type="service",
+        )
+        assert eid
+        assert db.count_entity_links(eid) == 1
+        # A new sighting of a *different* entity under min_memories=2 does not
+        # touch the existing single-mention entity.
+        mid2 = db.insert_memory(content="y", agent="default")
+        link_memory_entities(
+            db, memory_id=mid2,
+            entities=[{"name": "Nova", "type": "service", "aliases": []}],
+            agent_id="default", min_memories=2,
+        )
+        assert db.get_entity(eid) is not None, "existing entity must remain"
+        assert db.count_entity_links(eid) == 1
+    finally:
+        db.close()
+
+
+def test_typed_entities_skip_regex_fallback(monkeypatch, hermes_home: Path):
+    """When typed_entities are supplied, extract_entities (regex) is NOT run."""
+    from remnant import entity as entity_mod
+
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    _fake_embed(db, cfg)
+    try:
+        mid = db.insert_memory(content="x", agent="default")
+
+        calls: list[str] = []
+        original = entity_mod.extract_entities
+
+        def spy(text: str, **kwargs):
+            calls.append(text)
+            return original(text, **kwargs)
+
+        monkeypatch.setattr(entity_mod, "extract_entities", spy)
+
+        # Typed entities supplied: the regex path must not be invoked.
+        typed = [{"name": "Sven", "type": "person", "aliases": []}]
+        ids = extract_and_link_entities(
+            db, memory_id=mid, text="Sven prefers dark mode on Monday",
+            typed_entities=typed, agent_id="default", min_memories=1,
+        )
+        assert len(ids) == 1
+        assert calls == [], "regex extract_entities should not run for typed path"
+        # The typed entity was linked; the stoplisted "Monday" (which regex
+        # would have dropped anyway) was never even considered.
+        assert db.find_entity_by_name("Sven", agent_id="default") is not None
+
+        # Reset: with no typed entities, the regex path runs.
+        calls.clear()
+        mid2 = db.insert_memory(content="y", agent="default")
+        extract_and_link_entities(
+            db, memory_id=mid2, text="Sven likes Proxmox",
+            typed_entities=None, agent_id="default", min_memories=1,
+        )
+        assert calls, "regex extract_entities should run on the fallback path"
+    finally:
+        db.close()
+
+
+def test_extract_and_link_applies_threshold_on_regex_path(hermes_home: Path):
+    """The regex fallback path honours min_memories: one sighting defers."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    _fake_embed(db, cfg)
+    try:
+        mid = db.insert_memory(content="Sven runs Proxmox", agent="default")
+        ids = extract_and_link_entities(
+            db, memory_id=mid, text="Sven runs Proxmox",
+            typed_entities=None, agent_id="default", min_memories=2,
+        )
+        assert ids == [], "single regex sighting should be deferred"
+        assert db.find_entity_by_name("Sven", agent_id="default") is None
+    finally:
+        db.close()

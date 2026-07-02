@@ -215,6 +215,21 @@ CREATE TABLE IF NOT EXISTS dream_state (
     value TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+
+-- Issue #5: pending entity sightings. When the regex extraction path defers
+-- entity creation until a name has been sighted in >= ``entity_min_memories``
+-- distinct memories, each sighting is recorded here keyed by the normalized
+-- name + agent. Once the threshold is reached the entity is created, linked
+-- to every sighted memory, and the sighting rows are cleared. Entities that
+-- pre-date this mechanism (single-mention, already linked) are left alone.
+CREATE TABLE IF NOT EXISTS entity_sightings (
+    name_key TEXT NOT NULL,
+    agent TEXT,
+    memory_id TEXT NOT NULL,
+    seen_at TEXT NOT NULL,
+    PRIMARY KEY(name_key, agent, memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sightings_name ON entity_sightings(name_key, agent);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -874,6 +889,67 @@ class RemnantDB:
             )
             row = cur.fetchone()
             return row["id"] if row is not None else None
+
+    def count_entity_links(self, entity_id: str) -> int:
+        """Number of memories linked to ``entity_id`` (any status)."""
+        if not entity_id:
+            return 0
+        with self.read() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM memory_entities WHERE entity_id=?",
+                (entity_id,),
+            )
+            return int(cur.fetchone()["c"])
+
+    def record_entity_sighting(
+        self, name_key: str, agent_id: str | None, memory_id: str
+    ) -> None:
+        """Record a deferred entity sighting (idempotent)."""
+        if not name_key or not memory_id:
+            return
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR IGNORE INTO entity_sightings(name_key, agent, memory_id, seen_at) "
+                "VALUES(?,?,?,?)",
+                (name_key, agent_id, memory_id, _now_iso()),
+            )
+
+    def entity_sighting_count(self, name_key: str, agent_id: str | None) -> int:
+        """Number of distinct memories that have sighted ``name_key``."""
+        if not name_key:
+            return 0
+        with self.read() as cur:
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM entity_sightings WHERE name_key=? AND "
+                "(agent IS NULL OR agent=?)",
+                (name_key, agent_id),
+            )
+            return int(cur.fetchone()["c"])
+
+    def entity_sighting_memory_ids(
+        self, name_key: str, agent_id: str | None
+    ) -> list[str]:
+        """Memory ids of every sighting of ``name_key``."""
+        if not name_key:
+            return []
+        with self.read() as cur:
+            cur.execute(
+                "SELECT memory_id FROM entity_sightings WHERE name_key=? AND "
+                "(agent IS NULL OR agent=?)",
+                (name_key, agent_id),
+            )
+            return [r["memory_id"] for r in cur.fetchall()]
+
+    def clear_entity_sightings(self, name_key: str, agent_id: str | None) -> None:
+        """Drop sighting rows for ``name_key`` (after promotion)."""
+        if not name_key:
+            return
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM entity_sightings WHERE name_key=? AND "
+                "(agent IS NULL OR agent=?)",
+                (name_key, agent_id),
+            )
 
     # -- relations -------------------------------------------------------------
 
