@@ -1,0 +1,79 @@
+"""Ollama embedding client + cosine helper.
+
+- nomic-embed-text (768-dim) via the BSL1 Ollama `/api/embeddings` endpoint.
+- SQLite-backed cache keyed on (model, sha256(text)) so repeated facts never
+  re-hit the network.
+- `cosine()` for dedup comparison.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import math
+
+import httpx
+
+from .config import RemnantConfig
+from .db import RemnantDB
+
+log = logging.getLogger("remnant.embed")
+
+
+def _hash(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def cosine(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = 0.0
+    na = 0.0
+    nb = 0.0
+    for x, y in zip(a, b):
+        dot += x * y
+        na += x * x
+        nb += y * y
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return dot / math.sqrt(na * nb)
+
+
+class Embedder:
+    """Embedding client with SQLite-backed cache."""
+
+    def __init__(self, db: RemnantDB, config: RemnantConfig):
+        self._db = db
+        self._model = config.embed_model
+        self._url = config.embed_url
+        self._timeout = config.embed_timeout
+        self._client = httpx.Client(timeout=self._timeout)
+
+    def embed(self, text: str) -> list[float]:
+        """Return the embedding for `text`, hitting the cache when possible."""
+        text_hash = _hash(text)
+        cached = self._db.get_cached_embedding(self._model, text_hash)
+        if cached is not None:
+            return cached
+        vec = self._embed_remote(text)
+        self._db.put_cached_embedding(self._model, text_hash, vec)
+        return vec
+
+    def _embed_remote(self, text: str) -> list[float]:
+        try:
+            resp = self._client.post(
+                self._url,
+                json={"model": self._model, "prompt": text},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return [float(x) for x in data["embedding"]]
+        except (httpx.HTTPError, KeyError, ValueError) as e:
+            log.warning("embedding request failed: %s", e)
+            return []
+
+    def close(self) -> None:
+        self._client.close()
+
+
+__all__ = ["Embedder", "cosine"]

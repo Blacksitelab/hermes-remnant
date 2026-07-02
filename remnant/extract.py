@@ -1,0 +1,191 @@
+"""Async extraction worker.
+
+- Runs in a `ThreadPoolExecutor` (single worker by default) so `sync_turn`
+  stays non-blocking.
+- Pulls jobs from the persisted `extraction_queue` table; restarts don't lose
+  turns.
+- Calls gemma4:12b on the BSL1 OpenAI-compatible endpoint and parses facts +
+  entities from the JSON response.
+- Runs each extracted fact through the transient-state filter and dedup before
+  storing.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import threading
+from typing import Any
+
+import httpx
+
+from .config import RemnantConfig
+from .db import RemnantDB
+from .embed import Embedder
+from .ingest import is_transient, store_memory
+
+log = logging.getLogger("remnant.extract")
+
+_EXTRACT_PROMPT = (
+    "You are a memory extraction engine. Read the conversation turn and "
+    "extract durable facts worth remembering long-term.\n"
+    "\n"
+    "Rules:\n"
+    "- Only extract stable, long-lived facts (preferences, identity, projects, "
+    "relationships, owned things, recurring context).\n"
+    "- DO NOT extract transient state (current percentages, right-now status, "
+    '"is at", "currently", "today", timestamps).\n'
+    "- One fact per line, as a complete declarative sentence.\n"
+    "- Also list the entities (proper nouns / names of people, projects, "
+    "devices) that each fact is about.\n"
+    "\n"
+    "Return STRICT JSON only, no prose:\n"
+    '{"facts": [{"entity": "<entity name>", "fact": "<one-sentence fact>", '
+    '"visibility": "private"}]}\n'
+    "\n"
+    "Visibility must be one of: private, shared, fleet. Default to private."
+)
+
+_STOP_RE = re.compile(
+    r"\b(currently|now|is at|today|tonight|this morning|right now)\b",
+    re.IGNORECASE,
+)
+_PERCENT_RE = re.compile(r"\b\d{1,3}\s*%\b|\bpercent\b", re.IGNORECASE)
+_TIME_RE = re.compile(
+    r"\b\d{1,2}:\d{2}\b|\b(am|pm)\b", re.IGNORECASE
+)
+
+
+class ExtractionWorker:
+    """Background worker that drains the extraction_queue."""
+
+    def __init__(
+        self,
+        db: RemnantDB,
+        embedder: Embedder,
+        config: RemnantConfig,
+    ):
+        self._db = db
+        self._embedder = embedder
+        self._config = config
+        self._client = httpx.Client(timeout=config.extract_timeout)
+        self._stop = threading.Event()
+        self._executor: Any = None
+        self._future: Any = None
+        self._wake = threading.Event()
+
+    def start(self) -> None:
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="remnant-extract"
+        )
+        self._future = self._executor.submit(self._loop)
+
+    def wake(self) -> None:
+        """Wake the worker loop to check for new jobs."""
+        self._wake.set()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            self._wake.clear()
+            try:
+                self._drain()
+            except Exception as e:
+                log.warning("extraction loop error: %s", e)
+            # Wait for wake or poll interval
+            self._wake.wait(timeout=2.0)
+
+    def _drain(self) -> None:
+        while not self._stop.is_set():
+            job = self._db.claim_next_extraction(self._config.agent_id)
+            if job is None:
+                return
+            try:
+                self._process(job)
+                self._db.complete_extraction(int(job["id"]))
+            except Exception as e:
+                log.warning("extraction failed for turn %s: %s", job["turn_id"], e)
+                self._db.fail_extraction(int(job["id"]))
+
+    def _process(self, job: dict[str, Any]) -> None:
+        facts = self._extract(job["user_text"], job["assistant_text"])
+        for f in facts:
+            fact_text = f.get("fact", "").strip()
+            entity = f.get("entity", "").strip() or "general"
+            visibility = f.get("visibility", self._config.default_visibility)
+            if not fact_text:
+                continue
+            if is_transient(fact_text):
+                log.debug("rejected transient fact: %s", fact_text)
+                continue
+            canonical = self._db.resolve_entity(entity, job["agent_id"])
+            store_memory(
+                self._db,
+                self._embedder,
+                self._config,
+                fact=fact_text,
+                entity=canonical,
+                session_id=job["session_id"],
+                agent_id=job["agent_id"],
+                visibility=visibility,
+                source_turn_id=int(job["turn_id"]),
+            )
+
+    def _extract(self, user_text: str, assistant_text: str) -> list[dict[str, Any]]:
+        if not self._config.extract_enabled:
+            return []
+        content = f"USER: {user_text}\nASSISTANT: {assistant_text}"
+        try:
+            resp = self._client.post(
+                self._config.extract_url,
+                json={
+                    "model": self._config.extract_model,
+                    "messages": [
+                        {"role": "system", "content": _EXTRACT_PROMPT},
+                        {"role": "user", "content": content},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 512,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["choices"][0]["message"]["content"]
+            return _parse_facts(text)
+        except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as e:
+            log.warning("extraction LLM call failed: %s", e)
+            return []
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._wake.set()
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+        self._client.close()
+
+
+def _parse_facts(text: str) -> list[dict[str, Any]]:
+    """Parse the LLM response. Tolerates trailing prose / fenced blocks."""
+    # Try direct JSON first
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "facts" in obj:
+            return obj["facts"]
+    except json.JSONDecodeError:
+        pass
+    # Fall back to the first {...} block
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            obj = json.loads(text[start : end + 1])
+            if isinstance(obj, dict) and "facts" in obj:
+                return obj["facts"]
+        except json.JSONDecodeError:
+            pass
+    return []
+
+
+__all__ = ["ExtractionWorker"]
