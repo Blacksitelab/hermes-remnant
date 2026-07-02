@@ -21,6 +21,7 @@ from .config import (
     save_config,
 )
 from .db import RemnantDB, open_db
+from .dream import day_dream, night_dream
 from .embed import Embedder
 from .extract import ExtractionWorker
 from .ingest import ingest_turn
@@ -123,6 +124,15 @@ _SYSTEM_PROMPT_BLOCK = (
     "notes are indexed but their content is hidden from other agents in search.\n"
     "Transient state (percentages, current status, timestamps) is rejected.\n"
     "Memories are scoped by agent and visibility (private/shared/fleet).\n"
+    "Use the `memory_thread` tool to manage topic threads: create, update, "
+    "resolve, list, or sweep stale (threads inactive 14 days are marked stale). "
+    "Threads capture ongoing conversations and dream-loop suggestions; they are "
+    "never deleted.\n"
+    "A bounded dream loop (day_dream / night_dream, invokable from a cron timer) "
+    "finds non-obvious connections across memories and writes reflections to a "
+    "private DREAMS.md diary; cross-agent duplicates are merged into shared "
+    "memory. The loop pre-filters candidates locally and only ever sends a small "
+    "bounded list to the cloud model.\n"
 )
 
 # Config schema exposed to `hermes memory setup`. Kept minimal: only fields a
@@ -387,6 +397,22 @@ class RemnantMemoryProvider(MemoryProvider):
         return _index_vault(
             self._db, self._config, self._embedder, force=force
         )
+
+    # -- dream loop (Phase 5) -------------------------------------------------
+
+    def run_dream_loop(self, mode: str = "day") -> dict[str, Any]:
+        """Run a single dream-loop pass (callable from a cron/systemd timer).
+
+        ``mode`` is ``"day"`` or ``"night"``. Returns the loop summary dict.
+        Never starts a daemon: each call is one bounded pass.
+        """
+        if self._db is None or self._config is None or self._embedder is None:
+            return {"mode": mode, "skipped": "not_initialized"}
+        if mode == "day":
+            return day_dream(self._db, self._config, self._embedder)
+        if mode == "night":
+            return night_dream(self._db, self._config, self._embedder)
+        return {"mode": mode, "error": f"unknown mode: {mode}"}
 
 
 def register(ctx: Any) -> None:

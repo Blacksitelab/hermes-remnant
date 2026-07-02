@@ -27,6 +27,13 @@ from .graph import graph_traverse
 from .ingest import store_memory
 from .reflect import memory_reflect
 from .search import search
+from .threads import (
+    create_thread,
+    list_threads,
+    resolve_thread,
+    sweep_stale_threads,
+    update_thread,
+)
 from .vault import index_vault
 
 log = logging.getLogger("remnant.tools")
@@ -238,6 +245,71 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_thread",
+            "description": (
+                "Manage topic threads. Actions: create (start a new thread), "
+                "update (edit title/status/importance), resolve (mark a thread "
+                "done), list (list threads, optionally filtered by status), "
+                "stale (sweep threads inactive for 14 days to status='stale'). "
+                "Threads are never deleted."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["create", "update", "resolve", "list", "stale"],
+                        "description": "The thread action to perform.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Target thread id (update/resolve).",
+                    },
+                    "title": {
+                        "type": "string",
+                        "description": "Thread title (create) or new title (update).",
+                    },
+                    "topic": {
+                        "type": "string",
+                        "description": "Short topic key (create).",
+                    },
+                    "importance": {
+                        "type": "number",
+                        "description": "Importance 0.0-1.0 (create/update).",
+                    },
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "stale", "resolved"],
+                        "description": "New status (update).",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tags for the thread (create/update).",
+                    },
+                    "related_entities": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Entity ids/names linked to the thread.",
+                    },
+                    "status_filter": {
+                        "type": "string",
+                        "enum": ["active", "stale", "resolved"],
+                        "description": "Filter for the list action.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max threads to return (list, default 50).",
+                        "default": 50,
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
 
 
@@ -376,6 +448,81 @@ def handle_tool_call(
             "skipped": stats["skipped"],
             "forgotten": stats["forgotten"],
         }
+    if tool_name == "memory_thread":
+        action = str(args.get("action", "")).strip().lower()
+        if not action:
+            return {"error": "action is required"}
+        if action == "create":
+            title = str(args.get("title", "")).strip()
+            topic = str(args.get("topic", "")).strip()
+            if not title or not topic:
+                return {"error": "title and topic are required for create"}
+            try:
+                importance = float(args.get("importance", 0.5))
+            except (TypeError, ValueError):
+                importance = 0.5
+            tags = args.get("tags")
+            related = args.get("related_entities")
+            tid = create_thread(
+                db,
+                title=title,
+                topic=topic,
+                importance=importance,
+                tags=[str(t) for t in tags] if isinstance(tags, list) else None,
+                related_entities=(
+                    [str(e) for e in related] if isinstance(related, list) else None
+                ),
+                source="agent",
+                added_by=aid,
+            )
+            return {"thread_id": tid, "title": title, "topic": topic}
+        if action == "update":
+            tid = str(args.get("thread_id", "")).strip()
+            if not tid:
+                return {"error": "thread_id is required for update"}
+            try:
+                importance = (
+                    float(args.get("importance")) if args.get("importance") is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                importance = None
+            tags = args.get("tags")
+            related = args.get("related_entities")
+            res = update_thread(
+                db,
+                tid,
+                title=args.get("title"),
+                status=args.get("status"),
+                importance=importance,
+                tags=([str(t) for t in tags] if isinstance(tags, list) else None),
+                related_entities=(
+                    [str(e) for e in related] if isinstance(related, list) else None
+                ),
+            )
+            if res is None:
+                return {"error": f"thread not found: {tid}"}
+            return {"thread": res}
+        if action == "resolve":
+            tid = str(args.get("thread_id", "")).strip()
+            if not tid:
+                return {"error": "thread_id is required for resolve"}
+            res = resolve_thread(db, tid)
+            if res is None:
+                return {"error": f"thread not found: {tid}"}
+            return {"thread": res}
+        if action == "list":
+            status_filter = args.get("status_filter")
+            try:
+                limit = int(args.get("limit", 50))
+            except (TypeError, ValueError):
+                limit = 50
+            threads = list_threads(db, status=status_filter, limit=limit)
+            return {"threads": threads, "count": len(threads)}
+        if action == "stale":
+            marked = sweep_stale_threads(db)
+            return {"marked_stale": marked, "count": len(marked)}
+        return {"error": f"unknown thread action: {action}"}
     return {"error": f"unknown tool: {tool_name}"}
 
 

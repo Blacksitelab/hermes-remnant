@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -164,6 +164,32 @@ CREATE TABLE IF NOT EXISTS vault_files (
 );
 CREATE INDEX IF NOT EXISTS idx_vault_hash ON vault_files(hash);
 CREATE INDEX IF NOT EXISTS idx_vault_memory ON vault_files(memory_id);
+
+-- Phase 5: topic threads + dream-loop machine state.
+CREATE TABLE IF NOT EXISTS threads (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','stale','resolved')),
+    importance REAL DEFAULT 0.5,
+    tags TEXT,
+    related_entities TEXT,
+    source TEXT,
+    added_by TEXT,
+    created_at TEXT NOT NULL,
+    last_activity TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
+CREATE INDEX IF NOT EXISTS idx_threads_topic ON threads(topic);
+CREATE INDEX IF NOT EXISTS idx_threads_last_activity ON threads(last_activity);
+
+CREATE TABLE IF NOT EXISTS dream_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -1201,6 +1227,212 @@ class RemnantDB:
                 pass
         return d
 
+    # -- threads (Phase 5) -----------------------------------------------------
+
+    def insert_thread(
+        self,
+        *,
+        title: str,
+        topic: str,
+        importance: float = 0.5,
+        tags: list[str] | None = None,
+        related_entities: list[str] | None = None,
+        source: str = "manual",
+        added_by: str = "system",
+    ) -> str:
+        """Create a thread. Returns its id."""
+        if not title.strip() or not topic.strip():
+            raise ValueError("title and topic are required")
+        tid = _uuid()
+        now = _now_iso()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO threads(id, title, topic, status, importance, tags, "
+                "related_entities, source, added_by, created_at, last_activity, "
+                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    tid, title, topic, "active", importance,
+                    json.dumps(tags) if tags else None,
+                    json.dumps(related_entities) if related_entities else None,
+                    source, added_by, now, now, now,
+                ),
+            )
+            return tid
+
+    def update_thread(
+        self,
+        thread_id: str,
+        *,
+        title: str | None = None,
+        status: str | None = None,
+        importance: float | None = None,
+        tags: list[str] | None = None,
+        related_entities: list[str] | None = None,
+        touch: bool = True,
+    ) -> dict[str, Any] | None:
+        """Update mutable fields on a thread. Returns the updated row or None."""
+        before = self.get_thread(thread_id)
+        if before is None:
+            return None
+        now = _now_iso()
+        sets: list[str] = ["updated_at=?"]
+        params: list[Any] = [now]
+        if title is not None:
+            sets.append("title=?")
+            params.append(title)
+        if status is not None:
+            if status not in ("active", "stale", "resolved"):
+                raise ValueError(f"invalid status: {status}")
+            sets.append("status=?")
+            params.append(status)
+        if importance is not None:
+            sets.append("importance=?")
+            params.append(float(importance))
+        if tags is not None:
+            sets.append("tags=?")
+            params.append(json.dumps(tags) if tags else None)
+        if related_entities is not None:
+            sets.append("related_entities=?")
+            params.append(json.dumps(related_entities) if related_entities else None)
+        if touch:
+            sets.append("last_activity=?")
+            params.append(now)
+        params.append(thread_id)
+        with self.transaction() as cur:
+            cur.execute(
+                f"UPDATE threads SET {','.join(sets)} WHERE id=?", params
+            )
+        return self.get_thread(thread_id)
+
+    def resolve_thread(self, thread_id: str) -> dict[str, Any] | None:
+        """Mark a thread resolved (preserved, never deleted)."""
+        return self.update_thread(thread_id, status="resolved", touch=True)
+
+    def get_thread(self, thread_id: str) -> dict[str, Any] | None:
+        with self.read() as cur:
+            cur.execute("SELECT * FROM threads WHERE id=?", (thread_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        return _decode_thread(dict(row))
+
+    def list_threads(
+        self, *, status: str | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM threads"
+        params: list[Any] = []
+        if status is not None:
+            sql += " WHERE status=?"
+            params.append(status)
+        sql += " ORDER BY last_activity DESC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [_decode_thread(dict(r)) for r in cur.fetchall()]
+
+    def stale_threads(self, *, days: int = 14) -> list[dict[str, Any]]:
+        """Return active threads whose last_activity is older than `days`."""
+        cutoff = time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400)
+        )
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM threads WHERE status='active' AND last_activity < ? "
+                "ORDER BY last_activity ASC",
+                (cutoff,),
+            )
+            return [_decode_thread(dict(r)) for r in cur.fetchall()]
+
+    def sweep_stale_threads(self, *, days: int = 14) -> list[str]:
+        """Mark inactive active threads as stale. Returns the marked ids."""
+        stale = self.stale_threads(days=days)
+        if not stale:
+            return []
+        marked: list[str] = []
+        with self.transaction() as cur:
+            now = _now_iso()
+            for t in stale:
+                cur.execute(
+                    "UPDATE threads SET status='stale', updated_at=? WHERE id=? "
+                    "AND status='active'",
+                    (now, t["id"]),
+                )
+                marked.append(t["id"])
+        return marked
+
+    # -- dream_state (Phase 5) -------------------------------------------------
+
+    def get_state(self, key: str, default: Any = None) -> Any:
+        """Return a JSON-decoded value from dream_state, or `default`."""
+        with self.read() as cur:
+            cur.execute("SELECT value FROM dream_state WHERE key=?", (key,))
+            row = cur.fetchone()
+        if row is None:
+            return default
+        try:
+            return json.loads(row["value"])
+        except (json.JSONDecodeError, TypeError):
+            return default
+
+    def set_state(self, key: str, value: Any) -> None:
+        """Persist a JSON-serializable value under `key`."""
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO dream_state(key, value, updated_at) "
+                "VALUES(?,?,?)",
+                (key, json.dumps(value, default=str), _now_iso()),
+            )
+
+    def get_recent_memories(
+        self, *, since_ts: float, agent_id: str | None = None, limit: int = 200
+    ) -> list[dict[str, Any]]:
+        """Return active memories created since `since_ts` (epoch seconds).
+
+        `since_ts` is compared against the memories.created_at ISO timestamp.
+        """
+        since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(since_ts))
+        sql = (
+            "SELECT id, content, agent, visibility, source, type, timestamp, "
+            "created_at, updated_at FROM memories WHERE status='active' "
+            "AND created_at >= ?"
+        )
+        params: list[Any] = [since_iso]
+        if agent_id is not None:
+            sql += " AND agent=?"
+            params.append(agent_id)
+        sql += " ORDER BY created_at ASC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
+    def get_memories_for_agent_scope(
+        self, *, agent_id: str | None = None, visibility: str | None = "shared",
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return active memories visible across the agent scope.
+
+        For cross-agent duplicate detection: when `agent_id` is None all active
+        memories are considered; otherwise agent-scoped memories of `agent_id`
+        plus all shared/fleet memories from other agents.
+        """
+        sql = (
+            "SELECT id, content, agent, visibility, source, type, created_at "
+            "FROM memories WHERE status='active'"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND (agent=? OR visibility IN ('shared','fleet'))"
+            params.append(agent_id)
+        elif visibility is not None:
+            sql += " AND visibility=?"
+            params.append(visibility)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
     # -- lifecycle -------------------------------------------------------------
 
     def close(self) -> None:
@@ -1238,6 +1470,18 @@ def _normalize_entity_name(name: str) -> str:
 
     s = _re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _decode_thread(row: dict[str, Any]) -> dict[str, Any]:
+    """Decode JSON columns on a thread row."""
+    for k in ("tags", "related_entities"):
+        v = row.get(k)
+        if v:
+            try:
+                row[k] = json.loads(v)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return row
 
 
 def open_db(db_path: str | Path) -> RemnantDB:

@@ -29,6 +29,27 @@ DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
 DEFAULT_REFLECT_URL = DEFAULT_EXTRACT_URL
 DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
 
+# Phase 5: Dream loop. A bounded candidate list is pre-filtered locally with
+# cosine similarity, then sent to a cloud model for judgment. Day/night have
+# independent endpoints, budgets, and cooldowns. The dream loop is invoked by
+# an external cron/systemd timer (day_dream() / night_dream()), never a daemon.
+DEFAULT_DREAM_DAY_URL = DEFAULT_EXTRACT_URL
+DEFAULT_DREAM_DAY_MODEL = "deepseek-v4-flash:cloud"
+DEFAULT_DREAM_NIGHT_URL = DEFAULT_EXTRACT_URL
+DEFAULT_DREAM_NIGHT_MODEL = "deepseek-v4-flash:cloud"
+DEFAULT_DREAM_DAY_BUDGET = 3
+DEFAULT_DREAM_NIGHT_BUDGET = 5
+DEFAULT_DREAM_COOLDOWN_MINUTES = 120  # 2 hours per topic
+DEFAULT_DREAM_DIARY_PATH = "~/.hermes/remnant/DREAMS.md"
+# Bounded candidate list cap. The cloud model is only ever sent up to this many
+# memory pairs; the rest of the corpus stays local.
+DREAM_MAX_CANDIDATE_PAIRS = 30
+# Top-K similar active memories per recent memory (local pre-filter).
+DREAM_TOP_K = 5
+# Cosine thresholds. >0.6 => candidate connection; >0.7 => cross-agent dedup.
+DREAM_CONNECT_THRESHOLD = 0.6
+DREAM_DEDUP_THRESHOLD = 0.7
+
 # Cosine similarity above this => duplicate memory
 DEDUP_COSINE_THRESHOLD = 0.92
 # BM25 candidate count when checking duplicates
@@ -67,6 +88,17 @@ class RemnantConfig:
     reflect_url: str = DEFAULT_REFLECT_URL
     reflect_model: str = DEFAULT_REFLECT_MODEL
     reflect_timeout: float = 60.0
+    # Phase 5: dream loop (callable from cron/systemd; not a daemon).
+    dream_day_url: str = DEFAULT_DREAM_DAY_URL
+    dream_day_model: str = DEFAULT_DREAM_DAY_MODEL
+    dream_night_url: str = DEFAULT_DREAM_NIGHT_URL
+    dream_night_model: str = DEFAULT_DREAM_NIGHT_MODEL
+    dream_day_timeout: float = 90.0
+    dream_night_timeout: float = 120.0
+    dream_day_budget: int = DEFAULT_DREAM_DAY_BUDGET
+    dream_night_budget: int = DEFAULT_DREAM_NIGHT_BUDGET
+    dream_cooldown_minutes: int = DEFAULT_DREAM_COOLDOWN_MINUTES
+    diary_path: str = DEFAULT_DREAM_DIARY_PATH
     injection_token_budget: int = DEFAULT_INJECTION_TOKEN_BUDGET
     injection_prefetch_deadline_ms: int = DEFAULT_INJECTION_PREFETCH_DEADLINE_MS
     prefetch_enabled: bool = DEFAULT_PREFETCH_ENABLED
