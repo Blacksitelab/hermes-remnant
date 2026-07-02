@@ -319,7 +319,7 @@ class RemnantMemoryProvider(MemoryProvider):
         # the wire format every other provider (Hindsight, etc.) uses.
         if isinstance(result, str):
             return result
-        return json.dumps(result, ensure_ascii=False)
+        return json.dumps(result, ensure_ascii=False, default=str)
 
     # -- prompts --------------------------------------------------------------
 

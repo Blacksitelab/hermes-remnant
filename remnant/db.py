@@ -496,7 +496,7 @@ class RemnantDB:
         now = _now_iso()
         mid = _uuid()
         tags_json = json.dumps(tags) if tags else None
-        meta_json = json.dumps(metadata) if metadata else None
+        meta_json = json.dumps(metadata, default=str) if metadata else None
         with self.transaction() as cur:
             cur.execute(
                 "INSERT INTO memories(id, type, content, source, source_id, agent, "
@@ -1076,7 +1076,7 @@ class RemnantDB:
             raise KeyError(memory_id)
         col_value = value
         if field in ("tags", "metadata") and isinstance(value, (dict, list)):
-            col_value = json.dumps(value)
+            col_value = json.dumps(value, default=str)
         with self.transaction() as cur:
             cur.execute(
                 f"UPDATE memories SET {field}=?, updated_at=? WHERE id=?",
