@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 CREATE INDEX IF NOT EXISTS idx_audit_memory ON audit_log(memory_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+
+CREATE TABLE IF NOT EXISTS vault_files (
+    path TEXT PRIMARY KEY,
+    hash TEXT NOT NULL,
+    memory_id TEXT,
+    indexed_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vault_hash ON vault_files(hash);
+CREATE INDEX IF NOT EXISTS idx_vault_memory ON vault_files(memory_id);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -441,7 +450,14 @@ class RemnantDB:
         visibility: str | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
-        """BM25 keyword search over active memories, optionally filtered."""
+        """BM25 keyword search over active memories, optionally filtered.
+
+        Vault-source documents are a shared corpus: when ``agent_id`` is set,
+        vault documents authored by *other* agents are still visible (subject
+        to locked-note masking downstream in ``search``), so a user/agent can
+        search the shared vault. Agent-scoped facts remain private to their
+        owner.
+        """
         fts_query = _to_fts_query(query)
         if not fts_query:
             return []
@@ -454,7 +470,7 @@ class RemnantDB:
         )
         params: list[Any] = [fts_query]
         if agent_id is not None:
-            sql += " AND m.agent=?"
+            sql += " AND (m.agent=? OR m.source='vault')"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -515,6 +531,10 @@ class RemnantDB:
         Used by semantic search to load embeddings only for the BM25-pre-filtered
         candidate set, never the whole table. `memory_ids` should already be
         bounded by the caller (e.g. SEMANTIC_CANDIDATE_LIMIT).
+
+        Vault-source documents are a shared corpus (see ``search_bm25``): when
+        ``agent_id`` is set, vault documents authored by other agents remain
+        visible so the shared vault can be semantically searched.
         """
         if not memory_ids:
             return []
@@ -527,7 +547,7 @@ class RemnantDB:
         )
         params: list[Any] = list(memory_ids)
         if agent_id is not None:
-            sql += " AND m.agent=?"
+            sql += " AND (m.agent=? OR m.source='vault')"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -553,8 +573,12 @@ class RemnantDB:
 
         Ordered by recency. Embeddings are NOT loaded here; callers pass the
         returned ids to `search_by_embedding` to fetch vectors only for the
-        candidate set. This keeps the pre-filter cheap and avoids scanning
-        the embeddings table blindly.
+        candidate set. This keeps the pre-filter cheap and avoids scanning the
+        embeddings table blindly.
+
+        Vault-source documents are a shared corpus (see ``search_bm25``): when
+        ``agent_id`` is set, vault documents authored by other agents remain
+        visible.
         """
         sql = (
             "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
@@ -563,7 +587,7 @@ class RemnantDB:
         )
         params: list[Any] = []
         if agent_id is not None:
-            sql += " AND m.agent=?"
+            sql += " AND (m.agent=? OR m.source='vault')"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -1072,6 +1096,110 @@ class RemnantDB:
                 "VALUES(?,?,?,?)",
                 (model, text_hash, blob, time.time()),
             )
+
+    # -- vault files (Phase 4) -------------------------------------------------
+
+    def get_vault_hash(self, path: str) -> str | None:
+        """Return the stored content hash for a vault path, or None if absent."""
+        with self.read() as cur:
+            cur.execute("SELECT hash FROM vault_files WHERE path=?", (path,))
+            row = cur.fetchone()
+        return row["hash"] if row else None
+
+    def get_vault_memory(self, path: str) -> str | None:
+        """Return the memory_id linked to a vault path, or None."""
+        with self.read() as cur:
+            cur.execute("SELECT memory_id FROM vault_files WHERE path=?", (path,))
+            row = cur.fetchone()
+        return row["memory_id"] if row and row["memory_id"] else None
+
+    def set_vault_hash(
+        self, path: str, hash_hex: str, memory_id: str | None = None
+    ) -> None:
+        """Insert or update the vault_files row for `path` (idempotent)."""
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO vault_files(path, hash, memory_id, indexed_at) "
+                "VALUES(?,?,?,?)",
+                (path, hash_hex, memory_id, _now_iso()),
+            )
+
+    def get_all_vault_files(self) -> list[dict[str, Any]]:
+        """Return all known vault_files rows: {path, hash, memory_id, indexed_at}."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT path, hash, memory_id, indexed_at FROM vault_files"
+            )
+            return [dict(r) for r in cur.fetchall()]
+
+    def mark_vault_forgotten(self, path: str) -> str | None:
+        """Forget the memory linked to a vault path and remove the row.
+
+        Returns the memory_id that was forgotten (or None if no row existed),
+        so callers can audit/react. The memory row is preserved (status set to
+        'forgotten', never deleted) per Remnant's "nothing is ever deleted" rule.
+        """
+        with self.transaction() as cur:
+            cur.execute("SELECT memory_id FROM vault_files WHERE path=?", (path,))
+            row = cur.fetchone()
+            mid = row["memory_id"] if row else None
+            if mid:
+                cur.execute(
+                    "UPDATE memories SET status='forgotten', updated_at=? WHERE id=?",
+                    (_now_iso(), mid),
+                )
+            cur.execute("DELETE FROM vault_files WHERE path=?", (path,))
+        return mid
+
+    def mark_vault_forgotten_for_missing(
+        self, present_paths: set[str]
+    ) -> list[str]:
+        """Forget memories for every vault_files row whose path is not in
+        `present_paths`. Returns the list of forgotten memory ids (may be
+        empty). Used by the re-index pass to handle deleted files.
+        """
+        forgotten: list[str] = []
+        with self.transaction() as cur:
+            cur.execute("SELECT path, memory_id FROM vault_files")
+            rows = cur.fetchall()
+            for r in rows:
+                if r["path"] in present_paths:
+                    continue
+                mid = r["memory_id"]
+                if mid:
+                    cur.execute(
+                        "UPDATE memories SET status='forgotten', updated_at=? WHERE id=?",
+                        (_now_iso(), mid),
+                    )
+                    forgotten.append(mid)
+                cur.execute("DELETE FROM vault_files WHERE path=?", (r["path"],))
+        return forgotten
+
+    def get_memory_by_source_id(
+        self, source: str, source_id: str
+    ) -> dict[str, Any] | None:
+        """Return the most recent active memory matching (source, source_id)."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM memories WHERE source=? AND source_id=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (source, source_id),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        if d.get("metadata"):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if d.get("tags"):
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return d
 
     # -- lifecycle -------------------------------------------------------------
 

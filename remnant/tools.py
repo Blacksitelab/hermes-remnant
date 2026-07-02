@@ -9,6 +9,9 @@ Tools exposed to the agent:
 - `memory_graph`: traverse the entity graph around a named entity.
 - `memory_edit`: update / merge / forget / feedback / share / unshare memories.
   Every edit is audit-logged; nothing is ever deleted.
+- `memory_import`: bulk-import a memory source. Phase 4 supports
+  ``source='vault'`` (Obsidian vault re-index); ``hindsight`` and
+  ``memory_store`` are reserved enum values for later phases.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from .graph import graph_traverse
 from .ingest import store_memory
 from .reflect import memory_reflect
 from .search import search
+from .vault import index_vault
 
 log = logging.getLogger("remnant.tools")
 
@@ -55,6 +59,17 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                         "type": "integer",
                         "description": "Max results to return (default 10).",
                         "default": 10,
+                    },
+                    "profile_scope": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Optional list of allowed vault path prefixes. When "
+                            "set, document memories (source='vault') are only "
+                            "returned if their source_id starts with one of these "
+                            "prefixes. Ignored for non-document memories. "
+                            "Defaults to the provider's configured profile_scope."
+                        ),
                     },
                 },
                 "required": ["query"],
@@ -190,6 +205,39 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_import",
+            "description": (
+                "Bulk-import a memory source into Remnant. Phase 4 supports "
+                "source='vault', which re-walks the Obsidian vault, indexes new "
+                "and changed markdown notes as document memories, and forgets "
+                "memories for deleted files. Excluded vault folders (90_*-95_*, "
+                "99_ARCHIVE) are never indexed. 'hindsight' and 'memory_store' "
+                "sources are reserved for later phases."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "enum": ["vault", "hindsight", "memory_store"],
+                        "description": "The memory source to import.",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, re-index every non-excluded file even when "
+                            "its hash is unchanged (default false)."
+                        ),
+                        "default": False,
+                    },
+                },
+                "required": ["source"],
+            },
+        },
+    },
 ]
 
 
@@ -209,11 +257,22 @@ def handle_tool_call(
         query = str(args.get("query", "")).strip()
         limit = int(args.get("limit", config.search_limit))
         strategy = str(args.get("strategy", "keyword")).strip() or "keyword"
+        # profile_scope: explicit arg, else None (search() falls back to the
+        # provider-configured scope). An empty list is treated as "no scoping".
+        raw_scope = args.get("profile_scope")
+        profile_scope: list[str] | None
+        if raw_scope is None:
+            profile_scope = None
+        elif isinstance(raw_scope, list):
+            profile_scope = [str(p) for p in raw_scope if str(p).strip()]
+        else:
+            profile_scope = None
         if not query:
             return {"error": "query is required"}
         results = search(
             db, config, query, agent_id=aid, limit=limit,
             strategy=strategy, embedder=embedder,
+            profile_scope=profile_scope,
         )
         return {
             "results": [
@@ -222,6 +281,9 @@ def handle_tool_call(
                     "entity": "",
                     "fact": r["content"],
                     "visibility": r["visibility"],
+                    "source": r.get("source"),
+                    "source_id": r.get("source_id"),
+                    "locked": r.get("locked", False),
                     "score": round(r.get("score", 0.0), 4),
                 }
                 for r in results
@@ -299,6 +361,21 @@ def handle_tool_call(
             agent_id=aid,
             session_id=session_id,
         )
+    if tool_name == "memory_import":
+        source = str(args.get("source", "")).strip().lower()
+        if source not in ("vault", "hindsight", "memory_store"):
+            return {"error": f"unknown import source: {source}"}
+        if source != "vault":
+            # hindsight / memory_store are reserved for later phases.
+            return {"error": f"import source not implemented in Phase 4: {source}"}
+        force = bool(args.get("force", False))
+        stats = index_vault(db, config, embedder, force=force)
+        return {
+            "source": source,
+            "indexed": stats["indexed"],
+            "skipped": stats["skipped"],
+            "forgotten": stats["forgotten"],
+        }
     return {"error": f"unknown tool: {tool_name}"}
 
 

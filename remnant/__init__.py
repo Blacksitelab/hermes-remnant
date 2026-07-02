@@ -12,13 +12,21 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from .config import RemnantConfig, load_config, save_config
+from .config import (
+    DEFAULT_VAULT_EXCLUDE,
+    DEFAULT_VAULT_PATH,
+    DEFAULT_VAULT_REINDEX_INTERVAL_S,
+    RemnantConfig,
+    load_config,
+    save_config,
+)
 from .db import RemnantDB, open_db
 from .embed import Embedder
 from .extract import ExtractionWorker
 from .ingest import ingest_turn
 from .prefetch import prefetch as _run_prefetch
 from .tools import TOOL_SCHEMAS, handle_tool_call
+from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
 
@@ -101,13 +109,18 @@ _SYSTEM_PROMPT_BLOCK = (
     "## Remnant Memory Provider\n"
     "You have durable long-term memory via the Remnant provider.\n"
     "Use the `memory_search` tool to recall facts (keyword, semantic, auto hybrid, "
-    "or graph entity-traversal strategies).\n"
+    "or graph entity-traversal strategies). Pass `profile_scope` to restrict "
+    "vault documents to a set of allowed path prefixes.\n"
     "Use the `memory_store` tool to save a durable fact explicitly.\n"
     "Use the `memory_reflect` tool to synthesize an answer across stored memories.\n"
     "Use the `memory_graph` tool to explore entities and their connected memories.\n"
     "Use the `memory_edit` tool to update, merge, forget, score, or share memories. "
     "Nothing is ever deleted: forgotten memories stay in the DB but are hidden from "
     "search; updates supersede the old version while preserving it.\n"
+    "Use the `memory_import` tool with `source='vault'` to re-index the Obsidian "
+    "vault: new and changed notes become document memories, deleted notes are "
+    "forgotten. Excluded vault folders (90_*-95_*, 99_ARCHIVE) are skipped. Locked "
+    "notes are indexed but their content is hidden from other agents in search.\n"
     "Transient state (percentages, current status, timestamps) is rejected.\n"
     "Memories are scoped by agent and visibility (private/shared/fleet).\n"
 )
@@ -156,6 +169,36 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "agent_id",
         "description": "Agent identifier scoping memories",
         "default": "default",
+        "required": False,
+    },
+    {
+        "key": "vault_path",
+        "description": "Path to the Obsidian vault to index as document memories",
+        "default": DEFAULT_VAULT_PATH,
+        "required": False,
+    },
+    {
+        "key": "vault_exclude",
+        "description": (
+            "Top-level vault folder name prefixes to exclude from indexing "
+            "(e.g. 90_-95_*, 99_ARCHIVE)."
+        ),
+        "default": DEFAULT_VAULT_EXCLUDE,
+        "required": False,
+    },
+    {
+        "key": "profile_scope",
+        "description": (
+            "List of allowed vault path prefixes for this agent's document "
+            "search. Empty means no additional filtering."
+        ),
+        "default": [],
+        "required": False,
+    },
+    {
+        "key": "vault_reindex_interval_s",
+        "description": "Minimum seconds between automatic vault re-index passes",
+        "default": DEFAULT_VAULT_REINDEX_INTERVAL_S,
         "required": False,
     },
 ]
@@ -208,6 +251,9 @@ class RemnantMemoryProvider(MemoryProvider):
             if self._worker is not None:
                 self._worker.stop()
         finally:
+            # Phase 4: no background vault watcher process is started here.
+            # Re-index is driven by an external cron/timer calling
+            # `reindex_vault()`; nothing to stop on shutdown.
             if self._embedder is not None:
                 self._embedder.close()
             if self._db is not None:
@@ -326,6 +372,21 @@ class RemnantMemoryProvider(MemoryProvider):
         # Keep the queue bounded.
         if len(self._prefetch_queue) > 32:
             self._prefetch_queue = self._prefetch_queue[-32:]
+
+    # -- vault re-index (Phase 4) --------------------------------------------
+
+    def reindex_vault(self, *, force: bool = False) -> dict[str, int]:
+        """Re-walk the vault and index/forget documents. Returns stats.
+
+        Safe to call from an external cron/timer. Uses the provider's
+        configured ``vault_path`` / ``vault_exclude``. See
+        ``remnant.vault.index_vault`` for the underlying implementation.
+        """
+        if self._db is None or self._config is None or self._embedder is None:
+            return {"indexed": 0, "skipped": 0, "forgotten": 0}
+        return _index_vault(
+            self._db, self._config, self._embedder, force=force
+        )
 
 
 def register(ctx: Any) -> None:

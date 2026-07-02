@@ -18,6 +18,13 @@ EMBED_DIM = 768
 DEFAULT_EXTRACT_URL = "http://192.168.0.11:11434/v1/chat/completions"
 DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 
+# Phase 4: Obsidian vault indexing. The vault is the single source of truth for
+# notes; we index it as type='document' memories. Excluded folders hold agent
+# scratch/workspace trees that must never be ingested.
+DEFAULT_VAULT_PATH = "/home/jd/obsidian-vaults/BlacksiteLabVault"
+DEFAULT_VAULT_EXCLUDE = ["90_", "91_", "92_", "93_", "94_", "95_", "99_ARCHIVE"]
+DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
+
 # Reflection reuses the extraction endpoint/model by default (gemma4:12b on BSL1).
 DEFAULT_REFLECT_URL = DEFAULT_EXTRACT_URL
 DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
@@ -69,6 +76,11 @@ class RemnantConfig:
     default_visibility: str = "private"
     agent_id: str = "default"
     queue_max: int = QUEUE_MAX
+    # Phase 4: vault indexing + profile-scoped search.
+    vault_path: str = DEFAULT_VAULT_PATH
+    vault_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_VAULT_EXCLUDE))
+    profile_scope: list[str] = field(default_factory=list)
+    vault_reindex_interval_s: int = DEFAULT_VAULT_REINDEX_INTERVAL_S
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

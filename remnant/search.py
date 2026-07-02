@@ -31,6 +31,79 @@ def _scope_filter(results: list[dict[str, Any]], visibility: str | None) -> list
     return results
 
 
+def _profile_scope_filter(
+    results: list[dict[str, Any]], profile_scope: list[str] | None
+) -> list[dict[str, Any]]:
+    """Restrict document memories (source='vault') to allowed path prefixes.
+
+    Non-document memories are never filtered by profile_scope. When
+    `profile_scope` is None or empty, no additional filtering is applied.
+    A document memory is included if its ``source_id`` starts with one of the
+    allowed prefixes (after normalizing separators to ``/``).
+    """
+    if not profile_scope:
+        return results
+    prefixes = [p.strip().rstrip("/") for p in profile_scope if p and p.strip()]
+    if not prefixes:
+        return results
+    out: list[dict[str, Any]] = []
+    for r in results:
+        # Only document/vault memories are scope-restricted. The `source` may
+        # not be attached to every result dict (older search paths don't carry
+        # it); when absent we treat the row as non-document and let it through.
+        src = r.get("source")
+        if src != "vault":
+            out.append(r)
+            continue
+        sid = r.get("source_id") or ""
+        sid = sid.replace("\\", "/")
+        if any(sid == p or sid.startswith(p + "/") or sid.startswith(p) for p in prefixes):
+            out.append(r)
+    return out
+
+
+def _mask_locked(
+    results: list[dict[str, Any]], *, viewer_agent: str | None
+) -> list[dict[str, Any]]:
+    """Hide content of locked vault documents from non-owner agents.
+
+    A result is masked when its metadata carries ``locked=True`` and the viewer
+    is not the memory's own owner agent (``r['agent']``). Masked rows keep
+    id/title/path/metadata but have ``content`` replaced with a placeholder so
+    other agents see that a note exists and its metadata, but not its body.
+    Owner identity is per-row (the memory's ``agent`` column), not a single
+    global owner, so a single search spanning multiple owners masks each row
+    against its own author.
+    """
+    out: list[dict[str, Any]] = []
+    for r in results:
+        meta = r.get("metadata")
+        if isinstance(meta, str):
+            import json
+
+            try:
+                meta = json.loads(meta)
+            except (json.JSONDecodeError, TypeError):
+                meta = None
+        owner = r.get("agent") or r.get("agent_id")
+        is_locked = isinstance(meta, dict) and meta.get("locked") is True
+        # Mask when the viewer is not the row's owner. A None viewer (anonymous
+        # search) is treated as a non-owner: locked content is masked.
+        is_owner = viewer_agent is not None and viewer_agent == owner
+        if (
+            r.get("source") == "vault"
+            and is_locked
+            and not is_owner
+        ):
+            d = dict(r)
+            d["content"] = "[locked note: content hidden]"
+            d["locked"] = True
+            out.append(d)
+        else:
+            out.append(r)
+    return out
+
+
 def search(
     db: RemnantDB,
     config: RemnantConfig,
@@ -41,41 +114,111 @@ def search(
     limit: int | None = None,
     strategy: str = "keyword",
     embedder: Embedder | None = None,
+    profile_scope: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Run a memory search with the given strategy and scope filtering.
 
     - ``keyword``: BM25 only.
     - ``semantic``: cosine over embeddings, BM25-pre-filtered candidates.
     - ``auto``: RRF fusion of keyword + semantic.
+
+    ``profile_scope`` (Phase 4) restricts ``document``/``vault`` memories to
+    those whose ``source_id`` starts with one of the allowed prefixes. When
+    None/empty, no additional filtering is applied. Locked vault notes have
+    their content masked for any viewer that is not the memory's owner agent.
     """
     if limit is None:
         limit = config.search_limit
     if strategy not in ("keyword", "semantic", "auto", "graph"):
         strategy = "keyword"
 
+    # Resolve the effective scope: explicit arg overrides config.profile_scope.
+    scope = profile_scope if profile_scope is not None else (config.profile_scope or [])
+    # The "viewer" for locked-note masking is the agent performing the search:
+    # an explicit agent_id wins, else the provider-configured agent_id. A None
+    # viewer is treated as a non-owner anonymous search (locked content masked).
+    viewer = agent_id if agent_id is not None else config.agent_id
+
     if strategy == "graph":
         from .graph import graph_search
 
         results = graph_search(db, query, agent_id=agent_id, limit=limit)
+        results = _attach_source(db, results)
+        results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
+        results = _mask_locked(results, viewer_agent=viewer)
         return results[:limit]
 
     if strategy == "keyword":
-        results = db.search_bm25(query, agent_id=agent_id, limit=limit * 3 if visibility else limit)
+        results = db.search_bm25(
+            query, agent_id=agent_id, limit=limit * 3 if (visibility or scope) else limit
+        )
+        results = _attach_source(db, results)
+        results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
+        results = _mask_locked(results, viewer_agent=viewer)
         return results[:limit]
 
     if strategy == "semantic":
         ranked = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
+        ranked = _attach_source(db, ranked)
+        ranked = _profile_scope_filter(ranked, scope)
         ranked = _scope_filter(ranked, visibility)
+        ranked = _mask_locked(ranked, viewer_agent=viewer)
         return ranked[:limit]
 
     # auto: RRF fusion
     kw = db.search_bm25(query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
     sem = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
     fused = _rrf_fuse(kw, sem)
+    fused = _attach_source(db, fused)
+    fused = _profile_scope_filter(fused, scope)
     fused = _scope_filter(fused, visibility)
+    fused = _mask_locked(fused, viewer_agent=viewer)
     return fused[:limit]
+
+
+def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Enrich result rows with `source`, `source_id`, and `metadata` so that
+    profile_scope filtering and locked masking can be applied in-process.
+
+    search_bm25 / search_by_embedding don't JOIN source/source_id/metadata; we
+    fetch them in one batched read to keep this cheap (bounded by the result
+    set size, never the whole table).
+    """
+    if not results:
+        return results
+    ids = [r["id"] for r in results if r.get("id")]
+    if not ids:
+        return results
+    placeholders = ",".join("?" for _ in ids)
+    with db.read() as cur:
+        cur.execute(
+            f"SELECT id, agent, source, source_id, metadata, tags FROM memories "
+            f"WHERE id IN ({placeholders})",
+            ids,
+        )
+        rows = {r["id"]: dict(r) for r in cur.fetchall()}
+    import json
+
+    out: list[dict[str, Any]] = []
+    for r in results:
+        d = dict(r)
+        meta = rows.get(d.get("id"), {})
+        d.setdefault("agent", meta.get("agent"))
+        d.setdefault("agent_id", meta.get("agent"))
+        d.setdefault("source", meta.get("source"))
+        d.setdefault("source_id", meta.get("source_id"))
+        raw_meta = meta.get("metadata")
+        if isinstance(raw_meta, str) and raw_meta:
+            try:
+                d["metadata"] = json.loads(raw_meta)
+            except (json.JSONDecodeError, TypeError):
+                d["metadata"] = None
+        elif isinstance(raw_meta, dict):
+            d["metadata"] = raw_meta
+        out.append(d)
+    return out
 
 
 def _semantic_rank(
