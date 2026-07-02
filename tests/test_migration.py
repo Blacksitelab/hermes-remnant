@@ -656,10 +656,11 @@ def test_memory_import_tool_memory_store(provider: RemnantMemoryProvider, hermes
     res = provider.handle_tool_call(
         "memory_import", {"source": "memory_store"}, session_id="imp",
     )
-    assert "error" not in res
-    assert res["source"] == "memory_store"
-    assert res["stats"]["discovered"] == 1
-    assert res["stats"]["imported"] == 1
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["source"] == "memory_store"
+    assert parsed["stats"]["discovered"] == 1
+    assert parsed["stats"]["imported"] == 1
 
 
 def test_memory_import_tool_memory_store_dry_run(
@@ -669,8 +670,9 @@ def test_memory_import_tool_memory_store_dry_run(
     res = provider.handle_tool_call(
         "memory_import", {"source": "memory_store", "dry_run": True}, session_id="imp",
     )
-    assert "error" not in res
-    assert res["stats"]["dry_run"] is True
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["stats"]["dry_run"] is True
     # Provider's DB has no memories.
     assert provider._db.list_memories(agent_id="default") == []  # type: ignore[union-attr]
 
@@ -687,10 +689,11 @@ def test_memory_import_tool_hindsight_dry_run(
     res = provider.handle_tool_call(
         "memory_import", {"source": "hindsight", "dry_run": True}, session_id="imp",
     )
-    assert "error" not in res
-    assert res["source"] == "hindsight"
-    assert res["stats"]["dry_run"] is True
-    assert res["stats"]["imported"] == 1
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["source"] == "hindsight"
+    assert parsed["stats"]["dry_run"] is True
+    assert parsed["stats"]["imported"] == 1
 
 
 def test_memory_import_tool_schema_has_new_params(provider: RemnantMemoryProvider):

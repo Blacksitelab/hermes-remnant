@@ -8,6 +8,7 @@ stubbed to return no facts.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -311,22 +312,24 @@ def test_memory_graph_tool_returns_connected_entities(provider: RemnantMemoryPro
     res = provider.handle_tool_call(
         "memory_graph", {"entity": "Sven", "depth": 2}, session_id="graph",
     )
-    assert "entities" in res
-    assert "memories" in res
+    parsed = json.loads(res)
+    assert "entities" in parsed
+    assert "memories" in parsed
     # Sven resolves and is the seed at depth 0.
-    names = [e.get("name") for e in res["entities"]]
+    names = [e.get("name") for e in parsed["entities"]]
     assert "sven" in names
     # At least one memory linked to Sven is returned.
-    assert res["count"] >= 1
+    assert parsed["count"] >= 1
 
 
 def test_memory_graph_tool_unknown_entity(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_graph", {"entity": "Nonexistent"}, session_id="graph",
     )
-    assert res["entity"] is None
-    assert res["entities"] == []
-    assert res["count"] == 0
+    parsed = json.loads(res)
+    assert parsed["entity"] is None
+    assert parsed["entities"] == []
+    assert parsed["count"] == 0
 
 
 def test_search_graph_strategy_finds_linked_memories(hermes_home: Path):
@@ -671,14 +674,15 @@ def test_memory_edit_tool_dispatch(provider: RemnantMemoryProvider):
     search_res = provider.handle_tool_call(
         "memory_search", {"query": "dark mode"}, session_id="edit",
     )
-    mid = search_res["results"][0]["id"]
+    mid = json.loads(search_res)["results"][0]["id"]
     res = provider.handle_tool_call(
         "memory_edit",
         {"action": "feedback", "memory_id": mid, "feedback": "useful"},
         session_id="edit",
     )
-    assert "error" not in res
-    assert res["trust_score"] == pytest.approx(0.6)
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["trust_score"] == pytest.approx(0.6)
 
 
 # ===========================================================================
@@ -950,14 +954,14 @@ def test_memory_search_tool_excludes_forgotten(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_search", {"query": "dark mode"}, session_id="s",
     )
-    mid = res["results"][0]["id"]
+    mid = json.loads(res)["results"][0]["id"]
     provider.handle_tool_call(
         "memory_edit", {"action": "forget", "memory_id": mid}, session_id="s",
     )
     res2 = provider.handle_tool_call(
         "memory_search", {"query": "dark mode"}, session_id="s",
     )
-    assert all(r["id"] != mid for r in res2["results"])
+    assert all(r["id"] != mid for r in json.loads(res2)["results"])
 
 
 # --- config + tool schema sanity for Phase 3 --------------------------------

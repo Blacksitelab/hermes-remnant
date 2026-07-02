@@ -9,6 +9,7 @@ LLM call is stubbed to return no facts.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from pathlib import Path
@@ -123,8 +124,6 @@ def patch_extract(monkeypatch):
 def provider(hermes_home: Path, vault: Path) -> RemnantMemoryProvider:
     """A provider whose vault_path points at the per-test fake vault."""
     cfg_path = hermes_home / "remnant.json"
-    import json
-
     cfg_path.write_text(json.dumps({"vault_path": str(vault)}))
     p = RemnantMemoryProvider()
     p.initialize(session_id="p4-session", hermes_home=str(hermes_home))
@@ -740,9 +739,10 @@ def test_memory_import_tool_runs_vault(provider: RemnantMemoryProvider, vault: P
     res = provider.handle_tool_call(
         "memory_import", {"source": "vault"}, session_id="imp",
     )
-    assert "error" not in res
-    assert res["source"] == "vault"
-    assert res["indexed"] >= 1
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["source"] == "vault"
+    assert parsed["indexed"] >= 1
 
 
 def test_memory_import_hindsight_now_implemented(provider: RemnantMemoryProvider):
@@ -752,16 +752,17 @@ def test_memory_import_hindsight_now_implemented(provider: RemnantMemoryProvider
     res = provider.handle_tool_call(
         "memory_import", {"source": "hindsight", "dry_run": True}, session_id="imp",
     )
-    assert "error" not in res
-    assert res["source"] == "hindsight"
-    assert "stats" in res
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["source"] == "hindsight"
+    assert "stats" in parsed
 
 
 def test_memory_import_rejects_unknown_source(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_import", {"source": "bogus"}, session_id="imp",
     )
-    assert "error" in res
+    assert "error" in json.loads(res)
 
 
 def test_memory_import_schema_has_source_enum(provider: RemnantMemoryProvider):
@@ -791,7 +792,7 @@ def test_memory_search_tool_profile_scope_arg(
     res = provider.handle_tool_call(
         "memory_search", {"query": "alpha"}, session_id="s",
     )
-    ids = {r["source_id"] for r in res["results"] if r.get("source_id")}
+    ids = {r["source_id"] for r in json.loads(res)["results"] if r.get("source_id")}
     assert "Projects/alpha.md" in ids and "Personal/diary.md" in ids
     # With scope: only Projects/.
     res_scoped = provider.handle_tool_call(
@@ -799,7 +800,9 @@ def test_memory_search_tool_profile_scope_arg(
         {"query": "alpha", "profile_scope": ["Projects/"]},
         session_id="s",
     )
-    scoped_ids = {r["source_id"] for r in res_scoped["results"] if r.get("source_id")}
+    scoped_ids = {
+        r["source_id"] for r in json.loads(res_scoped)["results"] if r.get("source_id")
+    }
     assert scoped_ids == {"Projects/alpha.md"}
 
 
@@ -817,13 +820,11 @@ def test_memory_search_tool_locked_masking_for_other_agent(
     owner = provider.handle_tool_call(
         "memory_search", {"query": "hunter2"}, session_id="s",
     )
-    assert any("hunter2" in r["fact"] for r in owner["results"])
+    assert any("hunter2" in r["fact"] for r in json.loads(owner)["results"])
 
     # A different agent uses a provider configured with a different agent_id so
     # the owner check fails. We build a second provider pointing at the same
     # home so it reads the same DB.
-    import json
-
     home = Path(provider._hermes_home)  # type: ignore[attr-defined]
     cfg_path = home / "remnant.json"
     cfg_path.write_text(json.dumps({
@@ -835,7 +836,8 @@ def test_memory_search_tool_locked_masking_for_other_agent(
         res = intruder.handle_tool_call(
             "memory_search", {"query": "hunter2"}, session_id="intr",
         )
-        locked = [r for r in res["results"] if r.get("locked")]
+        results = json.loads(res)["results"]
+        locked = [r for r in results if r.get("locked")]
         assert locked
         for r in locked:
             assert "hunter2" not in r["fact"]

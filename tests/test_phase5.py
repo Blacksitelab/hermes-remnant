@@ -9,6 +9,7 @@ monkeypatched.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -572,9 +573,10 @@ def test_memory_thread_create_via_tool(provider: RemnantMemoryProvider):
         {"action": "create", "title": "T", "topic": "t", "importance": 0.8},
         session_id="s",
     )
-    assert "error" not in res
-    assert res["title"] == "T"
-    assert res["topic"] == "t"
+    parsed = json.loads(res)
+    assert "error" not in parsed
+    assert parsed["title"] == "T"
+    assert parsed["topic"] == "t"
 
 
 def test_memory_thread_list_via_tool(provider: RemnantMemoryProvider):
@@ -585,7 +587,7 @@ def test_memory_thread_list_via_tool(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_thread", {"action": "list"}, session_id="s",
     )
-    assert res["count"] >= 1
+    assert json.loads(res)["count"] >= 1
 
 
 def test_memory_thread_resolve_via_tool(provider: RemnantMemoryProvider):
@@ -593,12 +595,12 @@ def test_memory_thread_resolve_via_tool(provider: RemnantMemoryProvider):
         "memory_thread", {"action": "create", "title": "A", "topic": "a"},
         session_id="s",
     )
-    tid = created["thread_id"]
+    tid = json.loads(created)["thread_id"]
     res = provider.handle_tool_call(
         "memory_thread", {"action": "resolve", "thread_id": tid},
         session_id="s",
     )
-    assert res["thread"]["status"] == "resolved"
+    assert json.loads(res)["thread"]["status"] == "resolved"
 
 
 def test_memory_thread_update_via_tool(provider: RemnantMemoryProvider):
@@ -606,22 +608,24 @@ def test_memory_thread_update_via_tool(provider: RemnantMemoryProvider):
         "memory_thread", {"action": "create", "title": "A", "topic": "a"},
         session_id="s",
     )
-    tid = created["thread_id"]
+    tid = json.loads(created)["thread_id"]
     res = provider.handle_tool_call(
         "memory_thread",
         {"action": "update", "thread_id": tid, "title": "A2", "importance": 0.9},
         session_id="s",
     )
-    assert res["thread"]["title"] == "A2"
-    assert res["thread"]["importance"] == 0.9
+    parsed = json.loads(res)
+    assert parsed["thread"]["title"] == "A2"
+    assert parsed["thread"]["importance"] == 0.9
 
 
 def test_memory_thread_stale_via_tool(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_thread", {"action": "stale"}, session_id="s",
     )
-    assert "marked_stale" in res
-    assert res["count"] == 0
+    parsed = json.loads(res)
+    assert "marked_stale" in parsed
+    assert parsed["count"] == 0
 
 
 def test_memory_thread_create_validation(provider: RemnantMemoryProvider):
@@ -629,7 +633,7 @@ def test_memory_thread_create_validation(provider: RemnantMemoryProvider):
         "memory_thread", {"action": "create", "title": "", "topic": "x"},
         session_id="s",
     )
-    assert "error" in res
+    assert "error" in json.loads(res)
 
 
 def test_memory_thread_schema_present(provider: RemnantMemoryProvider):

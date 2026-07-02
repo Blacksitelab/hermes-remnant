@@ -7,6 +7,7 @@ deterministically.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -216,14 +217,33 @@ def test_is_transient_accepts_durable_facts():
 # --- store + dedup ---------------------------------------------------------
 
 
+def test_handle_tool_call_returns_string(provider: RemnantMemoryProvider):
+    """Regression for Blsitelab/hermes-remnant #3: the provider boundary must
+    return a JSON string, never a raw dict/list, because Hermes places the
+    return value directly into tool-message content and the Ollama cloud proxy
+    rejects non-string content with HTTP 400."""
+    res = provider.handle_tool_call(
+        "memory_store",
+        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        session_id="strcheck",
+    )
+    assert isinstance(res, str), "handle_tool_call must return a str for the wire"
+    # And it must be valid JSON we can round-trip.
+    parsed = json.loads(res)
+    assert parsed["stored"] is True
+    assert "memory_id" in parsed
+
+
 def test_memory_store_stores_durable_fact(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_store",
         {"fact": "Sven prefers dark mode", "entity": "Sven"},
         session_id="s2",
     )
-    assert res["stored"] is True
-    assert "memory_id" in res
+    assert isinstance(res, str)
+    parsed = json.loads(res)
+    assert parsed["stored"] is True
+    assert "memory_id" in parsed
 
 
 def test_memory_store_rejects_transient(provider: RemnantMemoryProvider):
@@ -232,7 +252,7 @@ def test_memory_store_rejects_transient(provider: RemnantMemoryProvider):
         {"fact": "the printer is at 32%", "entity": "printer"},
         session_id="s2",
     )
-    assert res["stored"] is False
+    assert json.loads(res)["stored"] is False
 
 
 def test_memory_store_dedup_identical(provider: RemnantMemoryProvider):
@@ -246,7 +266,7 @@ def test_memory_store_dedup_identical(provider: RemnantMemoryProvider):
         {"fact": "Sven prefers dark mode", "entity": "Sven"},
         session_id="s2",
     )
-    assert res["stored"] is False
+    assert json.loads(res)["stored"] is False
 
 
 def test_memory_store_dedup_near_identical(provider: RemnantMemoryProvider):
@@ -262,7 +282,7 @@ def test_memory_store_dedup_near_identical(provider: RemnantMemoryProvider):
         session_id="s3",
     )
     # Embeddings differ slightly but text normalization catches the dup.
-    assert res["stored"] is False
+    assert json.loads(res)["stored"] is False
 
 
 def test_store_memory_direct(hermes_home: Path):
@@ -303,19 +323,20 @@ def test_memory_search_returns_results(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_search", {"query": "dark mode"}, session_id="s4"
     )
-    assert res["count"] >= 1
-    facts = [r["fact"] for r in res["results"]]
+    parsed = json.loads(res)
+    assert parsed["count"] >= 1
+    facts = [r["fact"] for r in parsed["results"]]
     assert any("dark mode" in f.lower() for f in facts)
 
 
 def test_memory_search_empty_query(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call("memory_search", {"query": ""}, session_id="s4")
-    assert "error" in res
+    assert "error" in json.loads(res)
 
 
 def test_memory_search_unknown_tool(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call("bogus", {}, session_id="s4")
-    assert "error" in res
+    assert "error" in json.loads(res)
 
 
 def test_search_visibility_filtering(hermes_home: Path):

@@ -6,6 +6,7 @@ vectors and the reflect LLM call is stubbed.
 
 from __future__ import annotations
 
+import json
 import time
 from pathlib import Path
 
@@ -377,18 +378,19 @@ def test_memory_reflect_tool_mock(provider: RemnantMemoryProvider, monkeypatch):
         {"question": "What do we know about Sven and the homelab?"},
         session_id="reflect",
     )
-    assert "synthesis" in res
-    assert res["synthesis"]
-    assert res["count"] >= 1
-    assert isinstance(res["source_ids"], list)
-    assert res["source_ids"]
+    parsed = json.loads(res)
+    assert "synthesis" in parsed
+    assert parsed["synthesis"]
+    assert parsed["count"] >= 1
+    assert isinstance(parsed["source_ids"], list)
+    assert parsed["source_ids"]
 
 
 def test_memory_reflect_empty_question(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_reflect", {"question": ""}, session_id="reflect"
     )
-    assert "error" in res
+    assert "error" in json.loads(res)
 
 
 def test_memory_reflect_no_memories(provider: RemnantMemoryProvider, monkeypatch):
@@ -401,8 +403,9 @@ def test_memory_reflect_no_memories(provider: RemnantMemoryProvider, monkeypatch
         session_id="reflect",
     )
     # With no matching memories, hybrid_search returns [] and reflect short-circuits.
-    assert res["count"] == 0
-    assert res["synthesis"] == ""
+    parsed = json.loads(res)
+    assert parsed["count"] == 0
+    assert parsed["synthesis"] == ""
 
 
 # --- cosine sanity (re-confirm for semantic) --------------------------------

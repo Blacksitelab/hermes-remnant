@@ -12,6 +12,7 @@ transaction, then wakes the background worker.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any
 
@@ -297,12 +298,12 @@ class RemnantMemoryProvider(MemoryProvider):
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(TOOL_SCHEMAS)
 
-    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> Any:
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
         if self._db is None or self._config is None or self._embedder is None:
-            return {"error": "provider not initialized"}
+            return json.dumps({"error": "provider not initialized"})
         session_id = kwargs.get("session_id", self._session_id)
         agent_id = kwargs.get("agent_id", self._config.agent_id)
-        return handle_tool_call(
+        result = handle_tool_call(
             tool_name,
             args,
             db=self._db,
@@ -312,6 +313,13 @@ class RemnantMemoryProvider(MemoryProvider):
             agent_id=agent_id,
             hermes_home=self._hermes_home,
         )
+        # Hermes puts tool results directly into message content; the Ollama
+        # cloud proxy rejects dict content ("invalid message content type:
+        # map[string]interface{}"). Serialise to a JSON string so it matches
+        # the wire format every other provider (Hindsight, etc.) uses.
+        if isinstance(result, str):
+            return result
+        return json.dumps(result, ensure_ascii=False)
 
     # -- prompts --------------------------------------------------------------
 
