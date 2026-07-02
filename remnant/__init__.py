@@ -24,6 +24,7 @@ from .db import RemnantDB, open_db
 from .dream import day_dream, night_dream
 from .embed import Embedder
 from .extract import ExtractionWorker
+from .import_sources import import_hindsight, import_memory_store
 from .ingest import ingest_turn
 from .prefetch import prefetch as _run_prefetch
 from .tools import TOOL_SCHEMAS, handle_tool_call
@@ -122,6 +123,14 @@ _SYSTEM_PROMPT_BLOCK = (
     "vault: new and changed notes become document memories, deleted notes are "
     "forgotten. Excluded vault folders (90_*-95_*, 99_ARCHIVE) are skipped. Locked "
     "notes are indexed but their content is hidden from other agents in search.\n"
+    "Use `memory_import` with `source='memory_store'` to import MEMORY.md / "
+    "USER.md bullets across all Hermes profiles (~/.hermes/profiles/*) as facts "
+    "(confidence=0.9, trust_score=0.9) with fleet/shared/private visibility "
+    "heuristics. Use `source='hindsight'` to issue a bounded set of broad recall "
+    "queries to the Hindsight store and import unique results (trust_score=0.5). "
+    "Both dedup by content hash. Use `dry_run=true` to preview counts without "
+    "writing; `shadow=true` logs proposed actions to "
+    "~/.hermes/remnant/shadow.log instead of importing.\n"
     "Transient state (percentages, current status, timestamps) is rejected.\n"
     "Memories are scoped by agent and visibility (private/shared/fleet).\n"
     "Use the `memory_thread` tool to manage topic threads: create, update, "
@@ -296,6 +305,7 @@ class RemnantMemoryProvider(MemoryProvider):
             embedder=self._embedder,
             session_id=session_id,
             agent_id=agent_id,
+            hermes_home=self._hermes_home,
         )
 
     # -- prompts --------------------------------------------------------------
@@ -396,6 +406,39 @@ class RemnantMemoryProvider(MemoryProvider):
             return {"indexed": 0, "skipped": 0, "forgotten": 0}
         return _index_vault(
             self._db, self._config, self._embedder, force=force
+        )
+
+    # -- migration import (Phase 6) ------------------------------------------
+
+    def import_memory(
+        self,
+        source: str,
+        *,
+        profile: str | None = None,
+        dry_run: bool = False,
+        shadow: bool = False,
+    ) -> dict[str, Any]:
+        """Import memories from an existing store.
+
+        ``source`` is ``"memory_store"`` (MEMORY.md / USER.md across all Hermes
+        profiles), ``"hindsight"`` (bounded broad-query recall), or ``"vault"``
+        (delegates to ``reindex_vault``). Returns a stats dict. Safe to call
+        from an external cron/timer.
+        """
+        if self._db is None or self._config is None or self._embedder is None:
+            return {"error": "provider not initialized"}
+        if source == "vault":
+            return self.reindex_vault()
+        if source not in ("memory_store", "hindsight"):
+            return {"error": f"unknown import source: {source}"}
+        if source == "memory_store":
+            return import_memory_store(
+                self._db, self._config, self._embedder, self._hermes_home,
+                dry_run=dry_run, shadow=shadow, profile=profile,
+            )
+        return import_hindsight(
+            self._db, self._config, self._embedder,
+            dry_run=dry_run, shadow=shadow, hermes_home=self._hermes_home,
         )
 
     # -- dream loop (Phase 5) -------------------------------------------------

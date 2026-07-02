@@ -745,13 +745,16 @@ def test_memory_import_tool_runs_vault(provider: RemnantMemoryProvider, vault: P
     assert res["indexed"] >= 1
 
 
-def test_memory_import_rejects_unimplemented_source(
-    provider: RemnantMemoryProvider
-):
+def test_memory_import_hindsight_now_implemented(provider: RemnantMemoryProvider):
+    # Phase 6: hindsight is now a real import source (monkeypatched in the
+    # migration suite to avoid real recall calls); the dispatch returns stats
+    # rather than the Phase-4 "not implemented" error.
     res = provider.handle_tool_call(
-        "memory_import", {"source": "hindsight"}, session_id="imp",
+        "memory_import", {"source": "hindsight", "dry_run": True}, session_id="imp",
     )
-    assert "error" in res
+    assert "error" not in res
+    assert res["source"] == "hindsight"
+    assert "stats" in res
 
 
 def test_memory_import_rejects_unknown_source(provider: RemnantMemoryProvider):

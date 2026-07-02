@@ -10,13 +10,16 @@ Tools exposed to the agent:
 - `memory_edit`: update / merge / forget / feedback / share / unshare memories.
   Every edit is audit-logged; nothing is ever deleted.
 - `memory_import`: bulk-import a memory source. Phase 4 supports
-  ``source='vault'`` (Obsidian vault re-index); ``hindsight`` and
-  ``memory_store`` are reserved enum values for later phases.
+  ``source='vault'`` (Obsidian vault re-index). Phase 6 adds
+  ``source='memory_store'`` (MEMORY.md / USER.md across all Hermes profiles) and
+  ``source='hindsight'`` (bounded broad-query recall from the Hindsight store).
+  Both new sources support ``dry_run`` and ``shadow`` modes.
 """
 
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from .config import RemnantConfig
@@ -24,6 +27,7 @@ from .db import RemnantDB
 from .edit import memory_edit
 from .embed import Embedder
 from .graph import graph_traverse
+from .import_sources import import_hindsight, import_memory_store
 from .ingest import store_memory
 from .reflect import memory_reflect
 from .search import search
@@ -217,26 +221,54 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "memory_import",
             "description": (
-                "Bulk-import a memory source into Remnant. Phase 4 supports "
-                "source='vault', which re-walks the Obsidian vault, indexes new "
-                "and changed markdown notes as document memories, and forgets "
-                "memories for deleted files. Excluded vault folders (90_*-95_*, "
-                "99_ARCHIVE) are never indexed. 'hindsight' and 'memory_store' "
-                "sources are reserved for later phases."
+                "Import memories from an existing store into Remnant. "
+                "source='vault' re-indexes the Obsidian vault (new/changed "
+                "notes become document memories; deleted notes are forgotten). "
+                "source='memory_store' parses MEMORY.md / USER.md across all "
+                "Hermes profiles (~/.hermes/profiles/*) into facts with "
+                "visibility heuristics (fleet/shared/private). "
+                "source='hindsight' issues a bounded set of broad recall "
+                "queries to the Hindsight store and dedups by content hash. "
+                "Use dry_run to preview counts without writing. Use shadow=True "
+                "to log what would be imported to ~/.hermes/remnant/shadow.log "
+                "instead of touching the DB."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "enum": ["vault", "hindsight", "memory_store"],
+                        "enum": ["memory_store", "hindsight", "vault"],
                         "description": "The memory source to import.",
+                    },
+                    "profile": {
+                        "type": "string",
+                        "description": (
+                            "memory_store only: limit import to a single "
+                            "profile name. Ignored for other sources."
+                        ),
+                    },
+                    "dry_run": {
+                        "type": "boolean",
+                        "description": (
+                            "Preview counts without writing to the DB or "
+                            "shadow log (default false)."
+                        ),
+                        "default": False,
+                    },
+                    "shadow": {
+                        "type": "boolean",
+                        "description": (
+                            "Log proposed actions to ~/.hermes/remnant/shadow.log "
+                            "instead of importing (default false)."
+                        ),
+                        "default": False,
                     },
                     "force": {
                         "type": "boolean",
                         "description": (
-                            "If true, re-index every non-excluded file even when "
-                            "its hash is unchanged (default false)."
+                            "vault only: re-index every non-excluded file even "
+                            "when its hash is unchanged (default false)."
                         ),
                         "default": False,
                     },
@@ -322,6 +354,7 @@ def handle_tool_call(
     embedder: Embedder,
     session_id: str,
     agent_id: str | None = None,
+    hermes_home: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call. Returns a tool-result dict for the agent."""
     aid = agent_id or config.agent_id
@@ -437,17 +470,35 @@ def handle_tool_call(
         source = str(args.get("source", "")).strip().lower()
         if source not in ("vault", "hindsight", "memory_store"):
             return {"error": f"unknown import source: {source}"}
-        if source != "vault":
-            # hindsight / memory_store are reserved for later phases.
-            return {"error": f"import source not implemented in Phase 4: {source}"}
-        force = bool(args.get("force", False))
-        stats = index_vault(db, config, embedder, force=force)
-        return {
-            "source": source,
-            "indexed": stats["indexed"],
-            "skipped": stats["skipped"],
-            "forgotten": stats["forgotten"],
-        }
+        dry_run = bool(args.get("dry_run", False))
+        shadow = bool(args.get("shadow", False))
+        profile = args.get("profile")
+        if profile is not None:
+            profile = str(profile).strip() or None
+        if source == "vault":
+            force = bool(args.get("force", False))
+            stats = index_vault(db, config, embedder, force=force)
+            return {
+                "source": source,
+                "indexed": stats["indexed"],
+                "skipped": stats["skipped"],
+                "forgotten": stats["forgotten"],
+            }
+        # memory_store / hindsight need a hermes_home to discover profiles and
+        # to write the shadow log. The provider passes it through; fall back to
+        # the standard location for non-provider callers.
+        home = hermes_home or str(Path.home() / ".hermes")
+        if source == "memory_store":
+            stats = import_memory_store(
+                db, config, embedder, home,
+                dry_run=dry_run, shadow=shadow, profile=profile,
+            )
+        else:  # hindsight
+            stats = import_hindsight(
+                db, config, embedder,
+                dry_run=dry_run, shadow=shadow, hermes_home=home,
+            )
+        return {"source": source, "stats": stats}
     if tool_name == "memory_thread":
         action = str(args.get("action", "")).strip().lower()
         if not action:

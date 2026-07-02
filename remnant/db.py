@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta (
@@ -42,7 +42,10 @@ CREATE TABLE IF NOT EXISTS memories (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL CHECK(type IN ('fact','observation','conversation','document','thread')),
     content TEXT NOT NULL,
-    source TEXT NOT NULL CHECK(source IN ('conversation','vault','email','cron','sensor','manual')),
+    source TEXT NOT NULL CHECK(source IN (
+        'conversation','vault','email','cron','sensor',
+        'manual','import','hindsight'
+    )),
     source_id TEXT,
     agent TEXT,
     visibility TEXT DEFAULT 'private',
@@ -54,6 +57,8 @@ CREATE TABLE IF NOT EXISTS memories (
     status TEXT DEFAULT 'active',
     tags TEXT,
     metadata TEXT,
+    content_hash TEXT,
+    seen_count INTEGER DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -61,6 +66,7 @@ CREATE INDEX IF NOT EXISTS idx_mem_agent ON memories(agent);
 CREATE INDEX IF NOT EXISTS idx_mem_visibility ON memories(visibility);
 CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status);
 CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source);
+CREATE INDEX IF NOT EXISTS idx_mem_content_hash ON memories(content_hash);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     content, tags,
@@ -314,6 +320,34 @@ class RemnantDB:
                 cur.execute("ALTER TABLE entity_aliases ADD COLUMN agent TEXT")
             except sqlite3.OperationalError:
                 pass
+        # Phase 6 (migration): content_hash + seen_count on memories, and
+        # widen the source CHECK to allow 'import' and 'hindsight'. CREATE
+        # TABLE IF NOT EXISTS never alters an existing table, so backfill the
+        # columns for old DBs. The CHECK constraint cannot be altered in place;
+        # for pre-existing DBs we rely on the fact that sqlite only enforces
+        # CHECK on INSERT/UPDATE of the column, and old rows already pass. A
+        # fresh DB picks up the new CHECK from _SCHEMA above.
+        cur.execute("PRAGMA table_info(memories)")
+        cols = {row["name"] for row in cur.fetchall()}
+        if "content_hash" not in cols:
+            try:
+                cur.execute("ALTER TABLE memories ADD COLUMN content_hash TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_mem_content_hash "
+                    "ON memories(content_hash)"
+                )
+            except sqlite3.OperationalError:
+                pass
+        if "seen_count" not in cols:
+            try:
+                cur.execute(
+                    "ALTER TABLE memories ADD COLUMN seen_count INTEGER DEFAULT 1"
+                )
+            except sqlite3.OperationalError:
+                pass
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Cursor]:
@@ -434,6 +468,8 @@ class RemnantDB:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         confidence: float = 0.5,
+        trust_score: float = 0.5,
+        content_hash: str | None = None,
         embedding: list[float] | None = None,
         embed_model: str | None = None,
     ) -> str:
@@ -445,11 +481,13 @@ class RemnantDB:
             cur.execute(
                 "INSERT INTO memories(id, type, content, source, source_id, agent, "
                 "visibility, timestamp, confidence, trust_score, verified, superseded_by, "
-                "status, tags, metadata, created_at, updated_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,?,?,?,?,?)",
+                "status, tags, metadata, content_hash, seen_count, "
+                "created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,0,NULL,?,?,?,?,1,?,?)",
                 (
                     mid, type, content, source, source_id, agent, visibility,
-                    now, confidence, 0.5, "active", tags_json, meta_json, now, now,
+                    now, confidence, trust_score, "active", tags_json, meta_json,
+                    content_hash, now, now,
                 ),
             )
             if embedding is not None:
@@ -1226,6 +1264,54 @@ class RemnantDB:
             except (json.JSONDecodeError, TypeError):
                 pass
         return d
+
+    def get_memory_by_content_hash(self, content_hash: str) -> dict[str, Any] | None:
+        """Return the most recent active memory with a matching content_hash.
+
+        Used by the migration import path to dedup incoming facts across
+        memory_store and hindsight sources. Returns None when the hash is
+        absent or the column is NULL.
+        """
+        if not content_hash:
+            return None
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM memories WHERE content_hash=? AND status='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (content_hash,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return None
+        d = dict(row)
+        if d.get("metadata"):
+            try:
+                d["metadata"] = json.loads(d["metadata"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if d.get("tags"):
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return d
+
+    def increment_seen_count(self, memory_id: str) -> int:
+        """Bump the seen_count on a memory (duplicate re-observation).
+
+        Returns the new seen_count value. Used by the import path to record
+        that an incoming fact matched an existing memory without creating a
+        new row.
+        """
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE memories SET seen_count=COALESCE(seen_count,0)+1, "
+                "updated_at=? WHERE id=?",
+                (_now_iso(), memory_id),
+            )
+            cur.execute("SELECT seen_count FROM memories WHERE id=?", (memory_id,))
+            row = cur.fetchone()
+        return int(row["seen_count"]) if row and row["seen_count"] is not None else 0
 
     # -- threads (Phase 5) -----------------------------------------------------
 
