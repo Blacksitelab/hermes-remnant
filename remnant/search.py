@@ -240,6 +240,9 @@ def _semantic_rank(
         return []
     qvec = embedder.embed(query)
     if not qvec:
+        # No query embedding available (remote failure / None). Skip semantic
+        # comparison entirely; treat as no match rather than scoring against a
+        # zero vector.
         return []
 
     candidates = _bm25_candidates(db, query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)

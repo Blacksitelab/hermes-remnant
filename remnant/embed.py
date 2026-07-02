@@ -3,6 +3,8 @@
 - nomic-embed-text (768-dim) via the BSL1 Ollama `/api/embeddings` endpoint.
 - SQLite-backed cache keyed on (model, sha256(text)) so repeated facts never
   re-hit the network.
+- `embed()` returns ``None`` on failure (never an empty list): callers must
+  treat ``None`` as "no embedding" and skip semantic comparison / store no row.
 - `cosine()` for dedup comparison.
 """
 
@@ -49,17 +51,25 @@ class Embedder:
         self._timeout = config.embed_timeout
         self._client = httpx.Client(timeout=self._timeout)
 
-    def embed(self, text: str) -> list[float]:
-        """Return the embedding for `text`, hitting the cache when possible."""
+    def embed(self, text: str) -> list[float] | None:
+        """Return the embedding for `text`, hitting the cache when possible.
+
+        Returns ``None`` when the remote embedding call fails (and nothing is
+        cached). Callers must treat ``None`` as "no embedding available": skip
+        semantic comparison and store no embedding row, rather than treating an
+        empty vector as a usable zero vector.
+        """
         text_hash = _hash(text)
         cached = self._db.get_cached_embedding(self._model, text_hash)
         if cached is not None:
             return cached
         vec = self._embed_remote(text)
+        if vec is None:
+            return None
         self._db.put_cached_embedding(self._model, text_hash, vec)
         return vec
 
-    def _embed_remote(self, text: str) -> list[float]:
+    def _embed_remote(self, text: str) -> list[float] | None:
         try:
             resp = self._client.post(
                 self._url,
@@ -70,7 +80,7 @@ class Embedder:
             return [float(x) for x in data["embedding"]]
         except (httpx.HTTPError, KeyError, ValueError) as e:
             log.warning("embedding request failed: %s", e)
-            return []
+            return None
 
     def close(self) -> None:
         self._client.close()

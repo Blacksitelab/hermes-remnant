@@ -490,7 +490,7 @@ class RemnantDB:
                     content_hash, now, now,
                 ),
             )
-            if embedding is not None:
+            if embedding:
                 blob = _pack_embedding(embedding)
                 cur.execute(
                     "INSERT OR REPLACE INTO embeddings(memory_id, model, embedding, "

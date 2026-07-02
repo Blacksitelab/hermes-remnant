@@ -46,9 +46,11 @@ class _SessionEmbedder:
         self._query = query
         self._qvec: list[float] | None = qvec
 
-    def embed(self, text: str) -> list[float]:
+    def embed(self, text: str) -> list[float] | None:
         # Reuse the cached query vector when the text matches the session query,
         # otherwise delegate to the real embedder (which has its own SQLite cache).
+        # A None qvec means the query embedding failed upstream; we propagate
+        # None so semantic search skips cosine comparison rather than zero-scoring.
         if text == self._query and self._qvec is not None:
             return self._qvec
         return self._embedder.embed(text)
@@ -358,9 +360,12 @@ class RemnantMemoryProvider(MemoryProvider):
             try:
                 cached = self._embedder.embed(query)
             except Exception:
-                cached = []
+                cached = None
             if cached:
                 self._session_query_vec[session_id] = cached
+        # When embed() returned None (remote failure), pass None as the cached
+        # qvec so _SessionEmbedder.embed propagates None and semantic search is
+        # skipped instead of scoring against a zero vector.
         return _SessionEmbedder(self._embedder, query, qvec=cached)
 
     def prefetch(

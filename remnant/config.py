@@ -33,9 +33,11 @@ DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
 # cosine similarity, then sent to a cloud model for judgment. Day/night have
 # independent endpoints, budgets, and cooldowns. The dream loop is invoked by
 # an external cron/systemd timer (day_dream() / night_dream()), never a daemon.
-DEFAULT_DREAM_DAY_URL = DEFAULT_EXTRACT_URL
+# The dream cloud model is reached via the BSL0 proxy (127.0.0.1), distinct from
+# the local BSL1 extraction endpoint used by extract/reflect.
+DEFAULT_DREAM_DAY_URL = "http://127.0.0.1:11434/v1/chat/completions"
 DEFAULT_DREAM_DAY_MODEL = "deepseek-v4-flash:cloud"
-DEFAULT_DREAM_NIGHT_URL = DEFAULT_EXTRACT_URL
+DEFAULT_DREAM_NIGHT_URL = "http://127.0.0.1:11434/v1/chat/completions"
 DEFAULT_DREAM_NIGHT_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_DREAM_DAY_BUDGET = 3
 DEFAULT_DREAM_NIGHT_BUDGET = 5

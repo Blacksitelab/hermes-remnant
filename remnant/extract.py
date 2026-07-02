@@ -155,7 +155,7 @@ class ExtractionWorker:
                         {"role": "user", "content": content},
                     ],
                     "temperature": 0.1,
-                    "max_tokens": 512,
+                    "max_tokens": 4096,
                 },
             )
             resp.raise_for_status()

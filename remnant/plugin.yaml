@@ -4,4 +4,6 @@ description: "Durable memory engine for Hermes Agent: SQLite-backed fact storage
 hooks:
   - system_prompt_block
   - sync_turn
+  - prefetch
+  - queue_prefetch
   - shutdown

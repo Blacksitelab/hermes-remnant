@@ -361,7 +361,12 @@ def _pair(
 
 
 def _load_vectors(db: RemnantDB, memory_ids: list[str]) -> dict[str, list[float]]:
-    """Load embeddings for a bounded id list. Returns {id: vector}."""
+    """Load embeddings for a bounded id list. Returns {id: vector}.
+
+    Memories with no stored embedding (or an empty/unusable one) are omitted
+    from the map so downstream cosine pre-filtering treats them as "no vector"
+    and skips them rather than scoring against a zero vector.
+    """
     if not memory_ids:
         return {}
     out: dict[str, list[float]] = {}
@@ -373,7 +378,9 @@ def _load_vectors(db: RemnantDB, memory_ids: list[str]) -> dict[str, list[float]
     with db.read() as cur:
         cur.execute(sql, memory_ids)
         for r in cur.fetchall():
-            out[r["memory_id"]] = _unpack_embedding(r["embedding"])
+            vec = _unpack_embedding(r["embedding"])
+            if vec:
+                out[r["memory_id"]] = vec
     return out
 
 

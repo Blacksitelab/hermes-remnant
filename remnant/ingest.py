@@ -146,14 +146,15 @@ def store_memory(
                 log.debug("dedup (text): %s ~= %s", fact, c["content"])
                 return None
         # Then cosine on embeddings for semantic near-dup.
-        new_vec = embedder.embed(fact) if embedder else []
-        for c in candidates:
-            existing_vec = c.get("embedding", []) or []
-            if existing_vec and new_vec:
-                sim = cosine(new_vec, existing_vec)
-                if sim >= config.dedup_cosine_threshold:
-                    log.debug("dedup (cos=%.3f): %s ~= %s", sim, fact, c["content"])
-                    return None
+        new_vec = embedder.embed(fact) if embedder else None
+        if new_vec:
+            for c in candidates:
+                existing_vec = c.get("embedding", []) or []
+                if existing_vec:
+                    sim = cosine(new_vec, existing_vec)
+                    if sim >= config.dedup_cosine_threshold:
+                        log.debug("dedup (cos=%.3f): %s ~= %s", sim, fact, c["content"])
+                        return None
 
     # Contradiction detection: compare against existing active memories
     # that share an entity with this fact. Flag both via metadata, do not
@@ -175,8 +176,8 @@ def store_memory(
                 break
 
     embedding = embedder.embed(fact) if embedder else None
-    if embedding is None:
-        embedding = []
+    # embed() returns None on remote failure; pass None through so no embedding
+    # row is stored (insert_memory only writes a row when embedding is truthy).
     meta: dict[str, Any] = {"session_id": session_id}
     if entity:
         meta["entity"] = entity
