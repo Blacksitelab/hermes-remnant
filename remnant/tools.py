@@ -14,6 +14,7 @@ from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
 from .ingest import store_memory
+from .reflect import memory_reflect
 from .search import search
 
 log = logging.getLogger("remnant.tools")
@@ -24,8 +25,10 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         "function": {
             "name": "memory_search",
             "description": (
-                "Search the Remnant memory store for durable facts using keyword (BM25) "
-                "ranking. Results are scoped to the current agent and visibility."
+                "Search the Remnant memory store for durable facts. Supports "
+                "keyword (BM25), semantic (cosine over embeddings), and auto "
+                "(RRF hybrid) strategies. Results are scoped to the current "
+                "agent and visibility."
             ),
             "parameters": {
                 "type": "object",
@@ -33,6 +36,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "query": {
                         "type": "string",
                         "description": "Keywords or phrase to search for.",
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["keyword", "semantic", "auto"],
+                        "description": "Search strategy (default keyword).",
+                        "default": "keyword",
                     },
                     "limit": {
                         "type": "integer",
@@ -75,6 +84,27 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_reflect",
+            "description": (
+                "Synthesize an answer across the top relevant memories for a "
+                "question using the local reflection LLM. Returns a grounded "
+                "synthesis and the source memory ids used."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "The question to reflect on across stored memories.",
+                    },
+                },
+                "required": ["question"],
+            },
+        },
+    },
 ]
 
 
@@ -93,9 +123,13 @@ def handle_tool_call(
     if tool_name == "memory_search":
         query = str(args.get("query", "")).strip()
         limit = int(args.get("limit", config.search_limit))
+        strategy = str(args.get("strategy", "keyword")).strip() or "keyword"
         if not query:
             return {"error": "query is required"}
-        results = search(db, config, query, agent_id=aid, limit=limit)
+        results = search(
+            db, config, query, agent_id=aid, limit=limit,
+            strategy=strategy, embedder=embedder,
+        )
         return {
             "results": [
                 {
@@ -131,6 +165,11 @@ def handle_tool_call(
         if mid is None:
             return {"stored": False, "reason": "duplicate or transient fact rejected"}
         return {"stored": True, "memory_id": mid, "entity": canonical, "visibility": visibility}
+    if tool_name == "memory_reflect":
+        question = str(args.get("question", "")).strip()
+        if not question:
+            return {"error": "question is required"}
+        return memory_reflect(question, db, config, embedder, aid)
     return {"error": f"unknown tool: {tool_name}"}
 
 

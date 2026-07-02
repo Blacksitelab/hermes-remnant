@@ -17,9 +17,31 @@ from .db import RemnantDB, open_db
 from .embed import Embedder
 from .extract import ExtractionWorker
 from .ingest import ingest_turn
+from .prefetch import prefetch as _run_prefetch
 from .tools import TOOL_SCHEMAS, handle_tool_call
 
 log = logging.getLogger("remnant")
+
+
+class _SessionEmbedder:
+    """Per-session query-embedding cache wrapper.
+
+    Wraps the real Embedder so the (single) Ollama query embedding for a given
+    session is computed at most once and reused across all expanded query terms
+    in a prefetch call. Falls back to the underlying embedder transparently.
+    """
+
+    def __init__(self, embedder: Embedder, query: str, qvec: list[float] | None = None):
+        self._embedder = embedder
+        self._query = query
+        self._qvec: list[float] | None = qvec
+
+    def embed(self, text: str) -> list[float]:
+        # Reuse the cached query vector when the text matches the session query,
+        # otherwise delegate to the real embedder (which has its own SQLite cache).
+        if text == self._query and self._qvec is not None:
+            return self._qvec
+        return self._embedder.embed(text)
 
 # --- Hermes ABC -----------------------------------------------------------
 # The real ABC lives in ``agent.memory_provider`` inside a running Hermes.
@@ -78,8 +100,9 @@ except Exception:  # pragma: no cover - fallback for standalone/test envs
 _SYSTEM_PROMPT_BLOCK = (
     "## Remnant Memory Provider\n"
     "You have durable long-term memory via the Remnant provider.\n"
-    "Use the `memory_search` tool to recall facts (BM25 keyword search).\n"
+    "Use the `memory_search` tool to recall facts (keyword, semantic, or auto hybrid).\n"
     "Use the `memory_store` tool to save a durable fact explicitly.\n"
+    "Use the `memory_reflect` tool to synthesize an answer across stored memories.\n"
     "Transient state (percentages, current status, timestamps) is rejected.\n"
     "Memories are scoped by agent and visibility (private/shared/fleet).\n"
 )
@@ -144,6 +167,11 @@ class RemnantMemoryProvider(MemoryProvider):
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._started: bool = False
+        # Phase 2: per-session injection + query-embedding caches.
+        self._last_injected_hash: dict[str, str] = {}
+        self._session_query_vec: dict[str, list[float]] = {}
+        self._session_query: dict[str, str] = {}
+        self._prefetch_queue: list[tuple[str, str]] = []
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -242,6 +270,57 @@ class RemnantMemoryProvider(MemoryProvider):
         # Wake the background worker so it picks up the new job promptly.
         if self._worker is not None:
             self._worker.wake()
+
+    # -- prefetch (Phase 2) ---------------------------------------------------
+
+    def _session_embedder(self, session_id: str, query: str) -> _SessionEmbedder | None:
+        """Return an embedder wrapper that caches the query vector per session.
+
+        Computes the single Ollama query embedding once (the only network call
+        in prefetch) and reuses it for every expanded query term in this
+        session. Returns None if the provider isn't initialized.
+        """
+        if self._embedder is None or self._config is None:
+            return None
+        cached = self._session_query_vec.get(session_id)
+        if cached is None:
+            try:
+                cached = self._embedder.embed(query)
+            except Exception:
+                cached = []
+            if cached:
+                self._session_query_vec[session_id] = cached
+        return _SessionEmbedder(self._embedder, query, qvec=cached)
+
+    def prefetch(
+        self, query: str, *, session_id: str = "",
+        messages: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Proactive memory injection before an LLM call.
+
+        Returns a compact context block to prepend, or ``{}`` when memory isn't
+        needed, the deadline is exceeded, or the context is unchanged since the
+        last call in this session (diff-based suppression).
+        """
+        if self._db is None or self._config is None or self._embedder is None:
+            return {}
+        sid = session_id or self._session_id or "default"
+        # Reset the per-session query-vector cache when the query changes so a
+        # new query re-embeds; an identical query reuses the cached vector.
+        if self._session_query.get(sid) != query:
+            self._session_query.pop(sid, None)
+            self._session_query[sid] = query
+        return _run_prefetch(self, query, sid, messages=messages)
+
+    def queue_prefetch(self, query: str) -> None:
+        """Optionally pre-warm the next turn's prefetch. Non-blocking best-effort."""
+        if self._db is None or self._config is None:
+            return
+        sid = self._session_id or "default"
+        self._prefetch_queue.append((sid, query))
+        # Keep the queue bounded.
+        if len(self._prefetch_queue) > 32:
+            self._prefetch_queue = self._prefetch_queue[-32:]
 
 
 def register(ctx: Any) -> None:

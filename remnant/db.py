@@ -428,6 +428,77 @@ class RemnantDB:
             row = cur.fetchone()
         return _unpack_embedding(row["embedding"]) if row and row["embedding"] else []
 
+    def search_by_embedding(
+        self,
+        memory_ids: list[str],
+        *,
+        agent_id: str | None = None,
+        visibility: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return active memories in `memory_ids` with their embeddings attached.
+
+        Used by semantic search to load embeddings only for the BM25-pre-filtered
+        candidate set, never the whole table. `memory_ids` should already be
+        bounded by the caller (e.g. SEMANTIC_CANDIDATE_LIMIT).
+        """
+        if not memory_ids:
+            return []
+        placeholders = ",".join("?" for _ in memory_ids)
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at, m.updated_at, e.embedding "
+            "FROM memories m LEFT JOIN embeddings e ON e.memory_id = m.id "
+            f"WHERE m.id IN ({placeholders}) AND m.status='active'"
+        )
+        params: list[Any] = list(memory_ids)
+        if agent_id is not None:
+            sql += " AND m.agent=?"
+            params.append(agent_id)
+        if visibility is not None:
+            sql += " AND m.visibility=?"
+            params.append(visibility)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["embedding"] = _unpack_embedding(d["embedding"]) if d["embedding"] else []
+            out.append(d)
+        return out
+
+    def search_all_active(
+        self,
+        *,
+        agent_id: str | None = None,
+        visibility: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return active memory ids (optionally filtered) for candidate loading.
+
+        Ordered by recency. Embeddings are NOT loaded here; callers pass the
+        returned ids to `search_by_embedding` to fetch vectors only for the
+        candidate set. This keeps the pre-filter cheap and avoids scanning
+        the embeddings table blindly.
+        """
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at "
+            "FROM memories m WHERE m.status='active'"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND m.agent=?"
+            params.append(agent_id)
+        if visibility is not None:
+            sql += " AND m.visibility=?"
+            params.append(visibility)
+        sql += " ORDER BY m.created_at DESC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
+
     def list_memories(
         self,
         *,

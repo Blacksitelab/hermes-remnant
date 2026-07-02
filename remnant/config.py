@@ -18,6 +18,10 @@ EMBED_DIM = 768
 DEFAULT_EXTRACT_URL = "http://192.168.0.11:11434/v1/chat/completions"
 DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 
+# Reflection reuses the extraction endpoint/model by default (gemma4:12b on BSL1).
+DEFAULT_REFLECT_URL = DEFAULT_EXTRACT_URL
+DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
+
 # Cosine similarity above this => duplicate memory
 DEDUP_COSINE_THRESHOLD = 0.92
 # BM25 candidate count when checking duplicates
@@ -26,6 +30,18 @@ DEDUP_CANDIDATES = 8
 SEARCH_LIMIT = 10
 # Max turns queued for extraction before backpressure
 QUEUE_MAX = 256
+
+# Phase 2: proactive injection + semantic search
+DEFAULT_INJECTION_TOKEN_BUDGET = 2000
+DEFAULT_INJECTION_PREFETCH_DEADLINE_MS = 500
+DEFAULT_PREFETCH_ENABLED = True
+# BM25 pre-filter cap before cosine is computed on candidates.
+SEMANTIC_CANDIDATE_LIMIT = 100
+# RRF constant for hybrid fusion.
+RRF_K = 60
+# Reflection input cap (top-N memories) and output cap.
+REFLECT_TOP_N = 20
+REFLECT_MAX_TOKENS = 512
 
 CONFIG_FILENAME = "remnant.json"
 
@@ -41,6 +57,12 @@ class RemnantConfig:
     extract_timeout: float = 60.0
     extract_enabled: bool = True
     extract_workers: int = 1
+    reflect_url: str = DEFAULT_REFLECT_URL
+    reflect_model: str = DEFAULT_REFLECT_MODEL
+    reflect_timeout: float = 60.0
+    injection_token_budget: int = DEFAULT_INJECTION_TOKEN_BUDGET
+    injection_prefetch_deadline_ms: int = DEFAULT_INJECTION_PREFETCH_DEADLINE_MS
+    prefetch_enabled: bool = DEFAULT_PREFETCH_ENABLED
     dedup_cosine_threshold: float = DEDUP_COSINE_THRESHOLD
     dedup_candidates: int = DEDUP_CANDIDATES
     search_limit: int = SEARCH_LIMIT

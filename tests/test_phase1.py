@@ -382,7 +382,8 @@ def test_system_prompt_byte_stable_across_calls(provider: RemnantMemoryProvider)
 def test_get_tool_schemas(provider: RemnantMemoryProvider):
     schemas = provider.get_tool_schemas()
     names = {s["function"]["name"] for s in schemas}
-    assert names == {"memory_search", "memory_store"}
+    assert {"memory_search", "memory_store"} <= names
+    assert "memory_reflect" in names
 
 
 # --- extraction queue persistence -----------------------------------------
