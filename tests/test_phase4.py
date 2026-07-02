@@ -54,10 +54,13 @@ def _fake_embed(db, config, dim=8):
     emb._client = None
 
     def _seed(text: str) -> list[float]:
+        import hashlib
+
         words = [w.lower() for w in text.strip().split()]
         vec = [0.0] * dim
         for w in words:
-            h = abs(hash(w)) % dim
+            # Deterministic per-word bucket (independent of PYTHONHASHSEED).
+            h = int.from_bytes(hashlib.sha256(w.encode("utf-8")).digest()[:4], "big") % dim
             vec[h] += 1.0
         n = sum(v * v for v in vec) ** 0.5
         if n:
@@ -816,9 +819,12 @@ def test_memory_search_tool_locked_masking_for_other_agent(
         frontmatter={"locked": True},
     )
     provider.handle_tool_call("memory_import", {"source": "vault"}, session_id="imp")
-    # Owner sees content (BM25 matches the single token "hunter2").
+    # Owner sees content (BM25 matches the single token "hunter2"). Use the
+    # keyword strategy explicitly: this test is about locked-note masking, not
+    # semantic relevance, and the single-token query scores below the semantic
+    # threshold under the bag-of-words test embedder.
     owner = provider.handle_tool_call(
-        "memory_search", {"query": "hunter2"}, session_id="s",
+        "memory_search", {"query": "hunter2", "strategy": "keyword"}, session_id="s",
     )
     assert any("hunter2" in r["fact"] for r in json.loads(owner)["results"])
 
@@ -834,7 +840,7 @@ def test_memory_search_tool_locked_masking_for_other_agent(
     intruder.initialize(session_id="intr", hermes_home=str(home))
     try:
         res = intruder.handle_tool_call(
-            "memory_search", {"query": "hunter2"}, session_id="intr",
+            "memory_search", {"query": "hunter2", "strategy": "keyword"}, session_id="intr",
         )
         results = json.loads(res)["results"]
         locked = [r for r in results if r.get("locked")]

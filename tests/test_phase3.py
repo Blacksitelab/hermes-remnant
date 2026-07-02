@@ -49,11 +49,16 @@ def _fake_embed(db, config, dim=8):
     emb._client = None
 
     def _seed(text: str) -> list[float]:
+        import hashlib
+
         words = [w.lower() for w in text.strip().split()]
         vec = [0.0] * dim
         for w in words:
-            h = abs(hash(w)) % dim
+            # Deterministic per-word bucket (independent of PYTHONHASHSEED) so
+            # cosine scores are stable across runs.
+            h = int.from_bytes(hashlib.sha256(w.encode("utf-8")).digest()[:4], "big") % dim
             vec[h] += 1.0
+        # Normalize so cosine is well-defined.
         n = sum(v * v for v in vec) ** 0.5
         if n:
             vec = [v / n for v in vec]

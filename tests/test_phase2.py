@@ -44,10 +44,14 @@ def _fake_embed(db, config, dim=8):
     emb._client = None
 
     def _seed(text: str) -> list[float]:
+        import hashlib
+
         words = [w.lower() for w in text.strip().split()]
         vec = [0.0] * dim
         for w in words:
-            h = abs(hash(w)) % dim
+            # Deterministic per-word bucket (independent of PYTHONHASHSEED) so
+            # cosine scores are stable across runs.
+            h = int.from_bytes(hashlib.sha256(w.encode("utf-8")).digest()[:4], "big") % dim
             vec[h] += 1.0
         # Normalize so cosine is well-defined.
         n = sum(v * v for v in vec) ** 0.5
@@ -426,3 +430,171 @@ def test_phase2_config_defaults():
     assert cfg.prefetch_enabled is True
     assert cfg.reflect_model == "gemma4:12b"
     assert cfg.reflect_url == cfg.extract_url
+
+
+# --- issue #6: hybrid semantic search as default + similarity threshold ----
+
+
+def test_default_search_strategy_is_auto():
+    """search() must default to strategy='auto' when no strategy is passed."""
+    cfg = RemnantConfig()
+    assert cfg.default_search_strategy == "auto"
+    db = open_db(default_db_path())
+    emb = _fake_embed(db, cfg)
+    try:
+        _seed_memories(db, emb, cfg, [
+            ("Sven prefers dark mode for editors", "Sven", "private"),
+        ])
+        # No strategy arg => uses config.default_search_strategy == "auto".
+        # Force the embedder so the semantic arm ranks the relevant memory first.
+        results = hybrid_search(
+            db, cfg, "dark mode", agent_id="default", embedder=emb,
+        )
+        assert results, "auto default should return relevant results"
+        assert any("dark mode" in r["content"].lower() for r in results)
+    finally:
+        db.close()
+
+
+def test_semantic_below_threshold_returns_empty():
+    """A query whose top semantic score is below ``min_semantic_score`` must
+    return no results rather than keyword/recency noise.
+
+    We force this by raising ``min_semantic_score`` above the highest cosine the
+    fake embedder can produce for a related query, so a genuinely-relevant
+    search is suppressed when the bar is too high. The same must hold for both
+    the ``semantic`` and ``auto`` strategies.
+    """
+    db = open_db(default_db_path())
+    cfg = RemnantConfig()
+    emb = _fake_embed(db, cfg)
+    try:
+        _seed_memories(db, emb, cfg, [
+            ("Sven prefers dark mode for all editors", "Sven", "private"),
+            ("The homelab runs Proxmox on four nodes", "homelab", "private"),
+        ])
+        # A relevant query: the fake embedder yields a cosine well below 1.0
+        # (partial token overlap). Raising the threshold above that cosine
+        # must suppress all results.
+        cfg.min_semantic_score = 0.99
+        res_sem = hybrid_search(
+            db, cfg, "dark mode preference", agent_id="default",
+            strategy="semantic", embedder=emb,
+        )
+        assert res_sem == [], "semantic below threshold should return []"
+        res_auto = hybrid_search(
+            db, cfg, "dark mode preference", agent_id="default",
+            strategy="auto", embedder=emb,
+        )
+        assert res_auto == [], "auto below threshold should return []"
+    finally:
+        db.close()
+
+
+def test_semantic_above_threshold_returns_results():
+    """When the top semantic score meets the threshold, results are returned."""
+    db = open_db(default_db_path())
+    cfg = RemnantConfig()
+    emb = _fake_embed(db, cfg)
+    try:
+        _seed_memories(db, emb, cfg, [
+            ("Sven prefers dark mode for all editors", "Sven", "private"),
+        ])
+        # Default threshold (0.5) is met for a highly overlapping query.
+        res = hybrid_search(
+            db, cfg, "Sven prefers dark mode for all editors", agent_id="default",
+            strategy="semantic", embedder=emb,
+        )
+        assert res, "exact-overlap query should clear the default threshold"
+        assert res[0]["score"] >= cfg.min_semantic_score
+    finally:
+        db.close()
+
+
+def test_semantic_threshold_configurable():
+    """A lower min_semantic_score lets borderline matches through; a higher one
+    suppresses them."""
+    db = open_db(default_db_path())
+    cfg = RemnantConfig()
+    emb = _fake_embed(db, cfg)
+    try:
+        _seed_memories(db, emb, cfg, [
+            ("Sven prefers dark mode for all editors", "Sven", "private"),
+        ])
+        # The fake embedder shares tokens "dark","mode","for" with the query,
+        # giving a partial cosine (~0.55). A threshold of 0.9 should drop it.
+        cfg.min_semantic_score = 0.9
+        res = hybrid_search(
+            db, cfg, "dark mode preference", agent_id="default",
+            strategy="semantic", embedder=emb,
+        )
+        assert res == [], "high threshold should suppress borderline matches"
+        # A threshold of 0.0 lets everything through.
+        cfg.min_semantic_score = 0.0
+        res_lo = hybrid_search(
+            db, cfg, "dark mode preference", agent_id="default",
+            strategy="semantic", embedder=emb,
+        )
+        assert res_lo, "zero threshold should let matches through"
+    finally:
+        db.close()
+
+
+def test_search_tool_accepts_strategy_argument(provider: RemnantMemoryProvider):
+    """The memory_search tool must accept and honor a ``strategy`` argument."""
+    provider.handle_tool_call(
+        "memory_store",
+        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        session_id="seed",
+    )
+    # Force keyword strategy explicitly via the tool path.
+    out_kw = provider.handle_tool_call(
+        "memory_search",
+        {"query": "dark mode", "strategy": "keyword"},
+        session_id="s",
+    )
+    import json
+
+    parsed_kw = json.loads(out_kw)
+    assert parsed_kw["count"] >= 1
+    # Force semantic strategy explicitly.
+    out_sem = provider.handle_tool_call(
+        "memory_search",
+        {"query": "dark mode", "strategy": "semantic"},
+        session_id="s",
+    )
+    parsed_sem = json.loads(out_sem)
+    assert parsed_sem["count"] >= 1
+    # Force auto strategy explicitly.
+    out_auto = provider.handle_tool_call(
+        "memory_search",
+        {"query": "dark mode", "strategy": "auto"},
+        session_id="s",
+    )
+    parsed_auto = json.loads(out_auto)
+    assert parsed_auto["count"] >= 1
+    # Force graph strategy explicitly (no graph data seeded, but the call must
+    # be accepted and return a well-formed result).
+    out_graph = provider.handle_tool_call(
+        "memory_search",
+        {"query": "Sven", "strategy": "graph"},
+        session_id="s",
+    )
+    parsed_graph = json.loads(out_graph)
+    assert "count" in parsed_graph
+
+
+def test_search_tool_default_strategy_is_auto(provider: RemnantMemoryProvider):
+    """The memory_search tool must default to 'auto' when no strategy is given."""
+    provider.handle_tool_call(
+        "memory_store",
+        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        session_id="seed",
+    )
+    import json
+
+    out = provider.handle_tool_call(
+        "memory_search", {"query": "dark mode"}, session_id="s",
+    )
+    parsed = json.loads(out)
+    assert parsed["count"] >= 1

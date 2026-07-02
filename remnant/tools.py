@@ -63,8 +63,12 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "strategy": {
                         "type": "string",
                         "enum": ["keyword", "semantic", "auto", "graph"],
-                        "description": "Search strategy (default keyword).",
-                        "default": "keyword",
+                        "description": (
+                            "Search strategy (default auto): keyword (BM25), "
+                            "semantic (cosine over embeddings), auto (RRF "
+                            "hybrid fusion), or graph (entity-graph traversal)."
+                        ),
+                        "default": "auto",
                     },
                     "limit": {
                         "type": "integer",
@@ -361,7 +365,9 @@ def handle_tool_call(
     if tool_name == "memory_search":
         query = str(args.get("query", "")).strip()
         limit = int(args.get("limit", config.search_limit))
-        strategy = str(args.get("strategy", "keyword")).strip() or "keyword"
+        strategy = str(args.get("strategy") or config.default_search_strategy).strip()
+        if strategy not in ("keyword", "semantic", "auto", "graph"):
+            strategy = config.default_search_strategy
         # profile_scope: explicit arg, else None (search() falls back to the
         # provider-configured scope). An empty list is treated as "no scoping".
         raw_scope = args.get("profile_scope")
