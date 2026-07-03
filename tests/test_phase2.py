@@ -138,6 +138,8 @@ def _seed_memories(db, emb, cfg, items, agent_id="default"):
         ("status of the proxmox node", True),
         ("who is Alice", True),
         ("Sven", True),  # short proper-noun lookup
+        ("presence sensors", True),
+        ("docker", True),
         ("", False),
     ],
 )

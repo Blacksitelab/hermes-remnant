@@ -78,7 +78,7 @@ class Embedder:
         try:
             resp = self._client.post(
                 self._url,
-                json={"model": self._model, "prompt": text},
+                json={"model": self._model, "prompt": text, "keep_alive": -1},
             )
             resp.raise_for_status()
             data = resp.json()

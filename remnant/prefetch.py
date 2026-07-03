@@ -10,6 +10,7 @@ Embedder, which is cached per session by the provider.
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import time
 from typing import Any
@@ -51,17 +52,14 @@ def _needs_memory(query: str) -> bool:
     """Lightweight local intent classifier. No network, no LLM."""
     q = (query or "").strip()
     if not q:
+        logging.debug("Remnant prefetch skip: empty query")
         return False
     if _NEEDS_MEMORY_RE.search(q):
         return True
-    # Not a greeting/short small talk and has enough content words -> maybe.
     if _GREETING_RE.match(q):
+        logging.debug("Remnant prefetch skip: greeting/small-talk: %r", q)
         return False
-    tokens = [t for t in re.split(r"\s+", q) if t]
-    if len(tokens) <= 2:
-        # Short non-greeting queries are ambiguous; only allow if they contain
-        # a capitalized proper noun (likely an entity lookup).
-        return bool(_PROPER_RE.search(q))
+    logging.debug("Remnant prefetch pass: %r", q)
     return True
 
 

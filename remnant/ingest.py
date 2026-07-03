@@ -185,7 +185,7 @@ def store_memory(
         meta["contradicts"] = contradiction_targets
     mid = db.insert_memory(
         content=fact,
-        source="manual",
+        source="conversation" if source_turn_id is not None else "manual",
         agent=agent_id,
         visibility=visibility,
         source_id=str(source_turn_id) if source_turn_id is not None else None,

@@ -154,13 +154,17 @@ class ExtractionWorker:
                         {"role": "system", "content": _EXTRACT_PROMPT},
                         {"role": "user", "content": content},
                     ],
-                    "temperature": 0.1,
-                    "max_tokens": 4096,
+                    "stream": False,
+                    "options": {
+                        "temperature": 0.1,
+                        "num_predict": 4096,
+                    },
+                    "keep_alive": -1,
                 },
             )
             resp.raise_for_status()
             data = resp.json()
-            text = data["choices"][0]["message"]["content"]
+            text = data["message"]["content"]
             return _parse_facts(text)
         except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as e:
             log.warning("extraction LLM call failed: %s", e)

@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -63,7 +63,7 @@ CREATE TABLE IF NOT EXISTS memories (
     content TEXT NOT NULL,
     source TEXT NOT NULL CHECK(source IN (
         'conversation','vault','email','cron','sensor',
-        'manual','import','hindsight'
+        'manual','import','hindsight','dream'
     )),
     source_id TEXT,
     agent TEXT,
@@ -383,6 +383,72 @@ class RemnantDB:
                 )
             except sqlite3.OperationalError:
                 pass
+
+        # Phase 7 (migration): widen the memories.source CHECK constraint to
+        # allow 'dream'. SQLite does not support ALTER TABLE on CHECK, so we
+        # rebuild the table when the current schema lacks 'dream'.
+        cur.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'"
+        )
+        create_sql = cur.fetchone()[0]
+        if "'dream'" not in create_sql:
+            self._conn.execute("PRAGMA foreign_keys=OFF")
+            try:
+                cur.execute("BEGIN IMMEDIATE")
+                try:
+                    self._rebuild_memories_table(cur)
+                    cur.execute("COMMIT")
+                except Exception:
+                    cur.execute("ROLLBACK")
+                    raise
+            finally:
+                self._conn.execute("PRAGMA foreign_keys=ON")
+            # Recreate FTS5 triggers against the rebuilt table and rebuild the
+            # FTS index because rowids may have shifted during the table swap.
+            cur.executescript(_FTS_TRIGGERS)
+            try:
+                cur.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild')")
+            except sqlite3.OperationalError:
+                pass
+
+    def _rebuild_memories_table(self, cur: sqlite3.Cursor) -> None:
+        """Recreate the memories table with the widened source CHECK."""
+        cur.execute(
+            """
+            CREATE TABLE memories_new (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL CHECK(type IN ('fact','observation','conversation','document','thread')),
+                content TEXT NOT NULL,
+                source TEXT NOT NULL CHECK(source IN (
+                    'conversation','vault','email','cron','sensor',
+                    'manual','import','hindsight','dream'
+                )),
+                source_id TEXT,
+                agent TEXT,
+                visibility TEXT DEFAULT 'private',
+                timestamp TEXT NOT NULL,
+                confidence REAL DEFAULT 0.5,
+                trust_score REAL DEFAULT 0.5,
+                verified INTEGER DEFAULT 0,
+                superseded_by TEXT,
+                status TEXT DEFAULT 'active',
+                tags TEXT,
+                metadata TEXT,
+                content_hash TEXT,
+                seen_count INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        cur.execute("INSERT INTO memories_new SELECT * FROM memories")
+        cur.execute("DROP TABLE memories")
+        cur.execute("ALTER TABLE memories_new RENAME TO memories")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_agent ON memories(agent)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_visibility ON memories(visibility)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_source ON memories(source)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_mem_content_hash ON memories(content_hash)")
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Cursor]:
