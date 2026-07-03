@@ -86,9 +86,9 @@ Default config in `hermes_home/remnant.json`:
 ```json
 {
   "embedding_model": "nomic-embed-text",
-  "embedding_endpoint": "http://192.168.0.11:11434/api/embeddings",
+  "embedding_endpoint": "http://your-ollama-host.local:11434/api/embeddings",
   "extraction_model": "gemma4:12b",
-  "extraction_endpoint": "http://192.168.0.11:11434/v1/chat/completions"
+  "extraction_endpoint": "http://your-ollama-host.local:11434/v1/chat/completions"
 }
 ```
 

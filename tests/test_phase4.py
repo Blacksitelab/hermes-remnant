@@ -655,23 +655,23 @@ def test_locked_note_content_hidden_from_other_agent(
     secret = vault / "Personal" / "secret.md"
     _write_note(
         secret,
-        "# Secret\nhunter2 is the passphrase for BlacksiteLab.",
+        "# Secret\nREDACTED_EXAMPLE is the passphrase for BlacksiteLab.",
         frontmatter={"locked": True},
     )
     public = vault / "Projects" / "public.md"
-    _write_note(public, "# Public\nhunter2 appears in the public build log too.")
+    _write_note(public, "# Public\nREDACTED_EXAMPLE appears in the public build log too.")
     index_vault(db, cfg, emb)
     try:
-        # Owner agent: sees the secret content (BM25 matches "hunter2").
-        owner_res = hybrid_search(db, cfg, "hunter2", agent_id="owner")
+        # Owner agent: sees the secret content (BM25 matches "REDACTED_EXAMPLE").
+        owner_res = hybrid_search(db, cfg, "REDACTED_EXAMPLE", agent_id="owner")
         owner_contents = " ".join(r["content"] for r in owner_res)
-        assert "hunter2" in owner_contents
+        assert "REDACTED_EXAMPLE" in owner_contents
         assert any("passphrase" in r["content"] for r in owner_res)
 
         # Another agent querying the same DB: content masked, only metadata shown.
         viewer_cfg = RemnantConfig(vault_path=str(vault), agent_id="intruder")
         intruder_res = hybrid_search(
-            db, viewer_cfg, "hunter2", agent_id=None,
+            db, viewer_cfg, "REDACTED_EXAMPLE", agent_id=None,
         )
         locked_rows = [r for r in intruder_res if r.get("locked")]
         assert locked_rows, "locked note should still be returned (masked)"
@@ -686,7 +686,7 @@ def test_locked_note_content_hidden_from_other_agent(
             r for r in intruder_res if r.get("source_id") == "Projects/public.md"
         ]
         assert public_rows
-        assert "hunter2" in public_rows[0]["content"]
+        assert "REDACTED_EXAMPLE" in public_rows[0]["content"]
     finally:
         db.close()
 
@@ -698,17 +698,17 @@ def test_locked_note_visible_to_owner_unmasked(hermes_home: Path, vault: Path):
     secret = vault / "Personal" / "secret.md"
     _write_note(
         secret,
-        "# Secret\nSensitive hunter2 details here.",
+        "# Secret\nSensitive REDACTED_EXAMPLE details here.",
         frontmatter={"locked": True},
     )
     index_vault(db, cfg, emb)
     try:
-        res = hybrid_search(db, cfg, "hunter2", agent_id="owner")
+        res = hybrid_search(db, cfg, "REDACTED_EXAMPLE", agent_id="owner")
         # Owner sees real content, no locked flag.
         rows = [r for r in res if r.get("source_id") == "Personal/secret.md"]
         assert rows
         assert rows[0]["content"] != "[locked note: content hidden]"
-        assert "hunter2" in rows[0]["content"]
+        assert "REDACTED_EXAMPLE" in rows[0]["content"]
         assert not rows[0].get("locked")
     finally:
         db.close()
@@ -719,14 +719,14 @@ def test_unlocked_note_content_shown_to_everyone(hermes_home: Path, vault: Path)
     cfg = RemnantConfig(vault_path=str(vault), agent_id="owner")
     emb = _fake_embed(db, cfg)
     note = vault / "Projects" / "public.md"
-    _write_note(note, "# Public\nhunter2 build is green.")
+    _write_note(note, "# Public\nREDACTED_EXAMPLE build is green.")
     index_vault(db, cfg, emb)
     try:
         viewer_cfg = RemnantConfig(vault_path=str(vault), agent_id="intruder")
-        res = hybrid_search(db, viewer_cfg, "hunter2", agent_id=None)
+        res = hybrid_search(db, viewer_cfg, "REDACTED_EXAMPLE", agent_id=None)
         rows = [r for r in res if r.get("source_id") == "Projects/public.md"]
         assert rows
-        assert "hunter2" in rows[0]["content"]
+        assert "REDACTED_EXAMPLE" in rows[0]["content"]
         assert not rows[0].get("locked")
     finally:
         db.close()
@@ -815,18 +815,18 @@ def test_memory_search_tool_locked_masking_for_other_agent(
     # provider's agent_id is "default" (the owner).
     _write_note(
         vault / "Personal" / "secret.md",
-        "# Secret\nhunter2 is the passphrase.",
+        "# Secret\nREDACTED_EXAMPLE is the passphrase.",
         frontmatter={"locked": True},
     )
     provider.handle_tool_call("memory_import", {"source": "vault"}, session_id="imp")
-    # Owner sees content (BM25 matches the single token "hunter2"). Use the
+    # Owner sees content (BM25 matches the single token "REDACTED_EXAMPLE"). Use the
     # keyword strategy explicitly: this test is about locked-note masking, not
     # semantic relevance, and the single-token query scores below the semantic
     # threshold under the bag-of-words test embedder.
     owner = provider.handle_tool_call(
-        "memory_search", {"query": "hunter2", "strategy": "keyword"}, session_id="s",
+        "memory_search", {"query": "REDACTED_EXAMPLE", "strategy": "keyword"}, session_id="s",
     )
-    assert any("hunter2" in r["fact"] for r in json.loads(owner)["results"])
+    assert any("REDACTED_EXAMPLE" in r["fact"] for r in json.loads(owner)["results"])
 
     # A different agent uses a provider configured with a different agent_id so
     # the owner check fails. We build a second provider pointing at the same
@@ -840,13 +840,13 @@ def test_memory_search_tool_locked_masking_for_other_agent(
     intruder.initialize(session_id="intr", hermes_home=str(home))
     try:
         res = intruder.handle_tool_call(
-            "memory_search", {"query": "hunter2", "strategy": "keyword"}, session_id="intr",
+            "memory_search", {"query": "REDACTED_EXAMPLE", "strategy": "keyword"}, session_id="intr",
         )
         results = json.loads(res)["results"]
         locked = [r for r in results if r.get("locked")]
         assert locked
         for r in locked:
-            assert "hunter2" not in r["fact"]
+            assert "REDACTED_EXAMPLE" not in r["fact"]
             assert r["fact"] == "[locked note: content hidden]"
     finally:
         intruder.shutdown()

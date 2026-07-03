@@ -156,7 +156,7 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "embed_url",
         "description": "Ollama embeddings endpoint",
-        "default": "http://192.168.0.11:11434/api/embeddings",
+        "default": "http://your-ollama-host.local:11434/api/embeddings",
         "required": False,
     },
     {
@@ -168,7 +168,7 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "extract_url",
         "description": "Extraction LLM OpenAI-compatible endpoint",
-        "default": "http://192.168.0.11:11434/v1/chat/completions",
+        "default": "http://your-ollama-host.local:11434/v1/chat/completions",
         "required": False,
     },
     {

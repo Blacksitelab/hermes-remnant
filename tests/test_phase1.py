@@ -108,7 +108,7 @@ def patch_extract(monkeypatch):
 def test_load_config_defaults(hermes_home: Path):
     cfg = load_config(str(hermes_home))
     assert cfg.embed_model == "nomic-embed-text"
-    assert cfg.embed_url == "http://192.168.0.11:11434/api/embeddings"
+    assert cfg.embed_url == "http://your-ollama-host.local:11434/api/embeddings"
     assert cfg.extract_model == "gemma4:12b"
     assert cfg.default_visibility == "private"
 

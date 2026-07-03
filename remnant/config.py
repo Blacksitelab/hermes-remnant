@@ -12,11 +12,11 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-DEFAULT_EMBED_URL = "http://192.168.0.11:11434/api/embeddings"
+DEFAULT_EMBED_URL = "http://your-ollama-host.local:11434/api/embeddings"
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
 EMBED_DIM = 768
 
-DEFAULT_EXTRACT_URL = "http://192.168.0.11:11434/v1/chat/completions"
+DEFAULT_EXTRACT_URL = "http://your-ollama-host.local:11434/api/chat"
 DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 
 # Phase 4: Obsidian vault indexing. The vault is the single source of truth for
@@ -25,7 +25,7 @@ DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 # can be overridden via the REMNANT_VAULT_PATH env var (useful for tests and
 # deployments that store the vault elsewhere than the hardcoded BSL path).
 DEFAULT_VAULT_PATH = os.environ.get(
-    "REMNANT_VAULT_PATH", "/home/jd/obsidian-vaults/BlacksiteLabVault"
+    "REMNANT_VAULT_PATH", "/path/to/your/obsidian-vault"
 )
 DEFAULT_VAULT_EXCLUDE = ["90_", "91_", "92_", "93_", "94_", "95_", "99_ARCHIVE"]
 DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
@@ -38,11 +38,11 @@ DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
 # cosine similarity, then sent to a cloud model for judgment. Day/night have
 # independent endpoints, budgets, and cooldowns. The dream loop is invoked by
 # an external cron/systemd timer (day_dream() / night_dream()), never a daemon.
-# The dream cloud model is reached via the BSL0 proxy (127.0.0.1), distinct from
-# the local BSL1 extraction endpoint used by extract/reflect.
-DEFAULT_DREAM_DAY_URL = "http://127.0.0.1:11434/v1/chat/completions"
+# The dream cloud model is reached via the local Ollama proxy (localhost), distinct from
+# the embedding/extraction host so day/night prompts can be routed to a different model.
+DEFAULT_DREAM_DAY_URL = "http://localhost:11434/v1/chat/completions"
 DEFAULT_DREAM_DAY_MODEL = "deepseek-v4-flash:cloud"
-DEFAULT_DREAM_NIGHT_URL = "http://127.0.0.1:11434/v1/chat/completions"
+DEFAULT_DREAM_NIGHT_URL = "http://localhost:11434/v1/chat/completions"
 DEFAULT_DREAM_NIGHT_MODEL = "deepseek-v4-flash:cloud"
 DEFAULT_DREAM_DAY_BUDGET = 3
 DEFAULT_DREAM_NIGHT_BUDGET = 5
@@ -92,7 +92,7 @@ class RemnantConfig:
     embed_timeout: float = 30.0
     extract_url: str = DEFAULT_EXTRACT_URL
     extract_model: str = DEFAULT_EXTRACT_MODEL
-    extract_timeout: float = 60.0
+    extract_timeout: float = 120.0
     extract_enabled: bool = True
     extract_workers: int = 1
     reflect_url: str = DEFAULT_REFLECT_URL

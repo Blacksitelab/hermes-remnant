@@ -442,7 +442,7 @@ def import_memory_store(
 
 # -- import: hindsight ------------------------------------------------------
 
-_HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_BASE_URL", "http://127.0.0.1:9514")
+_HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_BASE_URL", "http://localhost:9514")
 _HINDSIGHT_BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "hermes-claire")
 
 
@@ -454,7 +454,7 @@ def _hindsight_recall(query: str, *, limit: int) -> list[dict[str, Any]]:
     ``{"content": str, "type": str, "id": str}`` dicts.
 
     The server URL and bank ID are configurable via ``HINDSIGHT_BASE_URL`` and
-    ``HINDSIGHT_BANK_ID`` env vars (defaults: ``http://127.0.0.1:9514`` and
+    ``HINDSIGHT_BANK_ID`` env vars (defaults: ``http://localhost:9514`` and
     ``hermes-claire``).
     """
     try:

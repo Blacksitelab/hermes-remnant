@@ -6,7 +6,7 @@ Index the Obsidian vault into Remnant as `type='document'` memories, react to fi
 
 ## In scope
 
-- Vault path: `/home/jd/obsidian-vaults/BlacksiteLabVault`
+- Vault path: `/path/to/your/obsidian-vault`
 - Exclude glob patterns: `90_*`–`95_*` and `99_ARCHIVE/`
 - Parse YAML frontmatter into `metadata` JSON
 - Store document memories with `source='vault'`, `source_id=relative vault path`

@@ -219,13 +219,13 @@ The default vault path can be overridden with the `REMNANT_VAULT_PATH` env var b
 
 ```yaml
 agent_id: default
-embed_url: http://192.168.0.11:11434/api/embeddings
+embed_url: http://your-ollama-host.local:11434/api/embeddings
 embed_model: nomic-embed-text
-extract_url: http://192.168.0.11:11434/v1/chat/completions
+extract_url: http://your-ollama-host.local:11434/v1/chat/completions
 extract_model: gemma4:12b
 extract_enabled: true
 default_visibility: private
-vault_path: /home/jd/obsidian-vaults/BlacksiteLabVault
+vault_path: /path/to/your/obsidian-vault
 vault_exclude:
   - "90_*"
   - "91_*"
