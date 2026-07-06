@@ -22,11 +22,12 @@ Pipeline (both modes):
      ``thread_title``. Two-stage: the first call generates observations, the
      second self-evaluates usefulness.
   6. Act on results:
-     - ``same_fact`` across agents → merge into a shared memory via
-       ``memory_edit(action='merge', actor='system')``; originals superseded.
-     - ``connection`` → append a first-person reflection to ``DREAMS.md`` and
-       optionally create a thread.
-     - ``noise`` → discarded but logged in the diary.
+     - ``same_fact`` across agents → merge into a shared ``source='dream'``
+       memory via ``store_memory``; originals superseded.
+      - ``connection`` → append a first-person reflection to ``DREAMS.md``,
+        store a ``source='dream'`` reflection memory, and optionally create
+        a thread.
+      - ``noise`` → discarded but logged in the diary.
   7. Persist the new run timestamp + counter back to ``dream_state``.
 
 The diary at ``~/.hermes/remnant/DREAMS.md`` is first-person, never indexed by
@@ -51,8 +52,8 @@ from .config import (
     RemnantConfig,
 )
 from .db import RemnantDB, _unpack_embedding
-from .edit import memory_edit
 from .embed import Embedder, cosine
+from .ingest import store_memory
 
 log = logging.getLogger("remnant.dream")
 
@@ -208,7 +209,23 @@ def _run_dream(
         elif kind == "connection":
             _append_diary(config, mode, reason)
             actions += 1
+            # Store the reflection as a dream-sourced memory so the graph
+            # captures it (issue #14). Fact text is first-person-ish; the
+            # entity is the thread title when the cloud proposed one, else
+            # the generic ``"dream"`` subject. Visibility is private so the
+            # reflection is local to the recording agent.
             title = (j.get("thread_title") or "").strip()
+            store_memory(
+                db,
+                embedder,
+                config,
+                fact=f"Dream reflection: {reason}",
+                entity=title if title else "dream",
+                session_id="dream",
+                agent_id=config.agent_id,
+                visibility="private",
+                source="dream",
+            )
             if title:
                 try:
                     from .threads import create_thread
@@ -541,37 +558,74 @@ def _merge_same_fact(
     *,
     actor: str,
 ) -> int:
-    """Merge cross-agent same_fact memories into one shared memory.
+    """Merge cross-agent same_fact memories into one shared dream memory.
 
-    Uses ``memory_edit(action='merge', actor='system')`` with combined content.
-    Returns 1 on success, 0 on failure (e.g. fewer than two valid memories).
+    Stores the merged memory via the lower-level ``store_memory`` (rather than
+    ``memory_edit(action='merge')``) so the new row carries
+    ``source='dream'`` and ``metadata={"merged_from": ids}``. The originals
+    are then superseded via ``memory_edit``'s supersede path so the audit log
+    + entity-graph carry-over still runs. Returns 1 on success, 0 on failure.
     """
     ids = [mid for mid in pair_ids if db.get_memory(mid) is not None]
     if len(ids) < 2:
         return 0
     parts: list[str] = []
+    merged_tags: list[str] = []
     for mid in ids:
         m = db.get_memory(mid)
         if m and m.get("content"):
             parts.append(m["content"].strip())
+        if m:
+            tags = m.get("tags")
+            if isinstance(tags, list):
+                merged_tags.extend(tags)
     if not parts:
         return 0
     combined = " | ".join(dict.fromkeys(parts))
+    merged_tags = list(dict.fromkeys(merged_tags))
+    # Pick a representative agent (the first original) for the merged memory.
+    first = db.get_memory(ids[0]) or {}
+    agent_id = first.get("agent") or config.agent_id
+    # Supersede the originals BEFORE storing the merged memory so the dedup
+    # path inside ``store_memory`` (which only considers ``status='active'``
+    # candidates) does not collapse the combined content back onto one of
+    # the originals when they are near-identical.
     try:
-        res = memory_edit(
-            db,
-            config,
-            embedder,
-            action="merge",
-            actor=actor,
-            memory_ids=ids,
-            content=combined,
-            visibility="shared",
-        )
-        return 1 if res.get("memory_id") else 0
+        for old_id in ids:
+            db.supersede(old_id, None, actor=actor)
     except Exception as e:
-        log.warning("merge_same_fact failed: %s", e)
+        log.warning("merge_same_fact pre-supersede failed: %s", e)
         return 0
+    new_mid = store_memory(
+        db,
+        embedder,
+        config,
+        fact=combined,
+        entity=(merged_tags[0] if merged_tags else "general"),
+        session_id="dream",
+        agent_id=agent_id,
+        visibility="shared",
+        entities=None,
+        source="dream",
+        tags=merged_tags or None,
+        metadata={"merged_from": ids},
+    )
+    if new_mid is None:
+        return 0
+    # Re-point the supersede rows at the real merged id and carry over entity
+    # links so the graph stays connected.
+    try:
+        from .edit import _carry_over_entity_links
+
+        for old_id in ids:
+            db.supersede(old_id, new_mid, actor=actor)
+            _carry_over_entity_links(
+                db, old_id=old_id, new_id=new_mid, agent_id=agent_id
+            )
+    except Exception as e:
+        log.warning("merge_same_fact supersede failed: %s", e)
+        return 0
+    return 1
 
 
 def _append_diary(config: RemnantConfig, mode: str, line: str) -> None:

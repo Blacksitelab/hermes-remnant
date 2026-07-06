@@ -688,7 +688,10 @@ def test_memory_edit_tool_dispatch(provider: RemnantMemoryProvider):
     )
     parsed = json.loads(res)
     assert "error" not in parsed
-    assert parsed["trust_score"] == pytest.approx(0.6)
+    # memory_store seeds manual-source trust at 0.9; the preceding
+    # memory_search reinforced it by +0.02 (-> 0.92); feedback 'useful' adds
+    # +0.1 capped at 1.0.
+    assert parsed["trust_score"] == pytest.approx(1.0)
 
 
 # ===========================================================================

@@ -155,7 +155,9 @@ def search(
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
-        return results[:limit]
+        results = results[:limit]
+        _reinforce(db, results, query=query, strategy=strategy)
+        return results
 
     if strategy == "keyword":
         results = db.search_bm25(
@@ -165,7 +167,9 @@ def search(
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
-        return results[:limit]
+        results = results[:limit]
+        _reinforce(db, results, query=query, strategy=strategy)
+        return results
 
     if strategy == "semantic":
         ranked = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
@@ -177,7 +181,9 @@ def search(
         ranked = _profile_scope_filter(ranked, scope)
         ranked = _scope_filter(ranked, visibility)
         ranked = _mask_locked(ranked, viewer_agent=viewer)
-        return ranked[:limit]
+        ranked = ranked[:limit]
+        _reinforce(db, ranked, query=query, strategy=strategy)
+        return ranked
 
     # auto: RRF fusion
     kw = db.search_bm25(query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
@@ -192,7 +198,43 @@ def search(
     fused = _profile_scope_filter(fused, scope)
     fused = _scope_filter(fused, visibility)
     fused = _mask_locked(fused, viewer_agent=viewer)
-    return fused[:limit]
+    fused = fused[:limit]
+    _reinforce(db, fused, query=query, strategy=strategy)
+    return fused
+
+
+def _reinforce(
+    db: RemnantDB,
+    results: list[dict[str, Any]],
+    *,
+    query: str,
+    strategy: str,
+) -> None:
+    """Retrieval reinforcement (issue #11).
+
+    Bump seen_count and trust_score (+0.02 capped at 0.95) for each distinct
+    memory id in ``results``. Time decay is intentionally skipped (optional).
+    """
+    seen: set[str] = set()
+    for r in results:
+        mid = r.get("id")
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        db.increment_seen_count(mid)
+        mem = db.get_memory(mid)
+        if mem is None:
+            continue
+        current = float(mem.get("trust_score") or 0.5)
+        new_score = min(current + 0.02, 0.95)
+        db.set_memory_field(
+            mid,
+            "trust_score",
+            new_score,
+            actor="system",
+            action="trust_reinforce",
+            details={"query": query, "strategy": strategy},
+        )
 
 
 def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[str, Any]]:

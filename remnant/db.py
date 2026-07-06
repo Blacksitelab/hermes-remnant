@@ -513,17 +513,21 @@ class RemnantDB:
             return int(cur.lastrowid)
 
     def claim_next_extraction(self, agent_id: str | None = None) -> dict[str, Any] | None:
-        """Atomically claim the next pending extraction job."""
+        """Atomically claim the next pending extraction job.
+
+        LIFO ordering (``ORDER BY id DESC``) so the most recently enqueued turn
+        is processed first — issue #13.
+        """
         with self.transaction() as cur:
             if agent_id is None:
                 cur.execute(
                     "SELECT * FROM extraction_queue WHERE status='pending' "
-                    "ORDER BY id LIMIT 1"
+                    "ORDER BY id DESC LIMIT 1"
                 )
             else:
                 cur.execute(
                     "SELECT * FROM extraction_queue WHERE status='pending' AND agent_id=? "
-                    "ORDER BY id LIMIT 1",
+                    "ORDER BY id DESC LIMIT 1",
                     (agent_id,),
                 )
             row = cur.fetchone()
@@ -554,6 +558,35 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute("SELECT COUNT(*) AS c FROM extraction_queue WHERE status='pending'")
             return int(cur.fetchone()["c"])
+
+    def get_unextracted_turns(
+        self, agent_id: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Return turns that have neither an extraction_queue row nor a
+        ``source='conversation'`` memory with ``source_id = str(turn_id)``.
+
+        Used by the extraction worker startup sweep so turns that were stored
+        but never extracted (e.g. crash between ``insert_turn`` and
+        ``enqueue_extraction``) are recovered on restart.
+        """
+        sql = (
+            "SELECT t.id, t.session_id, t.agent_id, t.user_text, t.assistant_text, "
+            "t.created_at "
+            "FROM turns t "
+            "LEFT JOIN extraction_queue q ON q.turn_id = t.id "
+            "LEFT JOIN memories m ON m.source_id = CAST(t.id AS TEXT) "
+            "AND m.source = 'conversation' "
+            "WHERE q.id IS NULL AND m.id IS NULL"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND t.agent_id=?"
+            params.append(agent_id)
+        sql += " ORDER BY t.id DESC LIMIT ?"
+        params.append(limit)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
 
     # -- memories --------------------------------------------------------------
 
@@ -1191,6 +1224,70 @@ class RemnantDB:
             except (json.JSONDecodeError, TypeError):
                 pass
         return d
+
+    def update_memory_content(
+        self,
+        memory_id: str,
+        *,
+        content: str,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        embedding: list[float] | None = None,
+        embed_model: str | None = None,
+        actor: str = "system",
+    ) -> dict[str, Any]:
+        """In-place content update for a memory, preserving identity columns
+        (memory_id, entity links, trust_score, retrieval history, etc.).
+
+        Updates ``content``, ``tags``, ``metadata``, ``content_hash`` (sha256 of
+        the new content) and ``updated_at``. Optionally replaces the embedding
+        (INSERT OR REPLACE into ``embeddings``). Writes a ``vault_update`` audit
+        row and rebuilds the FTS5 row so search reflects the new content.
+
+        Returns ``{"memory": after, "audit_id": audit_id, "before": before}``
+        like ``set_memory_field``. Raises ``KeyError`` if the memory is absent.
+        """
+        import hashlib
+
+        before = self.get_memory(memory_id)
+        if before is None:
+            raise KeyError(memory_id)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        tags_json = json.dumps(tags) if tags is not None else None
+        meta_json = json.dumps(metadata, default=str) if metadata is not None else None
+        now = _now_iso()
+        with self.transaction() as cur:
+            cur.execute(
+                "UPDATE memories SET content=?, tags=?, metadata=?, content_hash=?, "
+                "updated_at=? WHERE id=?",
+                (content, tags_json, meta_json, content_hash, now, memory_id),
+            )
+            if embedding:
+                blob = _pack_embedding(embedding)
+                cur.execute(
+                    "INSERT OR REPLACE INTO embeddings(memory_id, model, embedding, "
+                    "dimensions, created_at) VALUES(?,?,?,?,?)",
+                    (memory_id, embed_model, blob, len(embedding), now),
+                )
+            # Rebuild the FTS5 row. The triggers fire on UPDATE already, but we
+            # also do an explicit delete+insert so the index is consistent even
+            # when the trigger path is bypassed by external-content quirks.
+            cur.execute(
+                "DELETE FROM memories_fts WHERE rowid="
+                "(SELECT rowid FROM memories WHERE id=?)",
+                (memory_id,),
+            )
+            cur.execute(
+                "INSERT INTO memories_fts(rowid, content, tags) "
+                "SELECT rowid, content, tags FROM memories WHERE id=?",
+                (memory_id,),
+            )
+            audit_id = self._write_audit(
+                cur, actor, "vault_update", memory_id,
+                {"content_hash": content_hash},
+            )
+        after = self.get_memory(memory_id)
+        return {"memory": after, "audit_id": audit_id, "before": before}
 
     def set_memory_field(
         self,

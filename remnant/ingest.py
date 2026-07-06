@@ -65,6 +65,18 @@ def is_transient(text: str) -> bool:
     return bool(_TRANSIENT_RE.search(text or ""))
 
 
+def _initial_trust_score(source: str) -> float:
+    """Source-based initial trust score for a new memory (issue #11)."""
+    return {
+        "import": 0.9,
+        "manual": 0.9,
+        "vault": 0.8,
+        "hindsight": 0.7,
+        "conversation": 0.6,
+        "dream": 0.6,
+    }.get(source, 0.5)
+
+
 def detect_contradiction(new_fact: str, existing: str) -> bool:
     """Lightweight local contradiction heuristic. No LLM.
 
@@ -122,6 +134,9 @@ def store_memory(
     visibility: str = "private",
     source_turn_id: int | None = None,
     entities: list[dict[str, Any]] | None = None,
+    source: str | None = None,
+    tags: list[str] | None = None,
+    metadata: dict[str, Any] | None = None,
 ) -> str | None:
     """Store a fact with dedup + contradiction flagging. Returns memory id.
 
@@ -131,6 +146,19 @@ def store_memory(
     to seed ``relations`` edges between co-occurring entities. When omitted,
     ``entity`` (the legacy single-subject string) is treated as one entity of
     unknown type for backward compatibility.
+
+    ``source`` (optional) overrides the default source inference. When None
+    the source defaults to ``conversation`` (when ``source_turn_id`` is set)
+    or ``manual`` otherwise. When supplied, the value is used verbatim and
+    must satisfy the ``memories.source`` CHECK constraint (e.g. ``dream``).
+
+    ``tags`` (optional) overrides the default ``[entity]`` tag list. When
+    None the legacy single-element tag list is used (or no tags when there
+    is no entity).
+
+    ``metadata`` (optional) is merged into the per-memory metadata dict
+    alongside the internally-managed ``session_id`` / ``entity`` /
+    ``contradicts`` keys; caller keys win on collision.
     """
     fact = fact.strip()
     if not fact or is_transient(fact):
@@ -183,15 +211,21 @@ def store_memory(
         meta["entity"] = entity
     if contradiction_targets:
         meta["contradicts"] = contradiction_targets
+    if metadata:
+        meta.update(metadata)
+    resolved_source = source if source is not None else (
+        "conversation" if source_turn_id is not None else "manual"
+    )
     mid = db.insert_memory(
         content=fact,
-        source="conversation" if source_turn_id is not None else "manual",
+        source=resolved_source,
         agent=agent_id,
         visibility=visibility,
         source_id=str(source_turn_id) if source_turn_id is not None else None,
         type="fact",
-        tags=[entity] if entity else None,
+        tags=tags if tags is not None else ([entity] if entity else None),
         metadata=meta,
+        trust_score=_initial_trust_score(resolved_source),
         embedding=embedding or None,
         embed_model=getattr(embedder, "_model", None) if embedder else None,
     )
@@ -210,11 +244,18 @@ def store_memory(
             agent_id=agent_id,
         )
 
+    # Corroboration boost (issue #11): for each entity linked to this new
+    # memory, find other active memories sharing the entity and bump their
+    # trust_score (and the new memory's own) by +0.05 capped at 0.95.
+    # Contradicted memories are excluded from the boost.
+    _corroborate(db, mid, agent_id=agent_id, contradiction_targets=contradiction_targets)
+
     return mid
 
 
 def _flag_contradiction(db: RemnantDB, memory_id: str, new_fact: str) -> None:
-    """Append a `contradicts` entry to an existing memory's metadata."""
+    """Append a `contradicts` entry to an existing memory's metadata and apply a
+    trust penalty (issue #11): trust_score drops by 0.1, floored at 0.3."""
     mem = db.get_memory(memory_id)
     if mem is None:
         return
@@ -232,6 +273,88 @@ def _flag_contradiction(db: RemnantDB, memory_id: str, new_fact: str) -> None:
         action="contradiction_flag",
         details={"new_fact": new_fact},
     )
+    current = float(mem.get("trust_score") or 0.5)
+    new_score = max(current - 0.1, 0.3)
+    db.set_memory_field(
+        memory_id,
+        "trust_score",
+        new_score,
+        actor="system",
+        action="trust_penalty",
+        details={"new_fact": new_fact, "delta": -0.1},
+    )
+
+
+def _corroborate(
+    db: RemnantDB,
+    mid: str,
+    *,
+    agent_id: str | None,
+    contradiction_targets: list[str],
+) -> None:
+    """Corroboration boost (issue #11).
+
+    For each entity linked to the new memory, find other active memories that
+    share that entity. Each such memory (not in ``contradiction_targets``) gets
+    +0.05 trust_score (capped at 0.95). The new memory itself is bumped once if
+    at least one corroborating active memory was found.
+    """
+    # Collect the entity ids linked to the new memory directly from
+    # memory_entities (no db helper exists for this direction).
+    with db.read() as cur:
+        cur.execute(
+            "SELECT entity_id FROM memory_entities WHERE memory_id=?",
+            (mid,),
+        )
+        linked_eids = [r["entity_id"] for r in cur.fetchall()]
+    if not linked_eids:
+        return
+
+    contradicted = set(contradiction_targets)
+    corroborated_self = False
+    boosted: set[str] = set()
+    for eid in linked_eids[:5]:
+        others = db.get_memories_for_entity(eid, agent_id=agent_id)
+        for m in others:
+            other_id = m.get("id")
+            if not other_id or other_id == mid:
+                continue
+            if other_id in contradicted or other_id in boosted:
+                continue
+            if m.get("status") != "active":
+                continue
+            boosted.add(other_id)
+            entity_name = db.entity_name_for(eid)
+            # get_memories_for_entity does not select trust_score; fetch the
+            # current row so the boost is applied to the real value.
+            current_mem = db.get_memory(other_id)
+            if current_mem is None:
+                continue
+            current = float(current_mem.get("trust_score") or 0.5)
+            new_score = min(current + 0.05, 0.95)
+            db.set_memory_field(
+                other_id,
+                "trust_score",
+                new_score,
+                actor="system",
+                action="trust_corroborate",
+                details={"shared_entity": entity_name, "source_memory": mid},
+            )
+            corroborated_self = True
+
+    if corroborated_self:
+        new_mem = db.get_memory(mid)
+        if new_mem is not None:
+            current = float(new_mem.get("trust_score") or 0.5)
+            new_score = min(current + 0.05, 0.95)
+            db.set_memory_field(
+                mid,
+                "trust_score",
+                new_score,
+                actor="system",
+                action="trust_corroborate",
+                details={"source_memory": mid},
+            )
 
 
 def ingest_turn(
@@ -263,4 +386,4 @@ def ingest_turn(
     return turn_id
 
 
-__all__ = ["is_transient", "store_memory", "ingest_turn"]
+__all__ = ["is_transient", "store_memory", "ingest_turn", "_initial_trust_score"]

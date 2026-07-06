@@ -367,6 +367,8 @@ def extract_and_link_entities(
 
 __all__ = [
     "ENTITY_TYPES",
+    "_STOPWORDS",
+    "_STOPLIST",
     "extract_entities",
     "extract_and_link_entities",
     "guess_type",

@@ -190,8 +190,9 @@ def index_file(
 
     - Skips excluded paths and non-markdown files.
     - Skips unchanged files (hash matches the stored value).
-    - On change: forgets the old memory, stores a new one, embeds the body,
-      links extracted entities, and updates the vault_files row.
+    - On change: updates the existing memory in place; only forgets when the
+      file is deleted. Embeds the body, links extracted entities, and updates
+      the vault_files row.
     - Locked notes are indexed normally; the lock flag is in metadata so
       search can mask content for other agents.
     """
@@ -241,27 +242,38 @@ def index_file(
     embedding = embedder.embed(content) if embedder else None
     embed_model = getattr(embedder, "_model", None) if embedder else None
 
-    # Forget the prior memory for this path (if any) before inserting the new
-    # one, so vault_files always maps a path to a single active memory.
     if existing_mid:
-        db.mark_vault_forgotten(rel)
-
-    mid = db.insert_memory(
-        content=content,
-        source="vault",
-        source_id=rel,
-        agent=config.agent_id,
-        visibility=config.default_visibility,
-        type="document",
-        tags=tags,
-        metadata=metadata,
-        confidence=1.0,
-        embedding=embedding or None,
-        embed_model=embed_model,
-    )
+        # Update the existing memory in place, preserving memory_id, entity
+        # links, trust_score, retrieval history, etc. Only the content-bearing
+        # columns are rewritten; the vault_files row is updated below.
+        db.update_memory_content(
+            existing_mid,
+            content=content,
+            tags=tags,
+            metadata=metadata,
+            embedding=embedding or None,
+            embed_model=embed_model,
+        )
+        mid = existing_mid
+    else:
+        mid = db.insert_memory(
+            content=content,
+            source="vault",
+            source_id=rel,
+            agent=config.agent_id,
+            visibility=config.default_visibility,
+            type="document",
+            tags=tags,
+            metadata=metadata,
+            confidence=1.0,
+            trust_score=0.8,
+            embedding=embedding or None,
+            embed_model=embed_model,
+        )
     db.set_vault_hash(rel, hash_hex, memory_id=mid)
 
-    # Link extracted entities so vault documents join the entity graph.
+    # Re-extract and re-link entities for the (possibly updated) content so the
+    # entity graph tracks the current body. Existing links are preserved.
     ents = extract_entities(body)
     if ents:
         link_memory_entities(db, memory_id=mid, entities=ents, agent_id=config.agent_id)
