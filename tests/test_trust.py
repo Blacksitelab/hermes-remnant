@@ -250,7 +250,7 @@ def test_search_reinforces_returned_memories(hermes_home: Path):
     """A search increments seen_count and bumps trust_score by +0.02 (cap
     0.95) for each returned memory."""
     db = _open_db(hermes_home)
-    cfg = RemnantConfig(default_search_strategy="keyword")
+    cfg = RemnantConfig(default_search_strategy="keyword", trust_decay_enabled=False)
     emb = _fake_embed(db, cfg)
     try:
         mid = store_memory(
@@ -275,3 +275,94 @@ def test_search_reinforces_returned_memories(hermes_home: Path):
         assert after["trust_score"] == pytest.approx(min(before_trust + 0.02, 0.95))
     finally:
         db.close()
+
+
+def test_trust_decay_lowers_stale_memories(hermes_home: Path):
+    """A stale memory decays before reinforcement."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(default_search_strategy="keyword",
+                        trust_decay_enabled=True,
+                        trust_decay_half_life_days=30.0,
+                        trust_decay_floor=0.3)
+    emb = _fake_embed(db, cfg)
+    try:
+        mid = store_memory(
+            db, emb, cfg,
+            fact="Proxmox host alpha runs the build server",
+            entity="Proxmox",
+            session_id="s",
+            agent_id="default",
+            source="manual",
+        )
+        assert mid is not None
+        # Manually age the memory by 30 days so it should halve in trust.
+        _set_updated_at(db, mid, _days_ago(30))
+
+        before_trust = db.get_memory(mid)
+        assert before_trust is not None
+        before_trust = before_trust["trust_score"]
+        results = search(db, cfg, "Proxmox build server", agent_id="default",
+                        strategy="keyword")
+        assert any(r["id"] == mid for r in results)
+
+        after = db.get_memory(mid)
+        assert after is not None
+        expected_decayed = before_trust * 0.5
+        expected = min(expected_decayed + 0.02, 0.95)
+        assert after["trust_score"] == pytest.approx(expected, abs=0.01)
+    finally:
+        db.close()
+
+
+def test_trust_decay_disabled_skips_decay(hermes_home: Path):
+    """When time decay is disabled, only reinforcement applies."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(default_search_strategy="keyword", trust_decay_enabled=False)
+    emb = _fake_embed(db, cfg)
+    try:
+        mid = store_memory(
+            db, emb, cfg,
+            fact="Proxmox host alpha runs the build server",
+            entity="Proxmox",
+            session_id="s",
+            agent_id="default",
+            source="manual",
+        )
+        assert mid is not None
+        _set_updated_at(db, mid, _days_ago(60))
+
+        before_trust = db.get_memory(mid)
+        assert before_trust is not None
+        before_trust = before_trust["trust_score"]
+        results = search(db, cfg, "Proxmox build server", agent_id="default",
+                        strategy="keyword")
+        assert any(r["id"] == mid for r in results)
+
+        after = db.get_memory(mid)
+        assert after is not None
+        assert after["trust_score"] == pytest.approx(min(before_trust + 0.02, 0.95))
+    finally:
+        db.close()
+
+
+def _set_updated_at(db, mid, ts):
+    """Backdoor for tests: set the updated_at timestamp directly."""
+    with db.transaction() as cur:
+        cur.execute("UPDATE memories SET updated_at=? WHERE id=?", (ts, mid))
+
+
+def _days_ago(n: int) -> str:
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(days=n)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+
+def test_initial_trust_helper():
+    from remnant.ingest import _initial_trust_score
+    assert _initial_trust_score("manual") == 0.9
+    assert _initial_trust_score("conversation") == 0.6
+    assert _initial_trust_score("unknown") == 0.5

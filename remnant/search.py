@@ -15,6 +15,7 @@ Strategies:
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any
 
 from .config import RRF_K, SEMANTIC_CANDIDATE_LIMIT, RemnantConfig
@@ -156,7 +157,7 @@ def search(
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
         results = results[:limit]
-        _reinforce(db, results, query=query, strategy=strategy)
+        _reinforce(db, config, results, query=query, strategy=strategy)
         return results
 
     if strategy == "keyword":
@@ -168,7 +169,7 @@ def search(
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
         results = results[:limit]
-        _reinforce(db, results, query=query, strategy=strategy)
+        _reinforce(db, config, results, query=query, strategy=strategy)
         return results
 
     if strategy == "semantic":
@@ -182,7 +183,7 @@ def search(
         ranked = _scope_filter(ranked, visibility)
         ranked = _mask_locked(ranked, viewer_agent=viewer)
         ranked = ranked[:limit]
-        _reinforce(db, ranked, query=query, strategy=strategy)
+        _reinforce(db, config, ranked, query=query, strategy=strategy)
         return ranked
 
     # auto: RRF fusion
@@ -199,42 +200,90 @@ def search(
     fused = _scope_filter(fused, visibility)
     fused = _mask_locked(fused, viewer_agent=viewer)
     fused = fused[:limit]
-    _reinforce(db, fused, query=query, strategy=strategy)
+    _reinforce(db, config, fused, query=query, strategy=strategy)
     return fused
 
 
 def _reinforce(
     db: RemnantDB,
+    config: RemnantConfig,
     results: list[dict[str, Any]],
     *,
     query: str,
     strategy: str,
 ) -> None:
-    """Retrieval reinforcement (issue #11).
+    """Retrieval reinforcement (issue #11 + #16).
 
-    Bump seen_count and trust_score (+0.02 capped at 0.95) for each distinct
-    memory id in ``results``. Time decay is intentionally skipped (optional).
+    For each distinct memory id in ``results``:
+      1. Decay the current trust_score by age since last update.
+      2. Bump seen_count.
+      3. Add +0.02 trust_score (capped at 0.95).
+
+    Time decay uses a configurable half-life; scores cannot fall below
+    ``config.trust_decay_floor``. Decay is skipped when disabled.
     """
     seen: set[str] = set()
+    now = _utc_now()
     for r in results:
         mid = r.get("id")
         if not mid or mid in seen:
             continue
         seen.add(mid)
-        db.increment_seen_count(mid)
         mem = db.get_memory(mid)
         if mem is None:
             continue
+        updated_at = mem.get("updated_at") or mem.get("created_at")
         current = float(mem.get("trust_score") or 0.5)
-        new_score = min(current + 0.02, 0.95)
+        decayed = _apply_decay(current, updated_at, now, config)
+        db.increment_seen_count(mid)
+        new_score = min(decayed + 0.02, 0.95)
         db.set_memory_field(
             mid,
             "trust_score",
             new_score,
             actor="system",
             action="trust_reinforce",
-            details={"query": query, "strategy": strategy},
+            details={"query": query, "strategy": strategy, "decayed_from": current},
         )
+
+
+def _apply_decay(
+    current: float,
+    updated_at: str | None,
+    now: float,
+    config: RemnantConfig,
+) -> float:
+    """Apply exponential time decay to a trust score.
+
+    Half-life is ``config.trust_decay_half_life_days``. Decay never drops a
+    score below ``config.trust_decay_floor``. Disabled if
+    ``config.trust_decay_enabled`` is False.
+    """
+    if not getattr(config, "trust_decay_enabled", True):
+        return current
+    if not updated_at:
+        return current
+    try:
+        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+        age_days = (now - dt.timestamp()) / 86400.0
+    except (ValueError, TypeError):
+        return current
+    if age_days <= 0:
+        return current
+    half_life = float(
+        getattr(config, "trust_decay_half_life_days", 30.0) or 30.0
+    )
+    if half_life <= 0:
+        return current
+    decayed = current * (0.5 ** (age_days / half_life))
+    floor = float(getattr(config, "trust_decay_floor", 0.3))
+    return max(decayed, floor)
+
+
+def _utc_now() -> float:
+    import time as _time
+
+    return _time.time()
 
 
 def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
