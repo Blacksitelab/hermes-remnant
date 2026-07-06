@@ -63,6 +63,11 @@ DEDUP_COSINE_THRESHOLD = 0.92
 DEDUP_CANDIDATES = 8
 # Keyword search default limit
 SEARCH_LIMIT = 10
+# Trust score time decay (issue #16). Half-life in days; floor is the lowest
+# trust a memory can decay to through staleness. Set enabled=False to disable.
+TRUST_DECAY_ENABLED = True
+TRUST_DECAY_HALF_LIFE_DAYS = 30.0
+TRUST_DECAY_FLOOR = 0.3
 # Max turns queued for extraction before backpressure
 QUEUE_MAX = 256
 
@@ -120,6 +125,10 @@ class RemnantConfig:
     default_visibility: str = "private"
     agent_id: str = "default"
     queue_max: int = QUEUE_MAX
+    # Trust score time decay (issue #16).
+    trust_decay_enabled: bool = TRUST_DECAY_ENABLED
+    trust_decay_half_life_days: float = TRUST_DECAY_HALF_LIFE_DAYS
+    trust_decay_floor: float = TRUST_DECAY_FLOOR
     # Phase 4: vault indexing + profile-scoped search.
     vault_path: str = DEFAULT_VAULT_PATH
     vault_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_VAULT_EXCLUDE))
