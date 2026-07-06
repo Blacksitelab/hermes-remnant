@@ -439,17 +439,15 @@ def test_index_vault_reindexes_changed_file(hermes_home: Path, vault: Path):
         index_vault(db, cfg, emb)
         old_mid = db.get_vault_memory("Inbox/a.md")
         assert old_mid
-        # Mutate the file and re-index.
+        # Mutate the file and re-index. Issue #12: the memory is updated in
+        # place — same memory_id, no forgotten row, content + hash refreshed.
         _write_note(note, "# A\nchanged content about Proxmox")
         stats = index_vault(db, cfg, emb)
         assert stats["indexed"] == 1
         new_mid = db.get_vault_memory("Inbox/a.md")
-        assert new_mid
-        # Old memory was forgotten (status preserved, not deleted).
-        assert db.get_memory(old_mid)["status"] == "forgotten"
+        assert new_mid == old_mid
         assert db.get_memory(new_mid)["status"] == "active"
         assert "changed content" in db.get_memory(new_mid)["content"]
-        # vault_files now points at the new memory only.
         assert db.get_vault_memory("Inbox/a.md") == new_mid
     finally:
         db.close()

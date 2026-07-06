@@ -268,6 +268,11 @@ class RemnantMemoryProvider(MemoryProvider):
         self._embedder = Embedder(self._db, self._config)
         self._worker = ExtractionWorker(self._db, self._embedder, self._config)
         self._worker.start()
+        # Issue #13: sweep for turns that were stored but never extracted
+        # (e.g. crash between insert_turn and enqueue_extraction) before the
+        # worker starts draining the regular queue, then wake it to process.
+        self._worker.queue_startup_sweep()
+        self._worker.wake()
         self._started = True
         log.info("remnant initialized (home=%s, session=%s)", self._hermes_home, self._session_id)
 
