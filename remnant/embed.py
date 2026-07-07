@@ -60,10 +60,10 @@ class Embedder:
         empty vector as a usable zero vector.
         """
         # Truncate to stay within the embed model's context window.
-        # nomic-embed-text has a 2048-token limit (~8k chars at ~4 chars/token).
-        # Use 7000 chars as a safe ceiling to avoid 500 errors on long vault notes.
-        if len(text) > 7000:
-            text = text[:7000]
+        # nomic-embed-text on BSL1 has ~3000 char context limit (empirically tested).
+        # Use 2500 as a safe ceiling.
+        if len(text) > 2500:
+            text = text[:2500]
         text_hash = _hash(text)
         cached = self._db.get_cached_embedding(self._model, text_hash)
         if cached is not None:
