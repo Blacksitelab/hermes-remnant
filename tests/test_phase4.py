@@ -364,7 +364,7 @@ def test_index_file_skips_non_markdown(hermes_home: Path, vault: Path):
 
 def test_index_file_has_embedding_and_entity_links(hermes_home: Path, vault: Path):
     db = _open_db(hermes_home)
-    cfg = RemnantConfig(vault_path=str(vault))
+    cfg = RemnantConfig(vault_path=str(vault), entity_min_memories=1)
     emb = _fake_embed(db, cfg)
     note = vault / "Projects" / "alpha.md"
     _write_note(note, "# Project Alpha\nSven runs Project Alpha on Proxmox.")

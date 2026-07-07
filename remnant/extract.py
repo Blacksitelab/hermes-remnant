@@ -24,7 +24,7 @@ import httpx
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import _STOPWORDS, _STOPLIST
+from .entity import _COMMON_NOUNS, _FUNCTION_WORDS, _STOPWORDS, _STOPLIST
 from .ingest import is_transient, store_memory
 
 log = logging.getLogger("remnant.extract")
@@ -41,23 +41,9 @@ _STOPWORDS_LOWER: set[str] = {
     w.lower() for w in _STOPWORDS if w.lower() != "remnant"
 }
 
-# Common English function words the LLM sometimes emits as "entities". These
-# are not proper nouns and never belong in the entity graph. Mirrors the
-# anti-noise instructions added to ``_EXTRACT_PROMPT`` (issue #10). This is a
-# superset of ``_STOPWORDS_LOWER`` covering articles, prepositions,
-# conjunctions, pronouns, and short generic verbs.
-_FUNCTION_WORDS: set[str] = {
-    "and", "or", "but", "if", "then", "else", "for", "to", "of", "in",
-    "on", "at", "by", "with", "from", "into", "onto", "upon", "as", "is",
-    "are", "was", "were", "be", "been", "being", "do", "does", "did",
-    "have", "has", "had", "not", "no", "nor", "so", "than", "that", "this",
-    "these", "those", "it", "its", "we", "us", "our", "they", "them",
-    "their", "he", "him", "his", "she", "her", "you", "your", "i", "me",
-    "my", "who", "whom", "whose", "what", "which", "when", "where", "why",
-    "how", "all", "any", "some", "none", "both", "each", "every", "few",
-    "more", "most", "other", "such", "only", "own", "same", "very", "just",
-    "the", "a", "an",
-}
+# Common English function words and generic response words the LLM sometimes
+# emits as "entities". Imported from ``entity`` (issue #22) so the typed-entity
+# filter and the regex fallback share the same deny-list.
 
 _EXTRACT_PROMPT = (
     "You are a memory extraction engine. Read the conversation turn and "
@@ -224,6 +210,7 @@ class ExtractionWorker:
                 visibility=visibility,
                 source_turn_id=int(job["turn_id"]),
                 entities=typed_entities,
+                source_text=fact_text,
             )
         duration_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
@@ -302,11 +289,13 @@ def _parse_facts(text: str) -> list[dict[str, Any]]:
 
 
 def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter typed entities returned by the extraction LLM (issue #10).
+    """Filter typed entities returned by the extraction LLM (issue #10/#22).
 
     The model can return function words, stopwords, and short noise tokens as
     entities. This helper mirrors the regex path's stopword filter so only
-    durable proper nouns / named concepts reach the entity graph.
+    durable proper nouns / named concepts reach the entity graph. When more than
+    ``_MAX_TYPED_ENTITIES`` (15) survive, the list is capped to the top-N by a
+    simple salience heuristic (name length + alias count) to avoid graph bloat.
 
     Rules (lowercased ``name`` unless noted):
       - drop empties (``name.strip() == ""``);
@@ -326,7 +315,7 @@ def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]
         if not raw or len(raw.strip()) == 0:
             continue
         key = raw.lower()
-        if key in _STOPWORDS_LOWER or key in _STOPLIST or key in _FUNCTION_WORDS:
+        if key in _STOPWORDS_LOWER or key in _STOPLIST or key in _FUNCTION_WORDS or key in _COMMON_NOUNS:
             continue
         # Drop short lowercase noise; keep all-caps acronyms (e.g. ``AI``)
         # and title-cased proper-noun initials (e.g. ``Ai``).
@@ -336,7 +325,21 @@ def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]
             continue
         seen.add(key)
         out.append(ent)
+
+    # Issue #22: cap to the top 15 typed entities by simple salience.
+    if len(out) > _MAX_TYPED_ENTITIES:
+        scored: list[tuple[float, dict[str, Any]]] = []
+        for ent in out:
+            name = (ent.get("name") or "").strip()
+            aliases = ent.get("aliases") or []
+            score = len(name.split()) + 0.5 * len(aliases) + len(name) * 0.05
+            scored.append((score, ent))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        out = [ent for _, ent in scored[:_MAX_TYPED_ENTITIES]]
     return out
+
+
+_MAX_TYPED_ENTITIES = 15
 
 
 __all__ = ["ExtractionWorker", "filter_typed_entities"]

@@ -640,6 +640,23 @@ class RemnantDB:
                 (_now_iso(), memory_id),
             )
 
+    def hard_delete_memory(self, memory_id: str) -> bool:
+        """Permanently delete a memory and its cascading rows.
+
+        Unlike ``deactivate_memory``, this performs a real DELETE. Intended for
+        orphan cleanup (issue #23) where the memory is a duplicate/garbage row
+        with no links to vault files or other memories.
+        """
+        with self.transaction() as cur:
+            cur.execute(
+                "DELETE FROM memories WHERE id=?", (memory_id,)
+            )
+            cur.execute(
+                "DELETE FROM memories_fts WHERE rowid IN "
+                "(SELECT id FROM memories WHERE id=?)", (memory_id,)
+            )
+            return cur.fetchone() is not None if cur.rowcount else cur.rowcount > 0
+
     def search_bm25(
         self,
         query: str,
@@ -964,6 +981,21 @@ class RemnantDB:
             cur.execute("SELECT * FROM entities WHERE id=?", (entity_id,))
             row = cur.fetchone()
         return dict(row) if row else None
+
+    def get_entities_batch(
+        self, entity_ids: list[str]
+    ) -> dict[str, dict[str, Any]]:
+        """Fetch multiple entity rows by id. Returns {id: row_dict}."""
+        if not entity_ids:
+            return {}
+        placeholders = ",".join("?" for _ in entity_ids)
+        with self.read() as cur:
+            cur.execute(
+                f"SELECT id, name, type, aliases, agent FROM entities "
+                f"WHERE id IN ({placeholders})",
+                entity_ids,
+            )
+            return {r["id"]: dict(r) for r in cur.fetchall()}
 
     def find_entity_by_name(self, name: str, agent_id: str | None = None) -> str | None:
         """Return entity id matching `name` (or any alias) without creating one."""
@@ -1455,6 +1487,26 @@ class RemnantDB:
             )
             return [dict(r) for r in cur.fetchall()]
 
+    def find_orphan_forgotten_memory_ids(self) -> list[str]:
+        """Return IDs of forgotten memories with no source_id and no vault file.
+
+        These "orphan" memories were created during broken vault reindexes: the
+        vault_files row was dropped/never created, the memory was marked
+        ``status='forgotten'``, and it carries no ``source_id``. They are safe to
+        delete because nothing in the vault links back to them.
+        """
+        sql = (
+            "SELECT m.id FROM memories m "
+            "LEFT JOIN vault_files v ON v.memory_id = m.id "
+            "WHERE m.status IN ('forgotten', 'inactive') "
+            "AND m.source_id IS NULL "
+            "AND v.memory_id IS NULL "
+            "ORDER BY m.created_at"
+        )
+        with self.read() as cur:
+            cur.execute(sql)
+            return [r["id"] for r in cur.fetchall()]
+
     def mark_vault_forgotten(self, path: str) -> str | None:
         """Forget the memory linked to a vault path and remove the row.
 
@@ -1554,6 +1606,26 @@ class RemnantDB:
             except (json.JSONDecodeError, TypeError):
                 pass
         return d
+
+    def list_active_memories_for_decay(
+        self, *, batch_size: int | None = None
+    ) -> list[dict[str, Any]]:
+        """Return active memory ids with trust_score and updated_at.
+
+        Used by the batch trust-decay job (issue #24). ``batch_size`` can
+        bound the result for incremental passes; None returns the full set.
+        """
+        sql = (
+            "SELECT id, trust_score, updated_at FROM memories "
+            "WHERE status='active'"
+        )
+        params: list[Any] = []
+        if batch_size:
+            sql += " LIMIT ?"
+            params.append(batch_size)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(r) for r in cur.fetchall()]
 
     def increment_seen_count(self, memory_id: str) -> int:
         """Bump the seen_count on a memory (duplicate re-observation).
