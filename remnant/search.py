@@ -286,6 +286,46 @@ def _utc_now() -> float:
     return _time.time()
 
 
+def decay_trust_scores(
+    db: RemnantDB,
+    config: RemnantConfig,
+    *,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Batch decay every active memory's trust_score (issue #24).
+
+    Applies the same exponential half-life decay used on query, but to the whole
+    active corpus in one pass. Intended for cron/systemd timer jobs and for the
+    dream pipeline's nightly run.
+
+    Returns a summary dict: ``{"updated": int, "skipped": int, "dry_run": bool}``.
+    """
+    rows = db.list_active_memories_for_decay()
+    now = _utc_now()
+    updated = 0
+    skipped = 0
+    for r in rows:
+        mid = r.get("id")
+        if not mid:
+            continue
+        current = float(r.get("trust_score") or 0.5)
+        decayed = _apply_decay(current, r.get("updated_at"), now, config)
+        if abs(decayed - current) > 1e-9:
+            if not dry_run:
+                db.set_memory_field(
+                    mid,
+                    "trust_score",
+                    decayed,
+                    actor="system",
+                    action="trust_decay_batch",
+                    details={"old_score": current, "new_score": decayed},
+                )
+            updated += 1
+        else:
+            skipped += 1
+    return {"updated": updated, "skipped": skipped, "dry_run": dry_run}
+
+
 def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Enrich result rows with `source`, `source_id`, and `metadata` so that
     profile_scope filtering and locked masking can be applied in-process.

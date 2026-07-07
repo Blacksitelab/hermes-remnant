@@ -198,7 +198,7 @@ def test_reindex_preserves_trust_score_and_entity_links(
     """In-place update must not clobber trust_score, seen_count, or entity
     links — the whole point of issue #12 over the old forget+insert path."""
     db = _open_db(hermes_home)
-    cfg = RemnantConfig(vault_path=str(vault))
+    cfg = RemnantConfig(vault_path=str(vault), entity_min_memories=1)
     emb = _fake_embed(db, cfg)
     note = vault / "Projects" / "alpha.md"
     _write_note(note, "# Project Alpha\nSven runs Project Alpha on Proxmox.")

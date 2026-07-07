@@ -137,6 +137,7 @@ def store_memory(
     source: str | None = None,
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
+    source_text: str | None = None,
 ) -> str | None:
     """Store a fact with dedup + contradiction flagging. Returns memory id.
 
@@ -159,6 +160,11 @@ def store_memory(
     ``metadata`` (optional) is merged into the per-memory metadata dict
     alongside the internally-managed ``session_id`` / ``entity`` /
     ``contradicts`` keys; caller keys win on collision.
+
+    ``source_text`` (issue #21) is the original text/fact used to derive
+    sentence co-occurrence for relation seeding. When supplied, relations
+    are only created between entities that appear together in the same
+    sentence/paragraph.
     """
     fact = fact.strip()
     if not fact or is_transient(fact):
@@ -235,13 +241,17 @@ def store_memory(
     # Wire the entity graph: resolve + link typed entities (or the legacy
     # single `entity` subject) and seed relations between co-occurring ones.
     if entities:
-        link_memory_entities(db, memory_id=mid, entities=entities, agent_id=agent_id)
+        link_memory_entities(
+            db, memory_id=mid, entities=entities, agent_id=agent_id,
+            text=source_text or fact,
+        )
     elif entity:
         link_memory_entities(
             db,
             memory_id=mid,
             entities=[{"name": entity, "type": None, "aliases": []}],
             agent_id=agent_id,
+            text=source_text or fact,
         )
 
     # Corroboration boost (issue #11): for each entity linked to this new

@@ -54,6 +54,7 @@ from .config import (
 from .db import RemnantDB, _unpack_embedding
 from .embed import Embedder, cosine
 from .ingest import store_memory
+from .search import decay_trust_scores as search_decay_trust_scores
 
 log = logging.getLogger("remnant.dream")
 
@@ -159,6 +160,11 @@ def _run_dream(
         return {"mode": mode, "skipped": "budget_exhausted", "counter": counter}
 
     # 3. Select recent memories.
+    # Issue #24: run batch trust decay before dream work. The search path
+    # already applies per-query decay, but an initial system needs a batch pass.
+    if getattr(config, "trust_decay_enabled", True):
+        search_decay_trust_scores(db, config, dry_run=False)
+
     since_ts = _window_start(db, mode, now)
     recent = db.get_recent_memories(since_ts=since_ts, limit=200)
     if not recent:

@@ -27,7 +27,7 @@ from typing import Any
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import extract_entities, link_memory_entities
+from .entity import extract_and_link_entities, extract_entities, link_memory_entities
 
 log = logging.getLogger("remnant.vault")
 
@@ -274,9 +274,11 @@ def index_file(
 
     # Re-extract and re-link entities for the (possibly updated) content so the
     # entity graph tracks the current body. Existing links are preserved.
-    ents = extract_entities(body)
-    if ents:
-        link_memory_entities(db, memory_id=mid, entities=ents, agent_id=config.agent_id)
+    extract_and_link_entities(
+        db, memory_id=mid, text=body,
+        typed_entities=None, agent_id=config.agent_id,
+        min_memories=1,
+    )
     return mid
 
 

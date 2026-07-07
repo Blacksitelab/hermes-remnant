@@ -430,6 +430,7 @@ def import_memory_store(
                     db, memory_id=mid, text=entry,
                     typed_entities=None, agent_id=actor,
                     min_memories=getattr(config, "entity_min_memories", 2),
+                    max_entities=getattr(config, "entity_max_entities", 15),
                 )
                 db.write_audit(
                     actor=actor,
@@ -618,6 +619,7 @@ def import_hindsight(
                         db, memory_id=mid, text=content,
                         typed_entities=None, agent_id=actor,
                         min_memories=getattr(config, "entity_min_memories", 2),
+                        max_entities=getattr(config, "entity_max_entities", 15),
                     )
                     db.write_audit(
                         actor=actor,

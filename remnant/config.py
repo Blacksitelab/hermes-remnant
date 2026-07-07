@@ -139,8 +139,11 @@ class RemnantConfig:
     # persisted/linked. The LLM typed-entity path bypasses this threshold (the
     # extraction model already curates entities). Defaults to 2 so one-off
     # capitalized phrases (dates, places, generic nouns) do not pollute the
-    # entity graph; set to 1 to restore the old always-link behaviour.
+    # graph; set to 1 to restore the old always-link behaviour.
     entity_min_memories: int = 2
+    # Issue #21/#22: max entities linked/related per memory. Caps the entity
+    # graph to avoid complete-graph relation explosions and over-extraction.
+    entity_max_entities: int = 15
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
