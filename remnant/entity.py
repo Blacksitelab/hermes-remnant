@@ -122,6 +122,17 @@ _COMMON_NOUNS: set[str] = {
     "local", "general", "main", "major", "following", "final", "initial",
     "total", "current", "modern", "available", "specific", "various",
     "personal", "private", "shared", "public", "common",
+    # Issue #22 follow-up: extraction noise that leaked through in production
+    # re-extraction. These are common verbs/participles/abstract nouns that
+    # appear capitalized at sentence starts.
+    "involving", "related", "summary", "decision", "agents", "agent",
+    "after", "better", "key", "takeaways",
+    "notes", "note", "overview", "context", "background", "introduction",
+    "conclusion", "result", "results", "output", "action",
+    "actions", "item", "items", "task", "tasks", "step", "steps",
+    "phase", "update", "updates", "change", "changes", "fix", "fixes",
+    "issue", "issues", "error", "errors", "warning", "warnings",
+    "key takeaways", "related notes", "soul", "cv", "rtx",
 }
 
 # Issue #22: common English function words and generic response/sentence-starter
