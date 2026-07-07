@@ -22,6 +22,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 - **Indexes the Obsidian vault** as `document` memories, respecting workspace exclusions, frontmatter, locked notes, and per-agent profile scopes.
 - **Extracts entities with GLiNER** — a lightweight NER model (`urchade/gliner_small_v2`) extracts named entities with typed labels (person, tool, service, project, place, organization, concept). Falls back to regex if GLiNER is unavailable.
 - **Classifies typed relations** — co-occurrence edges are classified into semantic types (owns, uses, created, depends_on, monitors, manages, interacts_with, references, part_of) using entity-type heuristics.
+- **Expands queries via the entity graph** — when a user says "the printer", the prefetch pipeline generates n-gram phrases, resolves them against the entity graph (including aliases), traverses 1 hop to related entities, and adds canonical entity names as additional search terms. This bridges the gap between colloquial references and canonical entity names without adding latency.
 - **Runs a bounded dream loop** that finds non-obvious connections across memories using a cloud model, writes a first-person diary, and promotes real insights to threads.
 - **Imports existing memory stores** — Hermes MEMORY.md / USER.md files and Hindsight memories — with `dry_run` and `shadow` modes.
 
@@ -46,6 +47,9 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 
 6. **Entity extraction quality matters.**  
    GLiNER (a transformer-based NER model) is the primary entity extractor. Regex patterns are the fallback. The difference in quality is significant — GLiNER correctly identifies entities like `Qwen3-TTS` as a single tool rather than splitting it into `Qwen3` and `TTS`.
+
+7. **The entity graph is a query expansion surface, not just a traversal tool.**  
+   When a user says "the printer", `_graph_expand()` resolves the phrase against entity aliases ("the printer" → `elegoo centauri carbon v1`), traverses 1 hop to related entities, and adds canonical names as additional search terms. This runs in pure SQLite (<10 ms) and bridges the gap between how people talk and how entities are stored.
 
 ---
 
@@ -148,7 +152,7 @@ remnant/
 ├── search.py                # BM25, vector, RRF, graph, profile-scope search
 ├── tools.py                 # Tool schemas and dispatch (search/store/edit/graph/reflect/import/thread)
 ├── edit.py                  # memory_edit actions + audit logging
-├── prefetch.py              # Proactive prefetch with deadline/budget/dedup
+├── prefetch.py              # Proactive prefetch with deadline/budget/dedup + entity-graph query expansion
 ├── reflect.py               # memory_reflect synthesis
 ├── vault.py                 # Obsidian vault indexer
 ├── threads.py               # Thread CRUD + stale sweep
@@ -351,6 +355,7 @@ Remnant was built in five implementation phases plus a migration phase and a pos
 | 5 | Threads, bounded day/night dream loop, diary | 185 |
 | Migration | Import from Hindsight + MEMORY.md, dry_run, shadow mode | 223 |
 | 6 | GLiNER NER, typed relation classifier, trust calibration, embedding backfill | 308 |
+| 7 | Entity-graph query expansion in prefetch (alias resolution + 1-hop traversal) | 315 |
 
 ---
 
@@ -366,7 +371,7 @@ The BlacksiteLab production database (as of July 2026):
 | Relations | 6,399 |
 | Embeddings | 1,576 (100% coverage) |
 | DB size | 30.4 MB |
-| Tests | 308 passing |
+| Tests | 315 passing |
 
 Relation type distribution:
 
@@ -474,6 +479,8 @@ The shared SQLite database at `~/.hermes/remnant/remnant.db` is returned by the 
 - Email / feed / sensor indexing.
 - Web dashboard.
 - GLiNER model fine-tuning on fleet-specific vocabulary (fleet agent names, homelab services).
+- Self-tuning prefetch: use prefetch_stats data to adjust deadline/budget/expand depth based on observed hit rates. Deferred until sufficient stats are collected (~1 week of production data).
+- Curation loop: surface never-seen memories proactively to keep the corpus fresh. Depends on a reward signal (implicit reuse detection).
 
 ---
 
