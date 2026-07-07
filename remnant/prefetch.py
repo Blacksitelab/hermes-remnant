@@ -141,10 +141,28 @@ def prefetch(
     cfg: RemnantConfig = provider._config
     db: RemnantDB = provider._db
     embedder: Embedder = provider._embedder
+    agent_id = cfg.agent_id
+
+    def _record(outcome: str, reason: str | None, t0: float,
+                count: int = 0, tokens: int = 0) -> None:
+        """Best-effort stats recording — never breaks prefetch."""
+        try:
+            elapsed = (time.monotonic() - t0) * 1000.0
+            db.record_prefetch(
+                session_id=session_id, outcome=outcome, reason=reason,
+                elapsed_ms=elapsed, result_count=count, token_estimate=tokens,
+                query=query, agent_id=agent_id,
+            )
+        except Exception:
+            pass
+
+    _t_init = time.monotonic()
 
     if not cfg.prefetch_enabled:
+        _record("empty", "disabled", _t_init)
         return {}
     if not _needs_memory(query):
+        _record("empty", "not_needed", _t_init)
         return {}
     if deadline_ms is None:
         deadline_ms = cfg.injection_prefetch_deadline_ms
@@ -155,7 +173,6 @@ def prefetch(
     # provider. We pass the session-scoped embedder wrapper if present.
     session_embedder = provider._session_embedder(session_id, query) or embedder
 
-    agent_id = cfg.agent_id
     limit = cfg.search_limit
 
     # Gather candidate memories across expanded queries via hybrid (auto) search.
@@ -164,6 +181,7 @@ def prefetch(
     expansions = _expand_queries(query) or [query]
     for term in expansions:
         if time.monotonic() - t0 > deadline_s:
+            _record("empty", "deadline", t0)
             return {}
         try:
             results = hybrid_search(
@@ -180,11 +198,13 @@ def prefetch(
                 merged.append(r)
 
     if not merged:
+        _record("empty", "no_results", t0)
         return {}
 
     # Dedup against current conversation messages.
     merged = _dedup_against_messages(merged, messages)
     if not merged:
+        _record("empty", "all_deduped", t0)
         return {}
 
     # Token budget enforcement: greedy add until budget exhausted.
@@ -198,21 +218,27 @@ def prefetch(
         selected.append(m)
         running += line_tokens
     if not selected:
+        _record("empty", "budget_exhausted", t0)
         return {}
 
     context = _format_context(selected)
     if _approx_tokens(context) > budget:
+        _record("empty", "budget_overflow", t0)
         return {}
 
     if time.monotonic() - t0 > deadline_s:
+        _record("empty", "deadline_post_format", t0)
         return {}
 
     ctx_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
     # Diff-based suppression: same context as last turn in this session.
     if provider._last_injected_hash.get(session_id) == ctx_hash:
+        _record("empty", "diff_suppression", t0)
         return {}
     provider._last_injected_hash[session_id] = ctx_hash
 
+    _record("injected", None, t0, count=len(selected),
+            tokens=_approx_tokens(context))
     return {
         "context": context,
         "memories": [

@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -230,6 +230,23 @@ CREATE TABLE IF NOT EXISTS entity_sightings (
     PRIMARY KEY(name_key, agent, memory_id)
 );
 CREATE INDEX IF NOT EXISTS idx_sightings_name ON entity_sightings(name_key, agent);
+
+-- Prefetch stats: track every prefetch() call and its outcome so we can
+-- measure the empty-return rate, latency, and which rejection path fires.
+CREATE TABLE IF NOT EXISTS prefetch_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    outcome TEXT NOT NULL,          -- 'injected' or 'empty'
+    reason TEXT,                    -- why empty (e.g. 'deadline', 'no_results', 'greeting', 'diff_suppression')
+    elapsed_ms REAL,                 -- wall-clock time spent in prefetch()
+    result_count INTEGER DEFAULT 0,  -- number of memories injected (0 if empty)
+    token_estimate INTEGER DEFAULT 0,
+    query TEXT,                     -- the user query (truncated for storage)
+    agent_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_prefetch_outcome ON prefetch_stats(outcome);
+CREATE INDEX IF NOT EXISTS idx_prefetch_created ON prefetch_stats(created_at);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -471,6 +488,45 @@ class RemnantDB:
             yield cur
         finally:
             cur.close()
+
+    # -- prefetch stats --------------------------------------------------------
+
+    def record_prefetch(
+        self,
+        session_id: str,
+        outcome: str,
+        reason: str | None = None,
+        elapsed_ms: float = 0.0,
+        result_count: int = 0,
+        token_estimate: int = 0,
+        query: str = "",
+        agent_id: str | None = None,
+    ) -> None:
+        """Record a prefetch() call outcome for diagnostics.
+
+        Called on every prefetch return path (injected or empty) so we can
+        measure the empty-return rate, latency distribution, and which
+        rejection path fires most often.
+        """
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).isoformat()
+        # Truncate query for storage safety.
+        q = (query or "")[:500]
+        try:
+            with self._lock:
+                cur = self._conn.cursor()
+                cur.execute(
+                    """INSERT INTO prefetch_stats
+                       (session_id, outcome, reason, elapsed_ms, result_count,
+                        token_estimate, query, agent_id, created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?)""",
+                    (session_id, outcome, reason, elapsed_ms,
+                     result_count, token_estimate, q, agent_id, ts),
+                )
+                self._conn.commit()
+        except Exception:
+            # Stats are best-effort — never break prefetch over logging.
+            pass
 
     # -- turns -----------------------------------------------------------------
 
