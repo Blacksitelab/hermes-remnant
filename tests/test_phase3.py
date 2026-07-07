@@ -1182,6 +1182,7 @@ def test_typed_entities_skip_regex_fallback(monkeypatch, hermes_home: Path):
         extract_and_link_entities(
             db, memory_id=mid2, text="Sven likes Proxmox",
             typed_entities=None, agent_id="default", min_memories=1,
+            use_gliner=False,
         )
         assert calls, "regex extract_entities should run on the fallback path"
     finally:
@@ -1198,6 +1199,7 @@ def test_extract_and_link_applies_threshold_on_regex_path(hermes_home: Path):
         ids = extract_and_link_entities(
             db, memory_id=mid, text="Sven runs Proxmox",
             typed_entities=None, agent_id="default", min_memories=2,
+            use_gliner=False,
         )
         assert ids == [], "single regex sighting should be deferred"
         assert db.find_entity_by_name("Sven", agent_id="default") is None

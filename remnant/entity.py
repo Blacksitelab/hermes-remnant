@@ -32,9 +32,122 @@ Issue #5 additions:
 from __future__ import annotations
 
 import re
+import logging
 from typing import Any
 
 from .db import RemnantDB, _normalize_entity_name
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GLiNER-based entity extraction (optional, preferred over regex)
+# ---------------------------------------------------------------------------
+
+# Lazy-loaded singleton — the model is ~400MB and loads in ~2s.
+# We only load it once per process, and only if gliner is installed.
+_gliner_model = None
+_gliner_available: bool | None = None
+
+# Entity labels we ask GLiNER to look for. These map to our ENTITY_TYPES.
+_GLINER_LABELS = [
+    "person", "tool", "service", "project",
+    "location", "organization", "concept",
+]
+
+# Map GLiNER labels to our internal entity types.
+_LABEL_TO_TYPE: dict[str, str] = {
+    "person": "person",
+    "tool": "tool",
+    "service": "service",
+    "project": "project",
+    "location": "place",
+    "organization": "organization",
+    "concept": "concept",
+}
+
+# Threshold for GLiNER confidence — below this, skip the entity.
+_GLINER_THRESHOLD = 0.5
+
+
+def _get_gliner_model():
+    """Lazy-load the GLiNER model. Returns None if unavailable."""
+    global _gliner_model, _gliner_available
+    if _gliner_available is False:
+        return None
+    if _gliner_model is not None:
+        return _gliner_model
+    try:
+        from gliner import GLiNER
+        _gliner_model = GLiNER.from_pretrained("urchade/gliner_small-v2")
+        _gliner_available = True
+        logger.info("GLiNER model loaded successfully")
+        return _gliner_model
+    except Exception as e:
+        logger.warning("GLiNER not available, falling back to regex: %s", e)
+        _gliner_available = False
+        return None
+
+
+def extract_entities_gliner(
+    text: str,
+    *,
+    max_entities: int = 15,
+    threshold: float = _GLINER_THRESHOLD,
+) -> list[dict[str, Any]]:
+    """Extract entities using GLiNER NER model.
+
+    Returns the same format as ``extract_entities``:
+    ``[{"name": str, "type": str|None, "aliases": [str]}]``.
+
+    Falls back to an empty list if GLiNER is not available; callers should
+    use ``extract_high_signal_entities`` which tries GLiNER first and
+    falls back to regex.
+    """
+    if not text:
+        return []
+    model = _get_gliner_model()
+    if model is None:
+        return []
+
+    # Truncate to avoid excessive processing time on very long texts.
+    # GLiNER handles this fine — it just takes longer.
+    truncated = text[:5000]
+
+    try:
+        raw_entities = model.predict_entities(
+            truncated, labels=_GLINER_LABELS, threshold=threshold,
+        )
+    except Exception as e:
+        logger.warning("GLiNER prediction failed: %s", e)
+        return []
+
+    # Deduplicate by name (case-insensitive), keep highest-scoring.
+    seen: dict[str, dict[str, Any]] = {}
+    for ent in raw_entities:
+        name = ent["text"].strip()
+        if not name:
+            continue
+        key = name.lower()
+        label = ent.get("label", "")
+        etype = _LABEL_TO_TYPE.get(label, "concept")
+        score = ent.get("score", 0.0)
+        if key not in seen or score > seen[key].get("_score", 0):
+            seen[key] = {
+                "name": name,
+                "type": etype,
+                "aliases": [],
+                "_score": score,
+            }
+
+    # Sort by score descending, cap at max_entities.
+    result = sorted(seen.values(), key=lambda e: e.get("_score", 0), reverse=True)
+    result = result[:max_entities]
+
+    # Strip internal _score key.
+    return [
+        {"name": e["name"], "type": e["type"], "aliases": e["aliases"]}
+        for e in result
+    ]
 
 # Recognized entity types (spec: person, service, project, concept, place, tool).
 ENTITY_TYPES = {"person", "service", "project", "concept", "place", "tool"}
@@ -382,12 +495,20 @@ def extract_high_signal_entities(
     *,
     stoplist: set[str] | None = None,
     max_entities: int = 15,
+    use_gliner: bool = True,
 ) -> list[dict[str, Any]]:
     """Production entry point for entity extraction (issue #22).
 
     Returns at most ``max_entities`` (default 15) high-signal entities ranked by
     salience. This is the path used by vault indexing and import fallbacks.
+
+    When ``use_gliner`` is True (default), tries GLiNER NER extraction first.
+    Falls back to regex extraction if GLiNER is unavailable or returns nothing.
     """
+    if use_gliner:
+        gliner_entities = extract_entities_gliner(text, max_entities=max_entities)
+        if gliner_entities:
+            return gliner_entities
     return extract_entities(text, stoplist=stoplist, max_entities=max_entities)
 
 
@@ -613,6 +734,7 @@ def extract_and_link_entities(
     min_memories: int = 1,
     stoplist: set[str] | None = None,
     max_entities: int = 15,
+    use_gliner: bool = True,
 ) -> list[str]:
     """Unified entity linking entry point (issue #5/#21/#22).
 
@@ -621,10 +743,10 @@ def extract_and_link_entities(
     the model has already curated the entities, so re-running the regex would
     only add noise (dates, generic nouns, single-mention proper nouns).
 
-    When ``typed_entities`` is empty/None (the regex fallback path used by
-    ``import_sources`` and ``vault``), extract entities locally with
+    When ``typed_entities`` is empty/None, extract entities locally with
     ``extract_high_signal_entities`` (capped at ``max_entities``) and link them
-    through ``link_memory_entities``.
+    through ``link_memory_entities``. When ``use_gliner`` is True (default),
+    GLiNER NER extraction is tried first; regex is the fallback.
 
     ``text`` is forwarded to relation seeding so only sentence-co-occurring
     entity pairs receive edges, preventing complete-graph relation explosions.
@@ -634,6 +756,7 @@ def extract_and_link_entities(
     else:
         entities = extract_high_signal_entities(
             text, stoplist=stoplist, max_entities=max_entities,
+            use_gliner=use_gliner,
         )
     if not entities:
         return []
@@ -649,6 +772,7 @@ __all__ = [
     "_STOPWORDS",
     "_STOPLIST",
     "extract_entities",
+    "extract_entities_gliner",
     "extract_high_signal_entities",
     "extract_and_link_entities",
     "guess_type",

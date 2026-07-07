@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-from remnant.entity import extract_entities, seed_relations
+from remnant.entity import extract_high_signal_entities, seed_relations
 from remnant.db import RemnantDB
 
 
@@ -47,8 +47,7 @@ def reextract(
         print(f"Dry run: {total} active memories to re-extract")
         sample = memories[:5]
         for mid, content, agent in sample:
-            entities = extract_entities(content, max_entities=15)
-            print(f"  {mid[:8]}... → {len(entities)} entities: {[e['name'] for e in entities[:8]]}")
+            entities = extract_high_signal_entities(content, max_entities=15)
         # Current state
         c.execute("SELECT COUNT(*) FROM memory_entities")
         me_before = c.fetchone()[0]
@@ -77,7 +76,7 @@ def reextract(
     total_relations_seeded = 0
 
     for i, (mid, content, agent) in enumerate(memories):
-        entities = extract_entities(content, max_entities=15)
+        entities = extract_high_signal_entities(content, max_entities=15)
         entity_ids = []
         for ent in entities:
             name = ent["name"]

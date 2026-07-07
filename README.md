@@ -15,11 +15,13 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 - **Stores durable facts** extracted from conversation turns, vault notes, and imports.
 - **Dedupes aggressively** — the same fact is never stored twice; duplicate hits increment a `seen_count`.
 - **Filters transient state** — percentages, current timestamps, and words like *currently* / *now* are rejected.
-- **Scores trust** — every memory has a `trust_score` that is raised or lowered by feedback.
+- **Scores trust** — every memory has a `trust_score` calibrated by source quality, confidence, verification status, and engagement. Trust scores influence search ranking and decay over time.
 - **Self-edits** — agents can update, merge, forget, share, unshare, and score memories through tools.
 - **Searches three ways** — BM25 keyword, cosine vector similarity, entity-graph traversal, plus a hybrid RRF fusion.
 - **Proactively injects context** via Hermes' `prefetch()` hook, with a hard deadline, token budget, and diff-based suppression.
 - **Indexes the Obsidian vault** as `document` memories, respecting workspace exclusions, frontmatter, locked notes, and per-agent profile scopes.
+- **Extracts entities with GLiNER** — a lightweight NER model (`urchade/gliner_small_v2`) extracts named entities with typed labels (person, tool, service, project, place, organization, concept). Falls back to regex if GLiNER is unavailable.
+- **Classifies typed relations** — co-occurrence edges are classified into semantic types (owns, uses, created, depends_on, monitors, manages, interacts_with, references, part_of) using entity-type heuristics.
 - **Runs a bounded dream loop** that finds non-obvious connections across memories using a cloud model, writes a first-person diary, and promotes real insights to threads.
 - **Imports existing memory stores** — Hermes MEMORY.md / USER.md files and Hindsight memories — with `dry_run` and `shadow` modes.
 
@@ -42,6 +44,9 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 5. **The dream loop is bounded.**  
    Only a pre-filtered candidate list (≤30 pairs) is sent to the cloud model. Local cosine similarity does the heavy lifting.
 
+6. **Entity extraction quality matters.**  
+   GLiNER (a transformer-based NER model) is the primary entity extractor. Regex patterns are the fallback. The difference in quality is significant — GLiNER correctly identifies entities like `Qwen3-TTS` as a single tool rather than splitting it into `Qwen3` and `TTS`.
+
 ---
 
 ## Tech stack
@@ -50,6 +55,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 |-----------|--------|--------|
 | Storage | SQLite + FTS5 | Zero dependency, single-file, WAL mode, fast |
 | Embeddings | `nomic-embed-text` via BSL1 Ollama (768-dim) | Already loaded, CPU/GPU-capable, simple HTTP API |
+| Entity extraction | `urchade/gliner_small_v2` via GLiNER (CPU) | Purpose-built NER, ~400 MB, millisecond inference, typed entities |
 | Extraction / rerank / reflect | `gemma4:12b` on BSL1 via Ollama OpenAI-compatible API | Proven for extraction, already running |
 | Dream loop | Cloud model (`deepseek-v4-flash:cloud` by default) | Overnight quality, latency irrelevant |
 | Framework | Hermes memory-provider plugin | Registers `sync_turn`, `prefetch`, tool schemas |
@@ -72,6 +78,7 @@ cd /mnt/data/dev/hermes-remnant
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
+pip install gliner  # for GLiNER-based entity extraction
 ```
 
 ### 3. Register as a Hermes plugin
@@ -129,32 +136,35 @@ provider.shutdown()
 
 ```text
 remnant/
-├── __init__.py          # RemnantMemoryProvider + Hermes register entry point
-├── plugin.yaml          # Hermes plugin manifest
-├── config.py            # Configuration model, defaults, load/save
-├── db.py                # SQLite schema, migrations, CRUD, search helpers
-├── embed.py             # Embedding cache + Ollama embedder
-├── extract.py           # Async fact/entity extraction worker
-├── ingest.py            # Turn ingestion, transient filter, contradiction detection
-├── entity.py            # Entity extraction, resolution, alias normalization
-├── graph.py             # Pure-SQLite graph traversal
-├── search.py            # BM25, vector, RRF, graph, profile-scope search
-├── tools.py             # Tool schemas and dispatch (search/store/edit/graph/reflect/import/thread)
-├── edit.py              # memory_edit actions + audit logging
-├── prefetch.py          # Proactive prefetch with deadline/budget/dedup
-├── reflect.py           # memory_reflect synthesis
-├── vault.py             # Obsidian vault indexer
-├── threads.py           # Thread CRUD + stale sweep
-├── dream.py             # Day/night dream loop
-└── import_sources.py    # MEMORY.md / USER.md / Hindsight / shadow import
+├── __init__.py              # RemnantMemoryProvider + Hermes register entry point
+├── plugin.yaml              # Hermes plugin manifest
+├── config.py                # Configuration model, defaults, load/save
+├── db.py                    # SQLite schema, migrations, CRUD, search helpers
+├── embed.py                 # Embedding cache + Ollama embedder
+├── extract.py               # Async fact/entity extraction worker
+├── ingest.py                # Turn ingestion, transient filter, contradiction detection
+├── entity.py               # Entity extraction (GLiNER + regex fallback), resolution, alias normalization
+├── graph.py                 # Pure-SQLite graph traversal
+├── search.py                # BM25, vector, RRF, graph, profile-scope search
+├── tools.py                 # Tool schemas and dispatch (search/store/edit/graph/reflect/import/thread)
+├── edit.py                  # memory_edit actions + audit logging
+├── prefetch.py              # Proactive prefetch with deadline/budget/dedup
+├── reflect.py               # memory_reflect synthesis
+├── vault.py                 # Obsidian vault indexer
+├── threads.py               # Thread CRUD + stale sweep
+├── dream.py                 # Day/night dream loop
+├── import_sources.py        # MEMORY.md / USER.md / Hindsight / shadow import
+├── reextract.py             # Batch entity re-extraction (GLiNER) + orphan cleanup
+├── classify_relations.py    # Typed relation classifier (entity-type heuristics)
+└── calibrate_trust.py       # Trust score calibration (source quality, verification, engagement)
 
 tests/
-├── test_phase1.py       # Core storage, retrieval, dedup, transient filter
-├── test_phase2.py       # Semantic search, RRF, prefetch, reflection
-├── test_phase3.py       # Entity graph, self-editing, audit log, contradictions
-├── test_phase4.py       # Vault indexing, profile scope, locked notes
-├── test_phase5.py       # Threads, dream loop, budget, diary
-└── test_migration.py    # Memory-store + Hindsight import, dry_run, shadow
+├── test_phase1.py           # Core storage, retrieval, dedup, transient filter
+├── test_phase2.py           # Semantic search, RRF, prefetch, reflection
+├── test_phase3.py           # Entity graph, self-editing, audit log, contradictions
+├── test_phase4.py           # Vault indexing, profile scope, locked notes
+├── test_phase5.py           # Threads, dream loop, budget, diary
+└── test_migration.py         # Memory-store + Hindsight import, dry_run, shadow
 
 docs/
 ├── spec-phase1.md
@@ -209,6 +219,89 @@ def register(ctx):
 
 ---
 
+## Entity extraction
+
+Remnant uses a two-tier entity extraction strategy:
+
+### Primary: GLiNER (transformer-based NER)
+
+[GLiNER](https://github.com/urchade/GLiNER) is a lightweight NER model that identifies named entities in text and assigns them typed labels. Remnant uses `urchade/gliner_small_v2` (~400 MB), which runs on CPU in milliseconds.
+
+**Supported entity types:** person, organization, project, tool, service, place, concept
+
+**How it works:**
+1. Text is passed to the GLiNER model with the label set above
+2. Model returns entities with confidence scores (threshold: 0.5)
+3. Entities are deduplicated, filtered against a stoplist, and resolved against the existing entity graph
+4. If GLiNER is not installed or returns no entities, the regex extractor runs as a fallback
+
+**Wiring:** `extract_entities_gliner()` in `entity.py` is called by `extract_high_signal_entities()` when `use_gliner=True` (default). The model is loaded lazily as a module-level singleton — first call loads the model, subsequent calls reuse it.
+
+### Fallback: Regex patterns
+
+If GLiNER is unavailable, a regex-based extractor identifies entities using capitalization patterns, CamelCase detection, known-project matching, and a stoplist. This is the original Phase 3 extractor, preserved for environments without GLiNER.
+
+### Batch re-extraction
+
+`reextract.py` re-extracts entities for all memories in the DB:
+
+```bash
+python -m remnant.reextract --dry-run    # preview counts
+python -m remnant.reextract --batch 100   # run with progress every 100 memories
+```
+
+This clears existing entity links and relations, re-extracts with GLiNER, cleans up orphaned entities, and VACUUMs the database. Always back up the DB first.
+
+---
+
+## Typed relations
+
+Relations between entities are classified into semantic types using entity-type heuristics:
+
+| Relation type | Example | How it's detected |
+|---------------|---------|-------------------|
+| `owns` | kris → remnant | person owns project/tool |
+| `uses` | sven → ollama | person uses tool/service |
+| `created` | sven → skill | person created project/service |
+| `depends_on` | remnant → sqlite | project/service depends on tool |
+| `monitors` | claire → fleet | person monitors project/service |
+| `manages` | kris → bsl1 | person manages place/organization |
+| `interacts_with` | claire → sven | person interacts with person |
+| `references` | vault → remnant | project/service references project |
+| `part_of` | hub → blacksitelab | entity is part of organization |
+| `co_occurs` | docker → ollama | entities co-occur in memories but no typed relation |
+| `related_to` | (fallback) | no heuristic matched |
+
+```bash
+python -m remnant.classify_relations --dry-run  # preview
+python -m remnant.classify_relations --yes       # apply
+```
+
+---
+
+## Trust scoring
+
+Every memory has a `trust_score` (0.0–1.0) that influences search ranking. Trust is calibrated by:
+
+| Factor | Adjustment |
+|--------|------------|
+| Source: vault document | +0.15 |
+| Source: import (memory_store, hindsight) | +0.05 |
+| Source: manual entry | +0.05 |
+| Source: conversation | 0 (baseline) |
+| Source: hindsight | −0.05 |
+| Verified by agent | +0.10 |
+| Engagement (seen_count > 1) | +0.05 |
+| Cap | 0.95 |
+
+Trust scores decay over time via `decay_trust_scores()` in `search.py` — unverified memories drift toward 0.5, verified memories hold their floor.
+
+```bash
+python -m remnant.calibrate_trust  # recalibrate all trust scores
+```
+
+---
+
 ## Configuration
 
 Per-profile config lives at `hermes_home/remnant.json` (where `hermes_home` is the active Hermes profile directory, e.g. `~/.hermes/profiles/<profile>`). Edit it directly or set values through `hermes memory setup`. Each profile keeps its own config — `agent_id`, endpoints, vault path, visibility defaults — so multiple agents can share the single DB while remaining independently configured.
@@ -241,20 +334,69 @@ injection_token_budget: 2000
 injection_prefetch_deadline_ms: 500
 ```
 
+**GLiNER entity extraction** is enabled by default when the `gliner` package is installed. No configuration needed — the model (`urchade/gliner_small_v2`) is downloaded automatically on first use from HuggingFace (no token required). If `gliner` is not installed, the regex extractor runs automatically.
+
 ---
 
 ## Phases
 
-Remnant was built in five implementation phases plus a migration phase.
+Remnant was built in five implementation phases plus a migration phase and a post-launch improvement phase.
 
-| Phase | Focus | Commit | Tests |
-|-------|-------|--------|-------|
-| 1 | Core storage, async extraction, BM25, dedup, transient filter, visibility | `77a5680` | 29 |
-| 2 | Semantic search, RRF fusion, proactive `prefetch()`, `memory_reflect` | `a39e8e1` | 58 |
-| 3 | Entity graph, `memory_edit`, audit log, contradiction detection | `2f08eca` | 108 |
-| 4 | Vault indexing, frontmatter, profile-scoped search, locked notes | `20b4793` | 153 |
-| 5 | Threads, bounded day/night dream loop, diary | `064dd86` | 185 |
-| Migration | Import from Hindsight + MEMORY.md, dry_run, shadow mode | `6824b65` | 223 |
+| Phase | Focus | Tests |
+|-------|-------|-------|
+| 1 | Core storage, async extraction, BM25, dedup, transient filter, visibility | 29 |
+| 2 | Semantic search, RRF fusion, proactive `prefetch()`, `memory_reflect` | 58 |
+| 3 | Entity graph, `memory_edit`, audit log, contradiction detection | 108 |
+| 4 | Vault indexing, frontmatter, profile-scoped search, locked notes | 153 |
+| 5 | Threads, bounded day/night dream loop, diary | 185 |
+| Migration | Import from Hindsight + MEMORY.md, dry_run, shadow mode | 223 |
+| 6 | GLiNER NER, typed relation classifier, trust calibration, embedding backfill | 308 |
+
+---
+
+## Production stats
+
+The BlacksiteLab production database (as of July 2026):
+
+| Metric | Value |
+|--------|-------|
+| Active memories | 1,574 |
+| Entities | 2,971 |
+| Memory-entity links | 5,886 |
+| Relations | 6,399 |
+| Embeddings | 1,576 (100% coverage) |
+| DB size | 30.4 MB |
+| Tests | 308 passing |
+
+Relation type distribution:
+
+| Type | Count |
+|------|-------|
+| `related_to` | 3,208 |
+| `co_occurs` | 2,408 |
+| `owns` | 345 |
+| `uses` | 175 |
+| `created` | 118 |
+| `depends_on` | 49 |
+| `monitors` | 30 |
+| `references` | 30 |
+| `manages` | 17 |
+| `interacts_with` | 16 |
+| `part_of` | 3 |
+
+Entity type distribution:
+
+| Type | Count |
+|------|-------|
+| `concept` | 952 |
+| `tool` | 696 |
+| `service` | 553 |
+| `project` | 362 |
+| `place` | 185 |
+| `person` | 107 |
+| `organization` | 100 |
+
+Top entities by link count: `user` (510), `kris` (122), `sven` (92), `claire` (88), `project` (74), `assistant` (73), `system` (67), `yuki` (62), `remnant` (52), `klaus` (42), `sasha` (39), `margot` (36), `ai` (35), `bsl1` (31), `blacksitelab` (27).
 
 ---
 
@@ -277,6 +419,18 @@ ruff check remnant tests --fix
 
 ```bash
 mypy remnant
+```
+
+### Batch re-extraction
+
+After changing the entity extractor, re-extract all memories:
+
+```bash
+cp ~/.hermes/remnant/remnant.db ~/.hermes/remnant/remnant.db.backup
+python -m remnant.reextract --dry-run      # preview
+python -m remnant.reextract --batch 100     # run
+python -m remnant.classify_relations --yes  # reclassify typed relations
+python -m remnant.calibrate_trust           # recalibrate trust scores
 ```
 
 ---
@@ -319,6 +473,7 @@ The shared SQLite database at `~/.hermes/remnant/remnant.db` is returned by the 
 - Entity community detection (deferred until graph traversal needs it).
 - Email / feed / sensor indexing.
 - Web dashboard.
+- GLiNER model fine-tuning on fleet-specific vocabulary (fleet agent names, homelab services).
 
 ---
 
