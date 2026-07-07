@@ -17,7 +17,7 @@ from remnant.config import RemnantConfig
 from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder, cosine
 from remnant.ingest import store_memory
-from remnant.prefetch import _expand_queries, _needs_memory
+from remnant.prefetch import _expand_queries, _needs_memory, _graph_expand, _entity_lookup_phrases
 from remnant.search import _rrf_fuse
 from remnant.search import search as hybrid_search
 
@@ -156,6 +156,91 @@ def test_expand_queries_proper_nouns():
 
 def test_expand_queries_empty():
     assert _expand_queries("") == []
+
+
+# --- graph-based query expansion (Issue #28) --------------------------------
+
+
+def test_entity_lookup_phrases_preserves_stopwords():
+    """Unlike _expand_queries, _entity_lookup_phrases keeps 'the printer' intact."""
+    phrases = _entity_lookup_phrases("the printer")
+    assert "the printer" in phrases
+    assert "printer" in phrases
+
+
+def test_entity_lookup_phrases_empty():
+    assert _entity_lookup_phrases("") == []
+    assert _entity_lookup_phrases("   ") == []
+
+
+def test_entity_lookup_phrases_ngrams():
+    phrases = _entity_lookup_phrases("elegoo centauri carbon v1")
+    # Trigram should be present.
+    assert any("elegoo centauri carbon" in p for p in phrases)
+    # Unigrams too.
+    assert "elegoo" in phrases
+
+
+def test_graph_expand_resolves_alias(hermes_home: Path):
+    """'the printer' should resolve to the entity 'Elegoo Centauri Carbon V1'
+    via the alias index, not just the entity name.
+    """
+    db = open_db(default_db_path())
+    try:
+        # Create entity with alias "the printer".
+        eid = db.resolve_entity(
+            "elegoo centauri carbon v1",
+            agent_id="default",
+            entity_type="tool",
+            aliases=["the printer", "centauri"],
+        )
+        # Insert a memory and link the entity to it.
+        mid = db.insert_memory(
+            content="The user owns a 3D printer known as the Elegoo Centauri Carbon V1.",
+            source="manual",
+            agent="default",
+            visibility="private",
+        )
+        db.link_entity(memory_id=mid, entity_id=eid, agent_id="default")
+
+        terms = _graph_expand(db, "the printer", agent_id="default")
+        assert "elegoo centauri carbon v1" in terms
+    finally:
+        db.close()
+
+
+def test_graph_expand_no_match(hermes_home: Path):
+    """A query with no entity matches returns []."""
+    db = open_db(default_db_path())
+    try:
+        terms = _graph_expand(db, "banana smoothie recipe", agent_id="default")
+        assert terms == []
+    finally:
+        db.close()
+
+
+def test_graph_expand_finds_neighbours(hermes_home: Path):
+    """Graph expansion should return 1-hop neighbour names, not just the seed."""
+    db = open_db(default_db_path())
+    try:
+        # Create two entities with a relation.
+        eid_a = db.resolve_entity("alpha device", agent_id="default", entity_type="tool")
+        eid_b = db.resolve_entity("beta controller", agent_id="default", entity_type="tool")
+        db.add_relation(entity_a=eid_a, entity_b=eid_b, relation_type="depends_on")
+        terms = _graph_expand(db, "alpha device", agent_id="default")
+        assert "alpha device" in terms
+        assert "beta controller" in terms
+    finally:
+        db.close()
+
+
+def test_graph_expand_never_crashes_on_bad_input(hermes_home: Path):
+    db = open_db(default_db_path())
+    try:
+        assert _graph_expand(db, "", agent_id="default") == []
+        assert _graph_expand(db, "??? !!! ...", agent_id="default") == []
+    finally:
+        db.close()
 
 
 # --- semantic search --------------------------------------------------------

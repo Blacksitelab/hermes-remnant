@@ -84,6 +84,90 @@ def _expand_queries(query: str) -> list[str]:
     return terms[:3]
 
 
+# -- graph-based query expansion (Issue #28) ---------------------------------
+#
+# The core problem: when a user says "the printer", _expand_queries strips
+# "the" as a stopword and produces ["printer"]. BM25/semantic search for
+# "printer" is weak — it doesn't find the memory about the "Elegoo Centauri
+# Carbon V1" because the entity name doesn't contain the word "printer".
+#
+# But the entity graph already knows: alias "the printer" → entity "elegoo
+# centauri carbon v1". This function resolves entity mentions (including
+# multi-word phrases with stopwords like "the printer") against the entity
+# graph, traverses 1 hop to find related entity names, and returns the
+# canonical names as additional search terms. Pure SQLite, <10ms.
+
+# Phrases to try as entity lookups. We generate n-grams (1-3 words) from the
+# query, preserving stopwords so "the printer" survives. Dedup + cap.
+def _entity_lookup_phrases(query: str, max_phrases: int = 8) -> list[str]:
+    """Generate candidate entity names from the query, preserving stopwords.
+
+    Unlike _expand_queries which strips stopwords, this keeps phrases like
+    "the printer" intact so they can match aliases in the entity graph.
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    tokens = re.split(r"[\s,.;:!?]+", q)
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return []
+    phrases: list[str] = []
+    seen: set[str] = set()
+    # Unigrams + bigrams + trigrams.
+    for n in (3, 2, 1):
+        for i in range(len(tokens) - n + 1):
+            phrase = " ".join(tokens[i : i + n]).strip()
+            key = phrase.lower()
+            if key and key not in seen:
+                seen.add(key)
+                phrases.append(phrase)
+            if len(phrases) >= max_phrases:
+                break
+        if len(phrases) >= max_phrases:
+            break
+    return phrases
+
+
+def _graph_expand(
+    db: Any,
+    query: str,
+    agent_id: str | None = None,
+    max_terms: int = 5,
+) -> list[str]:
+    """Resolve entity mentions in the query against the graph and return
+    canonical entity names (resolved + 1-hop neighbours) as search terms.
+
+    Pure SQLite — no embeddings, no LLM. Returns [] if nothing resolves.
+    """
+    phrases = _entity_lookup_phrases(query)
+    if not phrases:
+        return []
+    seed_ids: list[str] = []
+    resolved_names: list[str] = []
+    seen_names: set[str] = set()
+    for phrase in phrases:
+        eid = db.find_entity_by_name(phrase, agent_id=agent_id)
+        if eid:
+            name = db.entity_name_for(eid)
+            if name and name.lower() not in seen_names:
+                seen_names.add(name.lower())
+                resolved_names.append(name)
+            if eid not in seed_ids:
+                seed_ids.append(eid)
+    if not seed_ids:
+        return []
+    # 1-hop traversal to find related entity names.
+    for eid in seed_ids:
+        result = db.traverse_graph(eid, depth=1, agent_id=agent_id)
+        for ent in result.get("entities", []):
+            name = ent.get("name")
+            if name and name.lower() not in seen_names:
+                seen_names.add(name.lower())
+                resolved_names.append(name)
+    return resolved_names[:max_terms]
+
+
 def _approx_tokens(text: str) -> int:
     """Cheap token estimate (~4 chars/token). No tokenizer dependency."""
     return max(1, len(text or "") // 4)
@@ -179,6 +263,19 @@ def prefetch(
     seen_ids: set[str] = set()
     merged: list[dict[str, Any]] = []
     expansions = _expand_queries(query) or [query]
+
+    # Graph-based query expansion (Issue #28): resolve entity mentions
+    # (including stopword-bearing phrases like "the printer") against the
+    # entity graph and add canonical entity names as search terms. Pure
+    # SQLite, <10ms — stays well within the prefetch deadline.
+    try:
+        graph_terms = _graph_expand(db, query, agent_id=agent_id)
+        for term in graph_terms:
+            if term and term not in expansions:
+                expansions.append(term)
+    except Exception:
+        pass  # Never let graph expansion break prefetch.
+
     for term in expansions:
         if time.monotonic() - t0 > deadline_s:
             _record("empty", "deadline", t0)
@@ -251,4 +348,4 @@ def prefetch(
     }
 
 
-__all__ = ["prefetch", "_needs_memory", "_expand_queries"]
+__all__ = ["prefetch", "_needs_memory", "_expand_queries", "_graph_expand", "_entity_lookup_phrases"]
