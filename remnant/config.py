@@ -58,7 +58,7 @@ DREAM_CONNECT_THRESHOLD = 0.6
 DREAM_DEDUP_THRESHOLD = 0.7
 
 # Cosine similarity above this => duplicate memory
-DEDUP_COSINE_THRESHOLD = 0.92
+DEDUP_COSINE_THRESHOLD = 0.85
 # BM25 candidate count when checking duplicates
 DEDUP_CANDIDATES = 8
 # Keyword search default limit
