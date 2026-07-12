@@ -158,6 +158,28 @@ def test_expand_queries_empty():
     assert _expand_queries("") == []
 
 
+def test_prefetch_reembeds_when_the_session_query_changes(provider, monkeypatch):
+    """A cached vector is only valid for the query it was embedded from."""
+    import remnant as remnant_module
+
+    calls: list[str] = []
+
+    def fake_embed(text: str) -> list[float]:
+        calls.append(text)
+        return [1.0] * 8
+
+    provider._embedder.embed = fake_embed  # type: ignore[union-attr]
+
+    def fake_prefetch(p, query, session_id, **kwargs):
+        p._session_embedder(session_id, query)
+        return {}
+
+    monkeypatch.setattr(remnant_module, "_run_prefetch", fake_prefetch)
+    provider.prefetch("remember alpha", session_id="same-session")
+    provider.prefetch("remember beta", session_id="same-session")
+    assert calls == ["remember alpha", "remember beta"]
+
+
 # --- graph-based query expansion (Issue #28) --------------------------------
 
 

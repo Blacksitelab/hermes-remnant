@@ -380,20 +380,12 @@ def ingest_turn(
     This is the part called from sync_turn and must be sub-10ms. It does no
     network calls and no embedding work.
     """
-    turn_id = db.insert_turn(
+    return db.insert_turn_with_extraction(
         session_id=session_id,
         agent_id=agent_id,
         user_text=user_text,
         assistant_text=assistant_text,
     )
-    db.enqueue_extraction(
-        turn_id=turn_id,
-        session_id=session_id,
-        agent_id=agent_id,
-        user_text=user_text,
-        assistant_text=assistant_text,
-    )
-    return turn_id
 
 
 __all__ = ["is_transient", "store_memory", "ingest_turn", "_initial_trust_score"]

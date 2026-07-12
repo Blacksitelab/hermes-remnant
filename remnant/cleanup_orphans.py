@@ -40,10 +40,12 @@ def main() -> int:
 
     db = RemnantDB(default_db_path())
 
-    result = cleanup_orphans(db, dry_run=args.dry_run)
+    # Preview before any deletion so the live pass reports its actual count.
+    result = cleanup_orphans(db, dry_run=True)
     print(f"Found {result['found']} orphaned forgotten memories.")
     if args.dry_run:
         print("Dry run — no changes made. Run with --yes to delete.")
+        db.close()
         return 0
 
     if not args.yes:

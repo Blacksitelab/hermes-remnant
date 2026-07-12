@@ -131,6 +131,7 @@ def _iter_entry_lines(text: str) -> Iterator[str]:
     happens in ``parse_memory_file``.
     """
     in_frontmatter = False
+    seen_content = False
     fenced = False
     for raw in text.splitlines():
         s = raw.rstrip()
@@ -139,16 +140,17 @@ def _iter_entry_lines(text: str) -> Iterator[str]:
             continue
         # YAML frontmatter: a leading ``---`` opens, the next ``---``/``...``
         # closes. Lines inside are skipped.
-        if stripped == "---" or stripped == "...":
-            if not in_frontmatter and not fenced and s == stripped:
-                # opening fence only counts at the very top of the file; we
-                # approximate by toggling on the first occurrence.
-                in_frontmatter = not in_frontmatter
-            else:
-                in_frontmatter = False
+        if in_frontmatter and stripped in ("---", "...") and s == stripped:
+            in_frontmatter = False
             continue
         if in_frontmatter:
             continue
+        # Only a leading fence is YAML frontmatter. A horizontal rule later
+        # in the document must not swallow the rest of the import.
+        if not seen_content and stripped == "---" and s == stripped:
+            in_frontmatter = True
+            continue
+        seen_content = True
         # Skip fenced code blocks.
         if stripped.startswith("```") or stripped.startswith("~~~"):
             fenced = not fenced
