@@ -179,6 +179,11 @@ def test_parse_memory_file_skips_headers_and_frontmatter():
     assert entries == ["A real bullet."]
 
 
+def test_parse_memory_file_keeps_content_after_horizontal_rule():
+    entries = parse_memory_file("- First fact.\n---\n- Second fact.\n")
+    assert entries == ["First fact.", "Second fact."]
+
+
 def test_parse_memory_file_dedups_identical_entries():
     text = "- Same fact.\n- Same fact.\n- Same fact.\n"
     entries = parse_memory_file(text)

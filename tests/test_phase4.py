@@ -216,7 +216,7 @@ def test_file_hash_is_sha256_hex(tmp_path: Path):
     f.write_text("hello\n")
     h = _file_hash(f)
     assert isinstance(h, str) and len(h) == 64
-    assert h == hashlib.sha256(b"hello\n").hexdigest()
+    assert h == hashlib.sha256(f.read_bytes()).hexdigest()
 
 
 # ===========================================================================
@@ -576,6 +576,23 @@ def test_profile_scope_filters_vault_documents(hermes_home: Path, vault: Path):
         )
         scoped_ids = {r["source_id"] for r in scoped if r.get("source") == "vault"}
         assert scoped_ids == {"Projects/alpha.md"}
+    finally:
+        db.close()
+
+
+def test_profile_scope_does_not_match_sibling_prefixes(hermes_home: Path, vault: Path):
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(vault_path=str(vault))
+    emb = _fake_embed(db, cfg)
+    _write_note(vault / "Project" / "allowed.md", "# Allowed\nalpha")
+    _write_note(vault / "Projects" / "blocked.md", "# Blocked\nalpha")
+    index_vault(db, cfg, emb)
+    try:
+        results = hybrid_search(
+            db, cfg, "alpha", agent_id="default", profile_scope=["Project"]
+        )
+        vault_ids = {r["source_id"] for r in results if r.get("source") == "vault"}
+        assert vault_ids == {"Project/allowed.md"}
     finally:
         db.close()
 

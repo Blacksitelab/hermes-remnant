@@ -37,6 +37,13 @@ def test_cleanup_orphans_deletes(db):
     assert mem is None or mem.get("status") != "active"
 
 
+def test_hard_delete_memory_reports_whether_a_row_was_deleted(db):
+    mid = db.insert_memory(content="Memory to delete", agent="test")
+    assert db.hard_delete_memory(mid) is True
+    assert db.get_memory(mid) is None
+    assert db.hard_delete_memory(mid) is False
+
+
 def test_cleanup_orphans_preserves_active(db):
     mid = db.insert_memory(content="Active memory", agent="test")
 

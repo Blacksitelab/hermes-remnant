@@ -547,6 +547,36 @@ class RemnantDB:
             )
             return int(cur.lastrowid)
 
+    def insert_turn_with_extraction(
+        self,
+        *,
+        session_id: str,
+        agent_id: str,
+        user_text: str,
+        assistant_text: str,
+    ) -> int:
+        """Persist a turn and its extraction job in one transaction.
+
+        A restart must never leave a durable turn without the queue row that
+        causes it to be processed.  Keeping both writes together also avoids
+        requiring recovery scans during normal operation.
+        """
+        now = time.time()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO turns(session_id, agent_id, user_text, assistant_text, created_at) "
+                "VALUES(?,?,?,?,?)",
+                (session_id, agent_id, user_text, assistant_text, now),
+            )
+            turn_id = int(cur.lastrowid)
+            cur.execute(
+                "INSERT INTO extraction_queue(turn_id, session_id, agent_id, user_text, "
+                "assistant_text, enqueued_at, attempts, status) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (turn_id, session_id, agent_id, user_text, assistant_text, now, 0, "pending"),
+            )
+            return turn_id
+
     # -- extraction queue ------------------------------------------------------
 
     def enqueue_extraction(
@@ -704,14 +734,10 @@ class RemnantDB:
         with no links to vault files or other memories.
         """
         with self.transaction() as cur:
-            cur.execute(
-                "DELETE FROM memories WHERE id=?", (memory_id,)
-            )
-            cur.execute(
-                "DELETE FROM memories_fts WHERE rowid IN "
-                "(SELECT id FROM memories WHERE id=?)", (memory_id,)
-            )
-            return cur.fetchone() is not None if cur.rowcount else cur.rowcount > 0
+            cur.execute("DELETE FROM memories WHERE id=?", (memory_id,))
+            # The memories_ad trigger maintains the external-content FTS row.
+            # Capture this rowcount before issuing any other statement.
+            return cur.rowcount > 0
 
     def search_bm25(
         self,

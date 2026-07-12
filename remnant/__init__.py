@@ -401,6 +401,7 @@ class RemnantMemoryProvider(MemoryProvider):
         # new query re-embeds; an identical query reuses the cached vector.
         if self._session_query.get(sid) != query:
             self._session_query.pop(sid, None)
+            self._session_query_vec.pop(sid, None)
             self._session_query[sid] = query
         return _run_prefetch(self, query, sid, messages=messages)
 

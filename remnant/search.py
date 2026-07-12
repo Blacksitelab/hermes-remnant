@@ -60,7 +60,7 @@ def _profile_scope_filter(
             continue
         sid = r.get("source_id") or ""
         sid = sid.replace("\\", "/")
-        if any(sid == p or sid.startswith(p + "/") or sid.startswith(p) for p in prefixes):
+        if any(sid == p or sid.startswith(p + "/") for p in prefixes):
             out.append(r)
     return out
 
