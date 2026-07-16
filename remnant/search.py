@@ -131,8 +131,9 @@ def search(
     their content masked for any viewer that is not the memory's owner agent.
 
     For ``semantic`` and ``auto``, if the top semantic cosine score is below
-    ``config.min_semantic_score`` (default 0.5), an empty list is returned
-    rather than keyword-dominated noise.
+    ``config.min_semantic_score`` (default 0.3), the semantic signal is weak.
+    In ``semantic`` mode this means no results; in ``auto`` mode we fall back to
+    the BM25 keyword results rather than returning nothing.
     """
     if limit is None:
         limit = config.search_limit
@@ -186,16 +187,22 @@ def search(
         _reinforce(db, config, ranked, query=query, strategy=strategy)
         return ranked
 
-    # auto: RRF fusion
+    # auto: RRF fusion. If the top semantic score is below threshold, the
+    # semantic signal is too weak for fusion, so we fall back to BM25-only
+    # results instead of returning an empty list.
     kw = db.search_bm25(query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
     sem = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
-    # Drop noise: if the top semantic cosine score is below the configured
-    # minimum, the query is not semantically related to any memory. Return an
-    # empty list instead of keyword-dominated BM25 noise.
     if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
-        return []
+        results = _attach_source(db, kw)
+        results = _profile_scope_filter(results, scope)
+        results = _scope_filter(results, visibility)
+        results = _mask_locked(results, viewer_agent=viewer)
+        results = results[:limit]
+        _reinforce(db, config, results, query=query, strategy="keyword_fallback")
+        return results
     fused = _rrf_fuse(kw, sem)
     fused = _attach_source(db, fused)
+    fused = _apply_source_weights(fused)
     fused = _profile_scope_filter(fused, scope)
     fused = _scope_filter(fused, visibility)
     fused = _mask_locked(fused, viewer_agent=viewer)
@@ -353,10 +360,17 @@ def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[st
     for r in results:
         d = dict(r)
         meta = rows.get(d.get("id"), {})
-        d.setdefault("agent", meta.get("agent"))
-        d.setdefault("agent_id", meta.get("agent"))
-        d.setdefault("source", meta.get("source"))
-        d.setdefault("source_id", meta.get("source_id"))
+        # Overwrite source/source_id even if the incoming row has a None value,
+        # so that fusion paths that pre-populate these keys don't block
+        # enrichment.
+        if "agent" not in d or d.get("agent") is None:
+            d["agent"] = meta.get("agent")
+        if "agent_id" not in d or d.get("agent_id") is None:
+            d["agent_id"] = meta.get("agent")
+        if "source" not in d or d.get("source") is None:
+            d["source"] = meta.get("source")
+        if "source_id" not in d or d.get("source_id") is None:
+            d["source_id"] = meta.get("source_id")
         raw_meta = meta.get("metadata")
         if isinstance(raw_meta, str) and raw_meta:
             try:
@@ -433,37 +447,34 @@ def _bm25_candidates(
 
 
 def _rrf_fuse(
-    kw: list[dict[str, Any]], sem: list[dict[str, Any]]
+    kw: list[dict[str, Any]],
+    sem: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
     """Reciprocal Rank Fusion: score = sum(1 / (k + rank)) over ranked lists."""
     scores: dict[str, float] = {}
     meta: dict[str, dict[str, Any]] = {}
 
+    def _rrf_meta(r: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "id": r["id"],
+            "content": r.get("content", ""),
+            "visibility": r.get("visibility", "private"),
+            "agent_id": r.get("agent_id"),
+            "created_at": r.get("created_at"),
+            "updated_at": r.get("updated_at"),
+        }
+
     for rank, r in enumerate(kw):
         mid = r["id"]
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (RRF_K + rank + 1)
         if mid not in meta:
-            meta[mid] = {
-                "id": mid,
-                "content": r.get("content", ""),
-                "visibility": r.get("visibility", "private"),
-                "agent_id": r.get("agent_id"),
-                "created_at": r.get("created_at"),
-                "updated_at": r.get("updated_at"),
-            }
+            meta[mid] = _rrf_meta(r)
 
     for rank, r in enumerate(sem):
         mid = r["id"]
         scores[mid] = scores.get(mid, 0.0) + 1.0 / (RRF_K + rank + 1)
         if mid not in meta:
-            meta[mid] = {
-                "id": mid,
-                "content": r.get("content", ""),
-                "visibility": r.get("visibility", "private"),
-                "agent_id": r.get("agent_id"),
-                "created_at": r.get("created_at"),
-                "updated_at": r.get("updated_at"),
-            }
+            meta[mid] = _rrf_meta(r)
 
     fused: list[dict[str, Any]] = []
     for mid, score in scores.items():
@@ -472,6 +483,39 @@ def _rrf_fuse(
         fused.append(d)
     fused.sort(key=lambda x: x["score"], reverse=True)
     return fused
+
+
+def _apply_source_weights(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Re-balance RRF scores so small precise facts compete with long vault notes.
+
+    Multipliers are intentionally mild (not a hard filter) so a directly
+    matching vault note can still rank first when it is genuinely the best
+    match.
+    """
+    weights = {
+        "conversation": 1.3,
+        "manual": 1.3,
+        "import": 1.3,
+        "hindsight": 1.3,
+        "dream": 1.1,
+        "cron": 1.1,
+        "sensor": 1.1,
+        "email": 1.1,
+        "vault": 0.7,
+    }
+    default_weight = 1.0
+    out: list[dict[str, Any]] = []
+    for r in results:
+        d = dict(r)
+        base = float(d.get("score", 0.0))
+        src = d.get("source") or "unknown"
+        weight = weights.get(src, default_weight)
+        d["score"] = base * weight
+        d["_rrf_base"] = base
+        d["_source_weight"] = weight
+        out.append(d)
+    out.sort(key=lambda x: x["score"], reverse=True)
+    return out
 
 
 __all__ = ["search"]

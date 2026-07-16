@@ -78,8 +78,8 @@ DEFAULT_PREFETCH_ENABLED = True
 # BM25 pre-filter cap before cosine is computed on candidates.
 SEMANTIC_CANDIDATE_LIMIT = 100
 # Minimum cosine similarity for semantic/auto results. Top semantic score below
-# this => no strong matches; return an empty list rather than noise.
-MIN_SEMANTIC_SCORE = 0.5
+# this => no strong matches; for ``auto`` strategy we still fall back to BM25.
+MIN_SEMANTIC_SCORE = 0.3
 # RRF constant for hybrid fusion.
 RRF_K = 60
 # Reflection input cap (top-N memories) and output cap.

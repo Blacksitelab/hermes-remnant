@@ -584,18 +584,20 @@ def test_semantic_below_threshold_returns_empty():
         ])
         # A relevant query: the fake embedder yields a cosine well below 1.0
         # (partial token overlap). Raising the threshold above that cosine
-        # must suppress all results.
+        # must suppress all semantic-only results. In ``auto`` mode we now fall
+        # back to BM25, so we only assert that semantic is empty.
         cfg.min_semantic_score = 0.99
         res_sem = hybrid_search(
             db, cfg, "dark mode preference", agent_id="default",
             strategy="semantic", embedder=emb,
         )
         assert res_sem == [], "semantic below threshold should return []"
+        # auto strategy now falls back to BM25 rather than returning [].
         res_auto = hybrid_search(
             db, cfg, "dark mode preference", agent_id="default",
             strategy="auto", embedder=emb,
         )
-        assert res_auto == [], "auto below threshold should return []"
+        assert res_auto, "auto below threshold should fall back to BM25"
     finally:
         db.close()
 
