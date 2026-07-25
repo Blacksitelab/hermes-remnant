@@ -421,6 +421,18 @@ ruff check remnant tests
 ruff check remnant tests --fix
 ```
 
+### Evaluate retrieval and inspect health
+
+Use a versioned JSON case file (`query`, `expected_ids`, optional strategy and
+agent scope) to measure recall@k, MRR, and latency without mutating memories:
+
+```bash
+python -m remnant.evaluate --cases retrieval-cases.json
+python -m remnant.maintenance health
+python -m remnant.maintenance migrate-default-agent --agent claire  # dry run
+python -m remnant.maintenance migrate-default-agent --agent claire --yes
+```
+
 ### Type check (optional)
 
 ```bash

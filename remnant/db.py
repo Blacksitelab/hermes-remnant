@@ -1530,6 +1530,27 @@ class RemnantDB:
         with self.transaction() as cur:
             return self._write_audit(cur, actor, action, memory_id, details or {})
 
+    def migrate_memory_agent(self, old_agent: str, new_agent: str) -> list[str]:
+        """Retag a legacy owner atomically and retain one audit event per row."""
+        with self.transaction() as cur:
+            cur.execute("SELECT id FROM memories WHERE agent=?", (old_agent,))
+            ids = [str(row["id"]) for row in cur.fetchall()]
+            if not ids:
+                return []
+            cur.execute(
+                "UPDATE memories SET agent=?, updated_at=? WHERE agent=?",
+                (new_agent, _now_iso(), old_agent),
+            )
+            for memory_id in ids:
+                self._write_audit(
+                    cur,
+                    "system",
+                    "migrate_legacy_agent",
+                    memory_id,
+                    {"from_agent": old_agent, "to_agent": new_agent},
+                )
+            return ids
+
     def list_audit(
         self,
         *,
