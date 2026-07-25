@@ -259,10 +259,15 @@ def prefetch(
 
     limit = cfg.search_limit
 
-    # Gather candidate memories across expanded queries via hybrid (auto) search.
+    # Run hybrid retrieval exactly once for the original request. Query
+    # expansion is useful lexical recall, but embedding every expansion turns a
+    # 500ms prefetch budget into several unbounded network requests.
     seen_ids: set[str] = set()
     merged: list[dict[str, Any]] = []
-    expansions = _expand_queries(query) or [query]
+    expansions = [query]
+    for term in _expand_queries(query):
+        if term and term not in expansions:
+            expansions.append(term)
 
     # Graph-based query expansion (Issue #28): resolve entity mentions
     # (including stopword-bearing phrases like "the printer") against the
@@ -283,7 +288,9 @@ def prefetch(
         try:
             results = hybrid_search(
                 db, cfg, term,
-                agent_id=agent_id, limit=limit, strategy="auto",
+                agent_id=agent_id,
+                limit=limit,
+                strategy="auto" if term == query else "keyword",
                 embedder=session_embedder,
             )
         except Exception:

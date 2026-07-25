@@ -98,6 +98,8 @@ def _do_update(
     before = db.get_memory(memory_id)
     if before is None:
         return {"error": f"memory not found: {memory_id}"}
+    if not _can_mutate(before, agent_id):
+        return {"error": "memory is owned by another agent"}
     # Reuse the old memory's scope defaults.
     vis = visibility or before.get("visibility") or config.default_visibility
     aid = agent_id or before.get("agent") or config.agent_id
@@ -161,6 +163,8 @@ def _do_merge(
         m = db.get_memory(mid)
         if m is None:
             return {"error": f"memory not found: {mid}"}
+        if not _can_mutate(m, agent_id):
+            return {"error": "memory is owned by another agent"}
         originals.append(m)
     # Inherit agent + visibility from the first original.
     first = originals[0]
@@ -219,6 +223,8 @@ def _do_forget(
     before = db.get_memory(memory_id)
     if before is None:
         return {"error": f"memory not found: {memory_id}"}
+    if not _can_mutate(before, agent_id):
+        return {"error": "memory is owned by another agent"}
     audit_id = db.set_memory_field(
         memory_id,
         "status",
@@ -252,6 +258,8 @@ def _do_feedback(
     before = db.get_memory(memory_id)
     if before is None:
         return {"error": f"memory not found: {memory_id}"}
+    if not _can_mutate(before, agent_id):
+        return {"error": "memory is owned by another agent"}
     delta = _FEEDBACK_DELTAS[fb]
     current = before.get("trust_score")
     base = float(current) if current is not None else 0.5
@@ -292,6 +300,8 @@ def _do_visibility(
     before = db.get_memory(memory_id)
     if before is None:
         return {"error": f"memory not found: {memory_id}"}
+    if not _can_mutate(before, agent_id):
+        return {"error": "memory is owned by another agent"}
     res = db.set_memory_field(
         memory_id,
         "visibility",
@@ -386,6 +396,19 @@ def _snapshot(mem: dict[str, Any]) -> dict[str, Any]:
         "trust_score": mem.get("trust_score"),
         "tags": mem.get("tags"),
     }
+
+
+def _can_mutate(memory: dict[str, Any], agent_id: str | None) -> bool:
+    """Provider edits are owner-only, including records shared for recall.
+
+    ``memory_edit`` is also a public low-level helper used by maintenance
+    scripts. Callers without an agent context retain the historical privileged
+    behavior; the Hermes provider always supplies one.
+    """
+    if agent_id is None:
+        return True
+    owner = memory.get("agent")
+    return bool(agent_id) and owner == agent_id
 
 
 _ACTIONS = {

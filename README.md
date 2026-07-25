@@ -194,10 +194,11 @@ The provider implements the Hermes `MemoryProvider` ABC:
 | `save_config(values, hermes_home)` | Persists config to YAML |
 | `system_prompt_block()` | Static, byte-stable tool description |
 | `sync_turn(...)` | Persist turn, enqueue extraction, non-blocking |
-| `prefetch(query, ...)` | Return relevant memories before LLM call |
-| `queue_prefetch(query)` | Best-effort prefetch warming |
+| `prefetch(query, ...)` | Return relevant memory context text before an LLM call |
 | `get_tool_schemas()` | Exposes all memory tools |
 | `handle_tool_call(tool_name, args, ...)` | Dispatches to internal tools |
+| `on_session_switch()` | Clears per-session recall state when Hermes rotates sessions |
+| `backup_paths()` | Declares the shared database for Hermes backups |
 | `shutdown()` | Stops worker, closes DB |
 
 Entry point:

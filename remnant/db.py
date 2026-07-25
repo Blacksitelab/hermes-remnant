@@ -294,7 +294,10 @@ class RemnantDB:
 
     def __init__(self, db_path: str | Path):
         self.path = str(db_path)
-        self._lock = threading.Lock()
+        # sqlite connections are not safe for overlapping cursor activity even
+        # with check_same_thread=False. WAL helps *separate connections*;
+        # this lock protects the provider's single shared connection.
+        self._lock = threading.RLock()
         self._conn = self._open()
         self._migrate()
 
@@ -482,12 +485,19 @@ class RemnantDB:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Cursor]:
-        """Read-only cursor (no lock; WAL allows concurrent readers)."""
-        cur = self._conn.cursor()
-        try:
-            yield cur
-        finally:
-            cur.close()
+        """Read-only cursor serialized on this connection.
+
+        WAL allows concurrent readers from different connections, but this
+        provider intentionally holds one connection shared by extraction,
+        prefetch, and tool calls. Serialize cursor use to avoid interleaved
+        statements and transaction state corruption.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+            finally:
+                cur.close()
 
     # -- prefetch stats --------------------------------------------------------
 
@@ -857,6 +867,45 @@ class RemnantDB:
             d = dict(r)
             d["embedding"] = _unpack_embedding(d["embedding"]) if d["embedding"] else []
             out.append(d)
+        return out
+
+    def search_all_embeddings(
+        self,
+        *,
+        agent_id: str | None = None,
+        visibility: str | None = None,
+        limit: int = 5_000,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, authorization-scoped embedding corpus.
+
+        Semantic retrieval must not be gated by lexical recall: a memory with
+        no shared words can still be the best answer. This exact scan is the
+        correct small-corpus implementation and has an explicit ceiling for a
+        future ANN replacement.
+        """
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at, m.updated_at, e.embedding "
+            "FROM memories m JOIN embeddings e ON e.memory_id = m.id "
+            "WHERE m.status='active'"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared', 'fleet'))"
+            params.append(agent_id)
+        if visibility is not None:
+            sql += " AND m.visibility=?"
+            params.append(visibility)
+        sql += " ORDER BY m.updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.read() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["embedding"] = _unpack_embedding(item["embedding"])
+            out.append(item)
         return out
 
     def search_all_active(

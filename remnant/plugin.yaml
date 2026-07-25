@@ -5,5 +5,4 @@ provides_hooks:
   - system_prompt_block
   - sync_turn
   - prefetch
-  - queue_prefetch
   - shutdown

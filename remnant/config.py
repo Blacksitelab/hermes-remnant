@@ -75,8 +75,10 @@ QUEUE_MAX = 256
 DEFAULT_INJECTION_TOKEN_BUDGET = 2000
 DEFAULT_INJECTION_PREFETCH_DEADLINE_MS = 500
 DEFAULT_PREFETCH_ENABLED = True
-# BM25 pre-filter cap before cosine is computed on candidates.
-SEMANTIC_CANDIDATE_LIMIT = 100
+# Upper bound for the local exact-vector scan. The default covers a personal
+# or small fleet store while keeping retrieval predictable; use an ANN index
+# once the corpus grows beyond this operational ceiling.
+SEMANTIC_SCAN_LIMIT = 5_000
 # Minimum cosine similarity for semantic/auto results. Top semantic score below
 # this => no strong matches; for ``auto`` strategy we still fall back to BM25.
 MIN_SEMANTIC_SCORE = 0.3
@@ -122,6 +124,7 @@ class RemnantConfig:
     search_limit: int = SEARCH_LIMIT
     min_semantic_score: float = MIN_SEMANTIC_SCORE
     default_search_strategy: str = "auto"
+    semantic_scan_limit: int = SEMANTIC_SCAN_LIMIT
     default_visibility: str = "private"
     agent_id: str = "default"
     queue_max: int = QUEUE_MAX
