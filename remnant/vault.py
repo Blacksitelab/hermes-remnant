@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ _FRONTMATTER_KEYS = ("type", "tags", "status", "created", "updated", "author", "
 # Only markdown notes are indexed. Non-markdown attachments live in the vault
 # but are out of scope for text indexing.
 _MARKDOWN_SUFFIXES = {".md", ".markdown"}
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 
 
 def _relative_path(absolute_path: str | Path, vault_root: str | Path) -> str:
@@ -180,6 +182,56 @@ def _tags_for(frontmatter: dict[str, Any]) -> list[str] | None:
     return None
 
 
+def _split_passages(body: str, max_chars: int, overlap: int) -> list[dict[str, Any]]:
+    """Split a note into heading-aware, overlapping retrieval passages."""
+    text = (body or "").strip()
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return [{"content": text, "heading_path": "", "start": 0, "end": len(text)}]
+    headings: list[str] = []
+    sections: list[tuple[str, str, int]] = []
+    section_start = 0
+    current_heading = ""
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        match = _HEADING_RE.match(line.strip())
+        if match:
+            if offset > section_start:
+                sections.append((text[section_start:offset], current_heading, section_start))
+            level = len(match.group(1))
+            headings = headings[: level - 1]
+            headings.append(match.group(2).strip())
+            current_heading = " > ".join(headings)
+            section_start = offset
+        offset += len(line)
+    if section_start < len(text):
+        sections.append((text[section_start:], current_heading, section_start))
+
+    out: list[dict[str, Any]] = []
+    step_overlap = max(0, min(overlap, max_chars // 2))
+    for section, heading_path, base in sections:
+        start = 0
+        while start < len(section):
+            end = min(len(section), start + max_chars)
+            # Prefer a paragraph or line boundary within the last quarter.
+            if end < len(section):
+                boundary = max(section.rfind("\n\n", start + max_chars * 3 // 4, end),
+                               section.rfind("\n", start + max_chars * 3 // 4, end))
+                if boundary > start:
+                    end = boundary
+            content = section[start:end].strip()
+            if content:
+                out.append({
+                    "content": content,
+                    "heading_path": heading_path,
+                    "start": base + start,
+                    "end": base + end,
+                })
+            if end >= len(section):
+                break
+            start = max(end - step_overlap, start + 1)
+    return out or [{"content": text, "heading_path": "", "start": 0, "end": len(text)}]
+
+
 def index_file(
     db: RemnantDB,
     config: RemnantConfig,
@@ -231,55 +283,75 @@ def index_file(
         body = _title_from(rel, raw)
 
     title = _title_from(rel, body)
-    content = body.strip() or title
+    passages = _split_passages(
+        body.strip() or title,
+        config.vault_passage_chars,
+        config.vault_passage_overlap,
+    )
     metadata = _build_metadata(frontmatter, rel)
     tags = _tags_for(frontmatter)
     locked = bool(frontmatter.get("locked"))
     if locked:
         metadata["locked"] = True
 
-    # Embed the body (frontmatter stripped). Cached by the embedder.
-    embedding = embedder.embed(content) if embedder else None
     embed_model = getattr(embedder, "_model", None) if embedder else None
+    existing_passages = {p["ordinal"]: p["memory_id"] for p in db.get_vault_passages(rel)}
+    # Migrate a legacy one-memory note in place: it becomes the first passage.
+    if not existing_passages and existing_mid:
+        existing_passages[0] = existing_mid
 
-    if existing_mid:
-        # Update the existing memory in place, preserving memory_id, entity
-        # links, trust_score, retrieval history, etc. Only the content-bearing
-        # columns are rewritten; the vault_files row is updated below.
-        db.update_memory_content(
-            existing_mid,
-            content=content,
-            tags=tags,
-            metadata=metadata,
-            embedding=embedding or None,
-            embed_model=embed_model,
+    memory_ids: list[str] = []
+    for ordinal, passage in enumerate(passages):
+        content = passage["content"]
+        passage_metadata = {
+            **metadata,
+            "title": title,
+            "parent_vault_path": rel,
+            "passage_ordinal": ordinal,
+            "heading_path": passage["heading_path"],
+            "start_offset": passage["start"],
+            "end_offset": passage["end"],
+        }
+        embedding = embedder.embed(content) if embedder else None
+        existing_passage_id = existing_passages.get(ordinal)
+        if existing_passage_id:
+            db.update_memory_content(
+                existing_passage_id,
+                content=content,
+                tags=tags,
+                metadata=passage_metadata,
+                embedding=embedding or None,
+                embed_model=embed_model,
+            )
+            mid = existing_passage_id
+        else:
+            mid = db.insert_memory(
+                content=content,
+                source="vault",
+                source_id=rel if ordinal == 0 else f"{rel}#p{ordinal}",
+                agent=config.agent_id,
+                visibility=config.default_visibility,
+                type="document",
+                tags=tags,
+                metadata=passage_metadata,
+                confidence=1.0,
+                trust_score=0.8,
+                embedding=embedding or None,
+                embed_model=embed_model,
+            )
+        db.set_vault_passage(
+            rel, ordinal, mid, passage["heading_path"], passage["start"], passage["end"]
         )
-        mid = existing_mid
-    else:
-        mid = db.insert_memory(
-            content=content,
-            source="vault",
-            source_id=rel,
-            agent=config.agent_id,
-            visibility=config.default_visibility,
-            type="document",
-            tags=tags,
-            metadata=metadata,
-            confidence=1.0,
-            trust_score=0.8,
-            embedding=embedding or None,
-            embed_model=embed_model,
+        extract_and_link_entities(
+            db, memory_id=mid, text=content,
+            typed_entities=None, agent_id=config.agent_id,
+            min_memories=1,
         )
-    db.set_vault_hash(rel, hash_hex, memory_id=mid)
+        memory_ids.append(mid)
 
-    # Re-extract and re-link entities for the (possibly updated) content so the
-    # entity graph tracks the current body. Existing links are preserved.
-    extract_and_link_entities(
-        db, memory_id=mid, text=body,
-        typed_entities=None, agent_id=config.agent_id,
-        min_memories=1,
-    )
-    return mid
+    db.forget_vault_passages_after(rel, len(passages) - 1)
+    db.set_vault_hash(rel, hash_hex, memory_id=memory_ids[0])
+    return memory_ids[0]
 
 
 def index_vault(

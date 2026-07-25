@@ -2,9 +2,8 @@
 
 Strategies:
 - ``keyword``: BM25 over the FTS5 index. The Phase 1 behavior.
-- ``semantic``: cosine similarity over stored embeddings. To avoid scanning
-  the whole database, embeddings are only loaded for a BM25-pre-filtered
-  candidate set (capped by ``SEMANTIC_CANDIDATE_LIMIT``).
+- ``semantic``: cosine similarity over a bounded, authorization-scoped vector
+  corpus. This keeps lexical mismatch from hiding semantically relevant facts.
 - ``auto`` (default): Reciprocal Rank Fusion (RRF, k=60) of BM25 + semantic.
   Results below ``min_semantic_score`` (top semantic score) are dropped to
   avoid returning keyword-dominated noise for semantically unrelated queries.
@@ -18,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from .config import RRF_K, SEMANTIC_CANDIDATE_LIMIT, RemnantConfig
+from .config import RRF_K, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder, cosine
 
@@ -158,7 +157,6 @@ def search(
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
         results = results[:limit]
-        _reinforce(db, config, results, query=query, strategy=strategy)
         return results
 
     if strategy == "keyword":
@@ -170,7 +168,6 @@ def search(
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
         results = results[:limit]
-        _reinforce(db, config, results, query=query, strategy=strategy)
         return results
 
     if strategy == "semantic":
@@ -184,13 +181,12 @@ def search(
         ranked = _scope_filter(ranked, visibility)
         ranked = _mask_locked(ranked, viewer_agent=viewer)
         ranked = ranked[:limit]
-        _reinforce(db, config, ranked, query=query, strategy=strategy)
         return ranked
 
     # auto: RRF fusion. If the top semantic score is below threshold, the
     # semantic signal is too weak for fusion, so we fall back to BM25-only
     # results instead of returning an empty list.
-    kw = db.search_bm25(query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
+    kw = db.search_bm25(query, agent_id=agent_id, limit=max(limit * 3, 100))
     sem = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
     if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
         results = _attach_source(db, kw)
@@ -198,7 +194,6 @@ def search(
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
         results = results[:limit]
-        _reinforce(db, config, results, query=query, strategy="keyword_fallback")
         return results
     fused = _rrf_fuse(kw, sem)
     fused = _attach_source(db, fused)
@@ -207,51 +202,7 @@ def search(
     fused = _scope_filter(fused, visibility)
     fused = _mask_locked(fused, viewer_agent=viewer)
     fused = fused[:limit]
-    _reinforce(db, config, fused, query=query, strategy=strategy)
     return fused
-
-
-def _reinforce(
-    db: RemnantDB,
-    config: RemnantConfig,
-    results: list[dict[str, Any]],
-    *,
-    query: str,
-    strategy: str,
-) -> None:
-    """Retrieval reinforcement (issue #11 + #16).
-
-    For each distinct memory id in ``results``:
-      1. Decay the current trust_score by age since last update.
-      2. Bump seen_count.
-      3. Add +0.02 trust_score (capped at 0.95).
-
-    Time decay uses a configurable half-life; scores cannot fall below
-    ``config.trust_decay_floor``. Decay is skipped when disabled.
-    """
-    seen: set[str] = set()
-    now = _utc_now()
-    for r in results:
-        mid = r.get("id")
-        if not mid or mid in seen:
-            continue
-        seen.add(mid)
-        mem = db.get_memory(mid)
-        if mem is None:
-            continue
-        updated_at = mem.get("updated_at") or mem.get("created_at")
-        current = float(mem.get("trust_score") or 0.5)
-        decayed = _apply_decay(current, updated_at, now, config)
-        db.increment_seen_count(mid)
-        new_score = min(decayed + 0.02, 0.95)
-        db.set_memory_field(
-            mid,
-            "trust_score",
-            new_score,
-            actor="system",
-            action="trust_reinforce",
-            details={"query": query, "strategy": strategy, "decayed_from": current},
-        )
 
 
 def _apply_decay(
@@ -391,13 +342,7 @@ def _semantic_rank(
     agent_id: str | None = None,
     embedder: Embedder | None = None,
 ) -> list[dict[str, Any]]:
-    """Cosine-rank memories over a BM25-pre-filtered candidate set.
-
-    Pre-filter with BM25 (cap ~100), load embeddings only for those ids, then
-    compute cosine against the query embedding. Falls back to recency-ordered
-    active memories if BM25 yields nothing (so semantic still works for terms
-    not in the FTS index but present as embeddings).
-    """
+    """Cosine-rank the bounded, authorization-scoped vector corpus."""
     if embedder is None:
         return []
     qvec = embedder.embed(query)
@@ -407,17 +352,10 @@ def _semantic_rank(
         # zero vector.
         return []
 
-    candidates = _bm25_candidates(db, query, agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
-    if not candidates:
-        # Fall back to recent active memories (still bounded) so semantic search
-        # works even when the query terms are not in the FTS index.
-        recent = db.search_all_active(agent_id=agent_id, limit=SEMANTIC_CANDIDATE_LIMIT)
-        candidates = [{"id": r["id"]} for r in recent]
-    if not candidates:
-        return []
-
-    ids = [c["id"] for c in candidates]
-    rows = db.search_by_embedding(ids, agent_id=agent_id)
+    rows = db.search_all_embeddings(
+        agent_id=agent_id,
+        limit=config.semantic_scan_limit,
+    )
     scored: list[dict[str, Any]] = []
     for r in rows:
         vec = r.get("embedding") or []
@@ -436,14 +374,6 @@ def _semantic_rank(
         scored.append(d)
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
-
-
-def _bm25_candidates(
-    db: RemnantDB, query: str, *, agent_id: str | None = None, limit: int
-) -> list[dict[str, Any]]:
-    """Pre-filter candidates via BM25 before computing cosine. Cheap + local."""
-    rows = db.search_bm25(query, agent_id=agent_id, limit=limit)
-    return [{"id": r["id"]} for r in rows]
 
 
 def _rrf_fuse(

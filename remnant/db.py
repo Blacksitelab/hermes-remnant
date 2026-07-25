@@ -21,7 +21,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -190,6 +190,39 @@ CREATE TABLE IF NOT EXISTS vault_files (
 CREATE INDEX IF NOT EXISTS idx_vault_hash ON vault_files(hash);
 CREATE INDEX IF NOT EXISTS idx_vault_memory ON vault_files(memory_id);
 
+CREATE TABLE IF NOT EXISTS vault_passages (
+    path TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    memory_id TEXT NOT NULL,
+    heading_path TEXT,
+    start_offset INTEGER,
+    end_offset INTEGER,
+    PRIMARY KEY(path, ordinal),
+    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_vault_passages_memory ON vault_passages(memory_id);
+
+-- Structured claim projections retain a versioned, queryable view of facts.
+-- The backing memory is always the source of truth and is never overwritten.
+CREATE TABLE IF NOT EXISTS claims (
+    id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL UNIQUE,
+    subject TEXT NOT NULL,
+    predicate TEXT NOT NULL,
+    object TEXT NOT NULL,
+    qualifiers TEXT,
+    confidence REAL DEFAULT 0.5,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'superseded', 'contradicted')),
+    valid_from TEXT,
+    valid_to TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_claims_subject_predicate
+    ON claims(subject, predicate, status, updated_at);
+
 -- Phase 5: topic threads + dream-loop machine state.
 CREATE TABLE IF NOT EXISTS threads (
     id TEXT PRIMARY KEY,
@@ -294,7 +327,10 @@ class RemnantDB:
 
     def __init__(self, db_path: str | Path):
         self.path = str(db_path)
-        self._lock = threading.Lock()
+        # sqlite connections are not safe for overlapping cursor activity even
+        # with check_same_thread=False. WAL helps *separate connections*;
+        # this lock protects the provider's single shared connection.
+        self._lock = threading.RLock()
         self._conn = self._open()
         self._migrate()
 
@@ -482,12 +518,19 @@ class RemnantDB:
 
     @contextmanager
     def read(self) -> Iterator[sqlite3.Cursor]:
-        """Read-only cursor (no lock; WAL allows concurrent readers)."""
-        cur = self._conn.cursor()
-        try:
-            yield cur
-        finally:
-            cur.close()
+        """Read-only cursor serialized on this connection.
+
+        WAL allows concurrent readers from different connections, but this
+        provider intentionally holds one connection shared by extraction,
+        prefetch, and tool calls. Serialize cursor use to avoid interleaved
+        statements and transaction state corruption.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                yield cur
+            finally:
+                cur.close()
 
     # -- prefetch stats --------------------------------------------------------
 
@@ -726,6 +769,96 @@ class RemnantDB:
                 (_now_iso(), memory_id),
             )
 
+    # -- structured claims ----------------------------------------------------
+
+    def create_claim(
+        self,
+        *,
+        memory_id: str,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float = 0.5,
+        qualifiers: dict[str, Any] | None = None,
+        status: str = "active",
+    ) -> str:
+        """Create a versioned claim projection backed by ``memory_id``."""
+        now = _now_iso()
+        claim_id = _uuid()
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT INTO claims(id, memory_id, subject, predicate, object, qualifiers, "
+                "confidence, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (
+                    claim_id, memory_id, subject, predicate, object,
+                    json.dumps(qualifiers, default=str) if qualifiers else None,
+                    confidence, status, now, now,
+                ),
+            )
+        return claim_id
+
+    def supersede_claims(
+        self, *, subject: str, predicate: str, except_memory_id: str | None = None
+    ) -> list[str]:
+        """Mark active conflicting versions as superseded and retain their history."""
+        with self.transaction() as cur:
+            sql = (
+                "SELECT id FROM claims WHERE subject=? COLLATE NOCASE "
+                "AND predicate=? COLLATE NOCASE AND status='active'"
+            )
+            params: list[Any] = [subject, predicate]
+            if except_memory_id:
+                sql += " AND memory_id<>?"
+                params.append(except_memory_id)
+            cur.execute(sql, params)
+            ids = [str(row["id"]) for row in cur.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                cur.execute(
+                    f"UPDATE claims SET status='superseded', valid_to=?, updated_at=? "
+                    f"WHERE id IN ({placeholders})",
+                    [_now_iso(), _now_iso(), *ids],
+                )
+            return ids
+
+    def get_claim_for_memory(self, memory_id: str) -> dict[str, Any] | None:
+        with self.read() as cur:
+            cur.execute("SELECT * FROM claims WHERE memory_id=?", (memory_id,))
+            row = cur.fetchone()
+        if row is None:
+            return None
+        claim = dict(row)
+        if claim.get("qualifiers"):
+            try:
+                claim["qualifiers"] = json.loads(claim["qualifiers"])
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return claim
+
+    def get_active_claim(self, subject: str, predicate: str) -> dict[str, Any] | None:
+        """Return the newest active version of a subject/predicate claim."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM claims WHERE subject=? COLLATE NOCASE "
+                "AND predicate=? COLLATE NOCASE AND status='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (subject, predicate),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_claims_for_memories(self, memory_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Return claim projections keyed by backing memory id in one query."""
+        if not memory_ids:
+            return {}
+        placeholders = ",".join("?" for _ in memory_ids)
+        with self.read() as cur:
+            cur.execute(
+                f"SELECT * FROM claims WHERE memory_id IN ({placeholders})",
+                memory_ids,
+            )
+            return {str(row["memory_id"]): dict(row) for row in cur.fetchall()}
+
     def hard_delete_memory(self, memory_id: str) -> bool:
         """Permanently delete a memory and its cascading rows.
 
@@ -857,6 +990,45 @@ class RemnantDB:
             d = dict(r)
             d["embedding"] = _unpack_embedding(d["embedding"]) if d["embedding"] else []
             out.append(d)
+        return out
+
+    def search_all_embeddings(
+        self,
+        *,
+        agent_id: str | None = None,
+        visibility: str | None = None,
+        limit: int = 5_000,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded, authorization-scoped embedding corpus.
+
+        Semantic retrieval must not be gated by lexical recall: a memory with
+        no shared words can still be the best answer. This exact scan is the
+        correct small-corpus implementation and has an explicit ceiling for a
+        future ANN replacement.
+        """
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at, m.updated_at, e.embedding "
+            "FROM memories m JOIN embeddings e ON e.memory_id = m.id "
+            "WHERE m.status='active'"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared', 'fleet'))"
+            params.append(agent_id)
+        if visibility is not None:
+            sql += " AND m.visibility=?"
+            params.append(visibility)
+        sql += " ORDER BY m.updated_at DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.read() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["embedding"] = _unpack_embedding(item["embedding"])
+            out.append(item)
         return out
 
     def search_all_active(
@@ -1481,6 +1653,27 @@ class RemnantDB:
         with self.transaction() as cur:
             return self._write_audit(cur, actor, action, memory_id, details or {})
 
+    def migrate_memory_agent(self, old_agent: str, new_agent: str) -> list[str]:
+        """Retag a legacy owner atomically and retain one audit event per row."""
+        with self.transaction() as cur:
+            cur.execute("SELECT id FROM memories WHERE agent=?", (old_agent,))
+            ids = [str(row["id"]) for row in cur.fetchall()]
+            if not ids:
+                return []
+            cur.execute(
+                "UPDATE memories SET agent=?, updated_at=? WHERE agent=?",
+                (new_agent, _now_iso(), old_agent),
+            )
+            for memory_id in ids:
+                self._write_audit(
+                    cur,
+                    "system",
+                    "migrate_legacy_agent",
+                    memory_id,
+                    {"from_agent": old_agent, "to_agent": new_agent},
+                )
+            return ids
+
     def list_audit(
         self,
         *,
@@ -1561,6 +1754,50 @@ class RemnantDB:
                 (path, hash_hex, memory_id, _now_iso()),
             )
 
+    def get_vault_passages(self, path: str) -> list[dict[str, Any]]:
+        """Return passage mappings for one vault path in ordinal order."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT path, ordinal, memory_id, heading_path, start_offset, end_offset "
+                "FROM vault_passages WHERE path=? ORDER BY ordinal",
+                (path,),
+            )
+            return [dict(row) for row in cur.fetchall()]
+
+    def set_vault_passage(
+        self,
+        path: str,
+        ordinal: int,
+        memory_id: str,
+        heading_path: str,
+        start_offset: int,
+        end_offset: int,
+    ) -> None:
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO vault_passages "
+                "(path, ordinal, memory_id, heading_path, start_offset, end_offset) "
+                "VALUES(?,?,?,?,?,?)",
+                (path, ordinal, memory_id, heading_path, start_offset, end_offset),
+            )
+
+    def forget_vault_passages_after(self, path: str, ordinal: int) -> list[str]:
+        """Forget obsolete passages after a note shrinks; return memory ids."""
+        with self.transaction() as cur:
+            cur.execute(
+                "SELECT memory_id FROM vault_passages WHERE path=? AND ordinal>?",
+                (path, ordinal),
+            )
+            ids = [str(row["memory_id"]) for row in cur.fetchall()]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                cur.execute(
+                    f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                    [_now_iso(), *ids],
+                )
+            cur.execute("DELETE FROM vault_passages WHERE path=? AND ordinal>?", (path, ordinal))
+            return ids
+
     def get_all_vault_files(self) -> list[dict[str, Any]]:
         """Return all known vault_files rows: {path, hash, memory_id, indexed_at}."""
         with self.read() as cur:
@@ -1600,13 +1837,18 @@ class RemnantDB:
             cur.execute("SELECT memory_id FROM vault_files WHERE path=?", (path,))
             row = cur.fetchone()
             mid = row["memory_id"] if row else None
-            if mid:
+            cur.execute("SELECT memory_id FROM vault_passages WHERE path=?", (path,))
+            passage_ids = [str(r["memory_id"]) for r in cur.fetchall()]
+            ids = list(dict.fromkeys(([str(mid)] if mid else []) + passage_ids))
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
                 cur.execute(
-                    "UPDATE memories SET status='forgotten', updated_at=? WHERE id=?",
-                    (_now_iso(), mid),
+                    f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                    [_now_iso(), *ids],
                 )
+            cur.execute("DELETE FROM vault_passages WHERE path=?", (path,))
             cur.execute("DELETE FROM vault_files WHERE path=?", (path,))
-        return mid
+        return str(ids[0]) if ids else None
 
     def mark_vault_forgotten_for_missing(
         self, present_paths: set[str]
@@ -1622,13 +1864,18 @@ class RemnantDB:
             for r in rows:
                 if r["path"] in present_paths:
                     continue
+                cur.execute("SELECT memory_id FROM vault_passages WHERE path=?", (r["path"],))
+                passage_ids = [str(p["memory_id"]) for p in cur.fetchall()]
                 mid = r["memory_id"]
-                if mid:
+                ids = list(dict.fromkeys(([str(mid)] if mid else []) + passage_ids))
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
                     cur.execute(
-                        "UPDATE memories SET status='forgotten', updated_at=? WHERE id=?",
-                        (_now_iso(), mid),
+                        f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                        [_now_iso(), *ids],
                     )
-                    forgotten.append(mid)
+                    forgotten.extend(ids)
+                cur.execute("DELETE FROM vault_passages WHERE path=?", (r["path"],))
                 cur.execute("DELETE FROM vault_files WHERE path=?", (r["path"],))
         return forgotten
 

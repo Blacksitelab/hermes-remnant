@@ -1,0 +1,103 @@
+"""Safe operational maintenance for a shared Remnant database.
+
+The commands here are deliberately explicit and dry-run first.  They are for
+operators, not agent tools: agents must not be able to retag ownership or run
+database maintenance through the model-facing memory surface.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from collections import Counter
+from typing import Any, Sequence
+
+from .db import RemnantDB, default_db_path, open_db
+
+
+def health_report(db: RemnantDB) -> dict[str, Any]:
+    """Return bounded health signals needed to operate the memory service."""
+    with db.read() as cur:
+        cur.execute("SELECT status, COUNT(*) AS count FROM memories GROUP BY status")
+        memories = {row["status"]: int(row["count"]) for row in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) AS count FROM embeddings")
+        embeddings = int(cur.fetchone()["count"])
+        cur.execute("SELECT status, COUNT(*) AS count FROM extraction_queue GROUP BY status")
+        extraction = {row["status"]: int(row["count"]) for row in cur.fetchall()}
+        cur.execute("SELECT outcome, COUNT(*) AS count FROM prefetch_stats GROUP BY outcome")
+        prefetch = {row["outcome"]: int(row["count"]) for row in cur.fetchall()}
+        cur.execute("SELECT COUNT(*) AS count FROM memories_fts")
+        fts_rows = int(cur.fetchone()["count"])
+        cur.execute("SELECT COUNT(*) AS count FROM memories")
+        memory_rows = int(cur.fetchone()["count"])
+        cur.execute("PRAGMA integrity_check")
+        integrity = str(cur.fetchone()[0])
+    return {
+        "integrity": integrity,
+        "memories_by_status": memories,
+        "memory_rows": memory_rows,
+        "fts_rows": fts_rows,
+        "embedding_coverage": round(embeddings / memory_rows, 4) if memory_rows else 1.0,
+        "embeddings": embeddings,
+        "extraction_queue": extraction,
+        "prefetch_outcomes": prefetch,
+    }
+
+
+def migrate_legacy_default_agent(
+    db: RemnantDB,
+    *,
+    target_agent: str,
+    dry_run: bool = True,
+) -> dict[str, Any]:
+    """Retag legacy ``agent='default'`` rows with an explicit owner.
+
+    This migration is intentionally opt-in: it cannot infer ownership safely.
+    It also leaves provenance and visibility untouched, so operators can audit
+    the exact target before applying it.
+    """
+    target = (target_agent or "").strip()
+    if not target or target == "default":
+        raise ValueError("target_agent must be a non-default explicit agent id")
+    with db.read() as cur:
+        cur.execute("SELECT id, status, source, visibility FROM memories WHERE agent='default'")
+        rows = [dict(row) for row in cur.fetchall()]
+    by_status = dict(Counter(str(row["status"]) for row in rows))
+    if not dry_run and rows:
+        db.migrate_memory_agent("default", target)
+    return {
+        "dry_run": dry_run,
+        "target_agent": target,
+        "would_migrate": len(rows),
+        "migrated": 0 if dry_run else len(rows),
+        "by_status": by_status,
+    }
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Inspect and maintain Remnant safely.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("health", help="Print database health as JSON.")
+    migrate = subparsers.add_parser("migrate-default-agent", help="Retag legacy default-owned memories.")
+    migrate.add_argument("--agent", required=True, help="Explicit owner to assign to legacy rows.")
+    migrate.add_argument("--dry-run", action="store_true", help="Preview only; this is the default.")
+    migrate.add_argument("--yes", action="store_true", help="Apply the migration.")
+    args = parser.parse_args(argv)
+    db = open_db(default_db_path())
+    try:
+        if args.command == "health":
+            print(json.dumps(health_report(db), indent=2, sort_keys=True))
+            return 0
+        if not args.yes:
+            result = migrate_legacy_default_agent(db, target_agent=args.agent, dry_run=True)
+            print(json.dumps(result, indent=2, sort_keys=True))
+            return 0
+        result = migrate_legacy_default_agent(db, target_agent=args.agent, dry_run=False)
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

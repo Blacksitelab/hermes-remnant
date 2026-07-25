@@ -15,6 +15,7 @@ import logging
 import re
 from typing import Any
 
+from .claims import record_claim_from_memory
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder, cosine
@@ -253,6 +254,18 @@ def store_memory(
             agent_id=agent_id,
             text=source_text or fact,
         )
+
+    # Project the source-backed fact into a versioned claim.  The original
+    # memory remains authoritative; claims only make its subject/predicate
+    # history explicit for retrieval and inspection.
+    record_claim_from_memory(
+        db,
+        memory_id=mid,
+        subject=entity,
+        fact=fact,
+        confidence=0.5,
+        contradicted=bool(contradiction_targets),
+    )
 
     # Corroboration boost (issue #11): for each entity linked to this new
     # memory, find other active memories sharing the entity and bump their

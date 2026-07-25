@@ -385,6 +385,7 @@ def handle_tool_call(
             strategy=strategy, embedder=embedder,
             profile_scope=profile_scope,
         )
+        claims = db.get_claims_for_memories([str(r["id"]) for r in results])
         return {
             "results": [
                 {
@@ -396,6 +397,16 @@ def handle_tool_call(
                     "source_id": r.get("source_id"),
                     "locked": r.get("locked", False),
                     "score": round(r.get("score", 0.0), 4),
+                    **({
+                        "claim": {
+                            "subject": claims[r["id"]]["subject"],
+                            "predicate": claims[r["id"]]["predicate"],
+                            "object": claims[r["id"]]["object"],
+                            "status": claims[r["id"]]["status"],
+                            "valid_from": claims[r["id"]].get("valid_from"),
+                            "valid_to": claims[r["id"]].get("valid_to"),
+                        }
+                    } if r["id"] in claims else {}),
                 }
                 for r in results
             ],

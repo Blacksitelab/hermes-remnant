@@ -246,9 +246,8 @@ def test_corroboration_boost_raises_shared_entity_trust(hermes_home: Path):
 # ===========================================================================
 
 
-def test_search_reinforces_returned_memories(hermes_home: Path):
-    """A search increments seen_count and bumps trust_score by +0.02 (cap
-    0.95) for each returned memory."""
+def test_search_does_not_mutate_returned_memories(hermes_home: Path):
+    """Retrieval is read-only; exposure is not evidence of truth or reuse."""
     db = _open_db(hermes_home)
     cfg = RemnantConfig(default_search_strategy="keyword", trust_decay_enabled=False)
     emb = _fake_embed(db, cfg)
@@ -271,14 +270,14 @@ def test_search_reinforces_returned_memories(hermes_home: Path):
         assert any(r["id"] == mid for r in results)
 
         after = db.get_memory(mid)
-        assert after["seen_count"] == before_seen + 1
-        assert after["trust_score"] == pytest.approx(min(before_trust + 0.02, 0.95))
+        assert after["seen_count"] == before_seen
+        assert after["trust_score"] == pytest.approx(before_trust)
     finally:
         db.close()
 
 
-def test_trust_decay_lowers_stale_memories(hermes_home: Path):
-    """A stale memory decays before reinforcement."""
+def test_search_does_not_decay_stale_memories(hermes_home: Path):
+    """Decay is batch maintenance, never a surprise query-side write."""
     db = _open_db(hermes_home)
     cfg = RemnantConfig(default_search_strategy="keyword",
                         trust_decay_enabled=True,
@@ -307,15 +306,13 @@ def test_trust_decay_lowers_stale_memories(hermes_home: Path):
 
         after = db.get_memory(mid)
         assert after is not None
-        expected_decayed = before_trust * 0.5
-        expected = min(expected_decayed + 0.02, 0.95)
-        assert after["trust_score"] == pytest.approx(expected, abs=0.01)
+        assert after["trust_score"] == pytest.approx(before_trust)
     finally:
         db.close()
 
 
-def test_trust_decay_disabled_skips_decay(hermes_home: Path):
-    """When time decay is disabled, only reinforcement applies."""
+def test_search_does_not_mutate_when_decay_disabled(hermes_home: Path):
+    """Read-only retrieval is independent of the decay configuration."""
     db = _open_db(hermes_home)
     cfg = RemnantConfig(default_search_strategy="keyword", trust_decay_enabled=False)
     emb = _fake_embed(db, cfg)
@@ -340,7 +337,7 @@ def test_trust_decay_disabled_skips_decay(hermes_home: Path):
 
         after = db.get_memory(mid)
         assert after is not None
-        assert after["trust_score"] == pytest.approx(min(before_trust + 0.02, 0.95))
+        assert after["trust_score"] == pytest.approx(before_trust)
     finally:
         db.close()
 

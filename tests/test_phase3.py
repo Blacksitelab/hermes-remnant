@@ -560,6 +560,21 @@ def test_edit_forget_missing_memory(hermes_home: Path):
         db.close()
 
 
+def test_edit_rejects_foreign_agent_memory(hermes_home: Path):
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    emb = _fake_embed(db, cfg)
+    try:
+        mid = _store_one(db, emb, cfg, agent_id="owner")
+        res = memory_edit(
+            db, cfg, emb, action="forget", actor="viewer", agent_id="viewer", memory_id=mid,
+        )
+        assert res == {"error": "memory is owned by another agent"}
+        assert db.get_memory(mid)["status"] == "active"
+    finally:
+        db.close()
+
+
 def test_edit_feedback_raises_trust(hermes_home: Path):
     db = _open_db(hermes_home)
     cfg = RemnantConfig()

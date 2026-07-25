@@ -7,13 +7,11 @@ This script recalibrates trust scores using multiple signals:
    > conversation (0.5) > hindsight (0.5)
 2. **Confidence**: higher confidence → higher baseline trust
 3. **Verified status**: verified memories get +0.1
-4. **Engagement**: seen_count > 1 → boost (retrieved and not forgotten = useful)
-5. **Recency**: recent memories get a small boost over old ones
+4. **Recency**: recent memories get a small boost over old ones
 
 The formula:
   base = confidence  (already set per-source on ingestion)
   if verified: base += 0.1
-  if seen_count > 1: base += min(0.05 * (seen_count - 1), 0.15)
   recency_boost = min(age_factor * 0.05, 0.05)  # up to +0.05 for very recent
   trust = min(base + recency_boost, 0.95)
 
@@ -31,6 +29,8 @@ import logging
 import sqlite3
 from collections import Counter
 from datetime import datetime
+
+from .db import default_db_path
 
 log = logging.getLogger("remnant.calibrate_trust")
 
@@ -50,7 +50,7 @@ def calibrate_trust(db_path: str, dry_run: bool = True) -> dict:
     c = conn.cursor()
 
     c.execute("""
-        SELECT id, source, confidence, trust_score, verified, seen_count, 
+        SELECT id, source, confidence, trust_score, verified,
                created_at, updated_at
         FROM memories 
         WHERE status = 'active'
@@ -67,11 +67,10 @@ def calibrate_trust(db_path: str, dry_run: bool = True) -> dict:
     now = time.time()
 
     for row in rows:
-        mid, source, confidence, current_trust, verified, seen_count, created_at, updated_at = row
+        mid, source, confidence, current_trust, verified, created_at, updated_at = row
         confidence = confidence or 0.5
         current_trust = current_trust or 0.5
         verified = verified or 0
-        seen_count = seen_count or 1
 
         # Base trust from confidence
         base = confidence
@@ -94,10 +93,6 @@ def calibrate_trust(db_path: str, dry_run: bool = True) -> dict:
         # Verified boost
         if verified:
             base += 0.1
-
-        # Engagement boost — retrieved multiple times means useful
-        if seen_count > 1:
-            base += min(0.05 * (seen_count - 1), 0.15)
 
         # Recency boost — memories updated in the last 7 days get a small bump
         updated_ts = _parse_iso(updated_at or created_at)
@@ -164,11 +159,11 @@ def main():
     parser = argparse.ArgumentParser(description="Calibrate trust scores based on quality signals")
     parser.add_argument("--dry-run", action="store_true", help="Preview without applying")
     parser.add_argument("--yes", action="store_true", help="Apply changes")
+    parser.add_argument("--db", default=str(default_db_path()), help="Path to the Remnant database")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
-    db_path = "/home/jd/.hermes/remnant/remnant.db"
-    result = calibrate_trust(db_path, dry_run=not args.yes)
+    result = calibrate_trust(args.db, dry_run=not args.yes)
     print(f"\n{'DRY RUN' if result['dry_run'] else 'APPLIED'}: {result['updated']}/{result['total']} memories updated")
 
 

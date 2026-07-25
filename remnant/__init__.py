@@ -244,7 +244,6 @@ class RemnantMemoryProvider(MemoryProvider):
         self._last_injected_hash: dict[str, str] = {}
         self._session_query_vec: dict[str, list[float]] = {}
         self._session_query: dict[str, str] = {}
-        self._prefetch_queue: list[tuple[str, str]] = []
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -387,15 +386,15 @@ class RemnantMemoryProvider(MemoryProvider):
     def prefetch(
         self, query: str, *, session_id: str = "",
         messages: list[dict[str, Any]] | None = None,
-    ) -> dict[str, Any]:
+    ) -> str:
         """Proactive memory injection before an LLM call.
 
-        Returns a compact context block to prepend, or ``{}`` when memory isn't
-        needed, the deadline is exceeded, or the context is unchanged since the
-        last call in this session (diff-based suppression).
+        Hermes' ``MemoryProvider`` contract requires formatted text, not a
+        structured payload. Internal diagnostics remain in ``prefetch.py``;
+        only the safe context string crosses the provider boundary.
         """
         if self._db is None or self._config is None or self._embedder is None:
-            return {}
+            return ""
         sid = session_id or self._session_id or "default"
         # Reset the per-session query-vector cache when the query changes so a
         # new query re-embeds; an identical query reuses the cached vector.
@@ -403,17 +402,32 @@ class RemnantMemoryProvider(MemoryProvider):
             self._session_query.pop(sid, None)
             self._session_query_vec.pop(sid, None)
             self._session_query[sid] = query
-        return _run_prefetch(self, query, sid, messages=messages)
+        result = _run_prefetch(self, query, sid, messages=messages)
+        return str(result.get("context") or "")
 
-    def queue_prefetch(self, query: str) -> None:
-        """Optionally pre-warm the next turn's prefetch. Non-blocking best-effort."""
-        if self._db is None or self._config is None:
-            return
-        sid = self._session_id or "default"
-        self._prefetch_queue.append((sid, query))
-        # Keep the queue bounded.
-        if len(self._prefetch_queue) > 32:
-            self._prefetch_queue = self._prefetch_queue[-32:]
+    def on_session_switch(
+        self,
+        new_session_id: str,
+        *,
+        parent_session_id: str = "",
+        reset: bool = False,
+        rewound: bool = False,
+        **_: Any,
+    ) -> None:
+        """Discard session-local recall state when Hermes rotates a session."""
+        old_session_id = self._session_id
+        self._session_id = new_session_id or "default"
+        affected = {old_session_id, self._session_id, parent_session_id}
+        if reset or rewound:
+            affected.add(new_session_id)
+        for sid in affected:
+            self._last_injected_hash.pop(sid, None)
+            self._session_query_vec.pop(sid, None)
+            self._session_query.pop(sid, None)
+
+    def backup_paths(self) -> list[str]:
+        """Expose the shared database to Hermes' external-backup mechanism."""
+        return [str(default_db_path())]
 
     # -- vault re-index (Phase 4) --------------------------------------------
 
