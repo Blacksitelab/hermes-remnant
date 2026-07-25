@@ -86,6 +86,32 @@ def _write_note(path: Path, body: str, frontmatter: dict | None = None) -> None:
     path.write_text(content, encoding="utf-8")
 
 
+def test_heading_aware_passages_preserve_offsets_and_forget_stale_chunks(
+    hermes_home: Path, vault: Path
+):
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(vault_path=str(vault), vault_passage_chars=70, vault_passage_overlap=10)
+    emb = _fake_embed(db, cfg)
+    note = vault / "project.md"
+    _write_note(note, "# Project\n" + "alpha " * 20 + "\n## Risks\n" + "beta " * 20)
+    try:
+        first = index_file(db, cfg, emb, note)
+        passages = db.get_vault_passages("project.md")
+        assert first == passages[0]["memory_id"]
+        assert len(passages) >= 2
+        assert any(p["heading_path"] == "Project > Risks" for p in passages)
+        assert all(p["end_offset"] > p["start_offset"] for p in passages)
+
+        _write_note(note, "# Project\nShort replacement note.")
+        index_file(db, cfg, emb, note)
+        refreshed = db.get_vault_passages("project.md")
+        assert len(refreshed) == 1
+        stale_ids = {p["memory_id"] for p in passages[1:]}
+        assert all(db.get_memory(mid)["status"] == "forgotten" for mid in stale_ids)
+    finally:
+        db.close()
+
+
 # ===========================================================================
 # Issue #12: in-place update preserves memory_id across reindex
 # ===========================================================================

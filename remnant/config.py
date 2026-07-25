@@ -29,6 +29,8 @@ DEFAULT_VAULT_PATH = os.environ.get(
 )
 DEFAULT_VAULT_EXCLUDE = ["90_", "91_", "92_", "93_", "94_", "95_", "99_ARCHIVE"]
 DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
+DEFAULT_VAULT_PASSAGE_CHARS = 1_200
+DEFAULT_VAULT_PASSAGE_OVERLAP = 150
 
 # Reflection reuses the extraction endpoint/model by default (gemma4:12b on BSL1).
 DEFAULT_REFLECT_URL = DEFAULT_EXTRACT_URL
@@ -137,6 +139,10 @@ class RemnantConfig:
     vault_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_VAULT_EXCLUDE))
     profile_scope: list[str] = field(default_factory=list)
     vault_reindex_interval_s: int = DEFAULT_VAULT_REINDEX_INTERVAL_S
+    # Heading-aware vault passages keep long notes precise at retrieval time.
+    # Set passage_chars to 0 to retain legacy whole-note indexing.
+    vault_passage_chars: int = DEFAULT_VAULT_PASSAGE_CHARS
+    vault_passage_overlap: int = DEFAULT_VAULT_PASSAGE_OVERLAP
     # Entity extraction tuning (issue #5). Newly regex-extracted entities must
     # be sighted in at least this many distinct memories before being
     # persisted/linked. The LLM typed-entity path bypasses this threshold (the
