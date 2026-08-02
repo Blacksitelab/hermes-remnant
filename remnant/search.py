@@ -14,23 +14,22 @@ Strategies:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 from .config import RRF_K, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder, cosine
-
-# Visibility precedence: private < shared < fleet. A search scoped to a higher
-# tier can see lower tiers; a lower-tier search cannot see higher tiers.
-_VIS_ORDER = {"private": 0, "shared": 1, "fleet": 2}
+from .scope import (
+    effective_profile_scope,
+    normalize_profile_scope,
+    path_in_profile_scope,
+    visibility_allows,
+)
 
 
 def _scope_filter(results: list[dict[str, Any]], visibility: str | None) -> list[dict[str, Any]]:
-    if visibility and _VIS_ORDER.get(visibility) is not None:
-        cap = _VIS_ORDER[visibility]
-        results = [r for r in results if _VIS_ORDER.get(r.get("visibility", "private"), 0) <= cap]
-    return results
+    return [r for r in results if visibility_allows(r.get("visibility"), visibility)]
 
 
 def _profile_scope_filter(
@@ -43,11 +42,13 @@ def _profile_scope_filter(
     A document memory is included if its ``source_id`` starts with one of the
     allowed prefixes (after normalizing separators to ``/``).
     """
-    if not profile_scope:
+    if profile_scope is None:
         return results
-    prefixes = [p.strip().rstrip("/") for p in profile_scope if p and p.strip()]
+    prefixes = normalize_profile_scope(profile_scope)
     if not prefixes:
-        return results
+        # An empty effective scope means no vault document is allowed. This is
+        # distinct from ``None`` (no configured scope).
+        return [r for r in results if r.get("source") != "vault"]
     out: list[dict[str, Any]] = []
     for r in results:
         # Only document/vault memories are scope-restricted. The `source` may
@@ -58,8 +59,7 @@ def _profile_scope_filter(
             out.append(r)
             continue
         sid = r.get("source_id") or ""
-        sid = sid.replace("\\", "/")
-        if any(sid == p or sid.startswith(p + "/") for p in prefixes):
+        if path_in_profile_scope(sid, prefixes):
             out.append(r)
     return out
 
@@ -141,8 +141,11 @@ def search(
     if strategy not in ("keyword", "semantic", "auto", "graph"):
         strategy = config.default_search_strategy
 
-    # Resolve the effective scope: explicit arg overrides config.profile_scope.
-    scope = profile_scope if profile_scope is not None else (config.profile_scope or [])
+    # A model-provided scope can narrow, but never broaden or disable, the
+    # provider-configured scope.
+    scope = effective_profile_scope(config.profile_scope, profile_scope)
+    if not config.profile_scope and not profile_scope:
+        scope = None
     # The "viewer" for locked-note masking is the agent performing the search:
     # an explicit agent_id wins, else the provider-configured agent_id. A None
     # viewer is treated as a non-owner anonymous search (locked content masked).
@@ -151,7 +154,9 @@ def search(
     if strategy == "graph":
         from .graph import graph_search
 
-        results = graph_search(db, query, agent_id=agent_id, limit=limit)
+        results = graph_search(
+            db, query, agent_id=agent_id, limit=limit, profile_scope=scope
+        )
         results = _attach_source(db, results)
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
@@ -161,7 +166,10 @@ def search(
 
     if strategy == "keyword":
         results = db.search_bm25(
-            query, agent_id=agent_id, limit=limit * 3 if (visibility or scope) else limit
+            query,
+            agent_id=agent_id,
+            profile_scope=scope,
+            limit=limit * 3 if (visibility or scope) else limit,
         )
         results = _attach_source(db, results)
         results = _profile_scope_filter(results, scope)
@@ -171,7 +179,9 @@ def search(
         return results
 
     if strategy == "semantic":
-        ranked = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
+        ranked = _semantic_rank(
+            db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope
+        )
         # Drop noise: if the top semantic cosine score is below the configured
         # minimum, there are no strong matches.
         if ranked and ranked[0].get("score", 0.0) < config.min_semantic_score:
@@ -186,8 +196,12 @@ def search(
     # auto: RRF fusion. If the top semantic score is below threshold, the
     # semantic signal is too weak for fusion, so we fall back to BM25-only
     # results instead of returning an empty list.
-    kw = db.search_bm25(query, agent_id=agent_id, limit=max(limit * 3, 100))
-    sem = _semantic_rank(db, config, query, agent_id=agent_id, embedder=embedder)
+    kw = db.search_bm25(
+        query, agent_id=agent_id, profile_scope=scope, limit=max(limit * 3, 100)
+    )
+    sem = _semantic_rank(
+        db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope
+    )
     if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
         results = _attach_source(db, kw)
         results = _profile_scope_filter(results, scope)
@@ -341,6 +355,7 @@ def _semantic_rank(
     *,
     agent_id: str | None = None,
     embedder: Embedder | None = None,
+    profile_scope: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Cosine-rank the bounded, authorization-scoped vector corpus."""
     if embedder is None:
@@ -354,6 +369,7 @@ def _semantic_rank(
 
     rows = db.search_all_embeddings(
         agent_id=agent_id,
+        profile_scope=profile_scope,
         limit=config.semantic_scan_limit,
     )
     scored: list[dict[str, Any]] = []

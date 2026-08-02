@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,9 @@ class RemnantConfig:
     extract_timeout: float = 120.0
     extract_enabled: bool = True
     extract_workers: int = 1
+    # ``auto`` infers Ollama-native vs OpenAI-compatible chat behavior from the
+    # endpoint path. Deployments can pin the protocol during migration.
+    llm_protocol: str = "auto"
     reflect_url: str = DEFAULT_REFLECT_URL
     reflect_model: str = DEFAULT_REFLECT_MODEL
     reflect_timeout: float = 60.0
@@ -198,8 +202,25 @@ def save_config(values: dict[str, Any], hermes_home: str | Path) -> Path:
     """Write non-secret config to `<hermes_home>/remnant.json`. Returns the path."""
     p = config_path(hermes_home)
     p.parent.mkdir(parents=True, exist_ok=True)
-    # Merge onto defaults so partial config still has sensible values.
-    merged = RemnantConfig.from_dict(values).to_dict()
-    with open(p, "w", encoding="utf-8") as fh:
-        json.dump(merged, fh, indent=2)
+    existing: dict[str, Any] = {}
+    if p.is_file():
+        try:
+            with open(p, encoding="utf-8") as fh:
+                loaded = json.load(fh)
+            if isinstance(loaded, dict):
+                existing = loaded
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    # Preserve settings not exposed by the current dashboard schema. This is
+    # important for hand-tuned timeouts, budgets, and rollout flags.
+    merged = RemnantConfig.from_dict({**existing, **(values or {})}).to_dict()
+    fd, temp_name = tempfile.mkstemp(prefix=".remnant-", suffix=".json", dir=p.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(merged, fh, indent=2)
+            fh.write("\n")
+        os.replace(temp_name, p)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
     return p

@@ -19,6 +19,7 @@ def graph_search(
     agent_id: str | None = None,
     depth: int = 2,
     limit: int = 20,
+    profile_scope: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Extract entity names from `query`, resolve them, traverse the graph,
     and return linked active memories. Pure SQLite.
@@ -35,7 +36,13 @@ def graph_search(
         names = [t for t in (query or "").split() if t]
     if not names:
         return []
-    return db.search_graph(names, agent_id=agent_id, depth=depth, limit=limit)
+    return db.search_graph(
+        names,
+        agent_id=agent_id,
+        depth=depth,
+        limit=limit,
+        profile_scope=profile_scope,
+    )
 
 
 def graph_traverse(
@@ -44,6 +51,7 @@ def graph_traverse(
     *,
     agent_id: str | None = None,
     depth: int = 2,
+    profile_scope: list[str] | None = None,
 ) -> dict[str, Any]:
     """Resolve `entity_name` to its canonical id and traverse the graph.
 
@@ -57,7 +65,9 @@ def graph_traverse(
     eid = db.find_entity_by_name(entity_name, agent_id=agent_id)
     if not eid:
         return {"entity": None, "entities": [], "memories": []}
-    result = db.traverse_graph(eid, depth=depth, agent_id=agent_id)
+    result = db.traverse_graph(
+        eid, depth=depth, agent_id=agent_id, profile_scope=profile_scope
+    )
     seed = db.get_entity(eid)
     return {
         "entity": seed,

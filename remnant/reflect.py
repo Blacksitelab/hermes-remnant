@@ -10,11 +10,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import httpx
-
 from .config import REFLECT_MAX_TOKENS, REFLECT_TOP_N, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
+from .llm import chat
 from .search import search as hybrid_search
 
 log = logging.getLogger("remnant.reflect")
@@ -65,23 +64,17 @@ def memory_reflect(
 def _call_llm(config: RemnantConfig, user_content: str) -> str:
     """Call the reflect endpoint. Returns empty string on any failure."""
     try:
-        with httpx.Client(timeout=config.reflect_timeout) as client:
-            resp = client.post(
-                config.reflect_url,
-                json={
-                    "model": config.reflect_model,
-                    "messages": [
-                        {"role": "system", "content": _REFLECT_PROMPT},
-                        {"role": "user", "content": user_content},
-                    ],
-                    "temperature": 0.2,
-                    "max_tokens": REFLECT_MAX_TOKENS,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return str(data["choices"][0]["message"]["content"]).strip()
-    except (httpx.HTTPError, KeyError, ValueError) as e:
+        return chat(
+            url=config.reflect_url,
+            model=config.reflect_model,
+            system=_REFLECT_PROMPT,
+            user=user_content,
+            timeout=config.reflect_timeout,
+            protocol=getattr(config, "llm_protocol", None),
+            temperature=0.2,
+            max_tokens=REFLECT_MAX_TOKENS,
+        )
+    except Exception as e:
         log.warning("reflect LLM call failed: %s", e)
         return ""
 
