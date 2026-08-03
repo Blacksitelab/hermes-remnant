@@ -655,6 +655,35 @@ def test_profile_scope_from_config_used_by_default(hermes_home: Path, vault: Pat
         db.close()
 
 
+def test_prefetch_respects_configured_profile_scope(provider: RemnantMemoryProvider, vault: Path):
+    """Injected context must apply the same vault scope as direct search."""
+    _write_note(vault / "Projects" / "allowed.md", "# Allowed\nalpha project details.")
+    _write_note(vault / "Personal" / "outside.md", "# Outside\nalpha workout routine.")
+    provider._config.profile_scope = ["Projects"]  # type: ignore[union-attr]
+    provider.handle_tool_call(
+        "memory_import", {"source": "vault", "force": True}, session_id="scope-import"
+    )
+    # Older/imported document rows may carry a non-vault source label. They
+    # still represent vault paths and must not bypass the profile boundary.
+    legacy_embedding = provider._embedder.embed("alpha legacy document")  # type: ignore[union-attr]
+    provider._db.insert_memory(  # type: ignore[union-attr]
+        content="alpha legacy document from outside scope",
+        source="import",
+        source_id="Personal/legacy.md",
+        type="document",
+        agent="default",
+        embedding=legacy_embedding,
+        embed_model=provider._config.embed_model,  # type: ignore[union-attr]
+    )
+
+    context = provider.prefetch("remember alpha project", session_id="scope-prefetch")
+
+    assert "alpha project details" in context
+    assert "alpha workout routine" not in context
+    assert "Personal/outside.md" not in context
+    assert "alpha legacy document" not in context
+
+
 # ===========================================================================
 # Locked notes: content hidden from other agents
 # ===========================================================================
@@ -855,7 +884,9 @@ def test_memory_search_tool_locked_masking_for_other_agent(
     intruder.initialize(session_id="intr", hermes_home=str(home))
     try:
         res = intruder.handle_tool_call(
-            "memory_search", {"query": "REDACTED_EXAMPLE", "strategy": "keyword"}, session_id="intr",
+            "memory_search",
+            {"query": "REDACTED_EXAMPLE", "strategy": "keyword"},
+            session_id="intr",
         )
         results = json.loads(res)["results"]
         locked = [r for r in results if r.get("locked")]

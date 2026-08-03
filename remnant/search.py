@@ -35,11 +35,15 @@ def _scope_filter(results: list[dict[str, Any]], visibility: str | None) -> list
 def _profile_scope_filter(
     results: list[dict[str, Any]], profile_scope: list[str] | None
 ) -> list[dict[str, Any]]:
-    """Restrict document memories (source='vault') to allowed path prefixes.
+    """Restrict vault/document memories to allowed path prefixes.
 
-    Non-document memories are never filtered by profile_scope. When
-    `profile_scope` is None or empty, no additional filtering is applied.
-    A document memory is included if its ``source_id`` starts with one of the
+    Non-document memories are never filtered by profile_scope. A vault memory
+    is identified by ``source='vault'``; legacy/imported document rows are
+    also identified by ``type='document'`` so their paths cannot bypass the
+    provider scope merely because their source label differs. ``None`` means
+    no scope; an empty effective scope excludes document rows while retaining
+    ordinary facts.
+    A scoped document is included if its ``source_id`` starts with one of the
     allowed prefixes (after normalizing separators to ``/``).
     """
     if profile_scope is None:
@@ -48,14 +52,17 @@ def _profile_scope_filter(
     if not prefixes:
         # An empty effective scope means no vault document is allowed. This is
         # distinct from ``None`` (no configured scope).
-        return [r for r in results if r.get("source") != "vault"]
+        return [
+            r for r in results
+            if r.get("source") != "vault" and r.get("type") != "document"
+        ]
     out: list[dict[str, Any]] = []
     for r in results:
-        # Only document/vault memories are scope-restricted. The `source` may
-        # not be attached to every result dict (older search paths don't carry
-        # it); when absent we treat the row as non-document and let it through.
-        src = r.get("source")
-        if src != "vault":
+        # Legacy search rows may omit both fields; _attach_source() enriches
+        # normal lanes before this function runs. Treat only explicit vault or
+        # document rows as path-scoped so ordinary facts remain searchable.
+        is_document = r.get("source") == "vault" or r.get("type") == "document"
+        if not is_document:
             out.append(r)
             continue
         sid = r.get("source_id") or ""
@@ -125,9 +132,10 @@ def search(
     - ``auto`` (default): RRF fusion of keyword + semantic.
 
     ``profile_scope`` (Phase 4) restricts ``document``/``vault`` memories to
-    those whose ``source_id`` starts with one of the allowed prefixes. When
-    None/empty, no additional filtering is applied. Locked vault notes have
-    their content masked for any viewer that is not the memory's owner agent.
+    those whose ``source_id`` starts with one of the allowed prefixes. ``None``
+    means no configured scope; an empty effective scope excludes document rows
+    while retaining ordinary facts. Locked vault notes have their content
+    masked for any viewer that is not the memory's owner agent.
 
     For ``semantic`` and ``auto``, if the top semantic cosine score is below
     ``config.min_semantic_score`` (default 0.3), the semantic signal is weak.
@@ -314,7 +322,7 @@ def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[st
     placeholders = ",".join("?" for _ in ids)
     with db.read() as cur:
         cur.execute(
-            f"SELECT id, agent, source, source_id, metadata, tags FROM memories "
+            f"SELECT id, agent, source, type, source_id, metadata, tags FROM memories "
             f"WHERE id IN ({placeholders})",
             ids,
         )
@@ -334,6 +342,8 @@ def _attach_source(db: RemnantDB, results: list[dict[str, Any]]) -> list[dict[st
             d["agent_id"] = meta.get("agent")
         if "source" not in d or d.get("source") is None:
             d["source"] = meta.get("source")
+        if "type" not in d or d.get("type") is None:
+            d["type"] = meta.get("type")
         if "source_id" not in d or d.get("source_id") is None:
             d["source_id"] = meta.get("source_id")
         raw_meta = meta.get("metadata")

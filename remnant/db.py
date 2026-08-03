@@ -2332,19 +2332,30 @@ def _append_profile_scope_sql(
 ) -> tuple[str, list[Any]]:
     """Apply vault profile scope before ranking and LIMIT.
 
-    Non-vault memories are not path-scoped. An empty effective scope therefore
-    excludes vault rows while retaining ordinary facts.
+    Non-vault memories are not path-scoped. Both current vault rows and legacy
+    document rows are path-scoped, so an imported document cannot bypass the
+    policy by carrying a different source label. An empty effective scope
+    therefore excludes vault/document rows while retaining ordinary facts.
     """
     if profile_scope is None:
         return sql, params
     prefixes = normalize_profile_scope(profile_scope)
     if not prefixes:
-        return sql + f" AND {alias}.source <> 'vault'", params
+        return (
+            sql
+            + f" AND COALESCE({alias}.source, '') <> 'vault'"
+            + f" AND COALESCE({alias}.type, '') <> 'document'",
+            params,
+        )
     clauses: list[str] = []
     for prefix in prefixes:
         clauses.append(f"{alias}.source_id=? OR {alias}.source_id LIKE ?")
         params.extend([prefix, prefix + "/%"])
-    return sql + f" AND ({alias}.source <> 'vault' OR ({' OR '.join(clauses)}))", params
+    non_document = (
+        f"COALESCE({alias}.source, '') <> 'vault'"
+        f" AND COALESCE({alias}.type, '') <> 'document'"
+    )
+    return sql + f" AND ({non_document} OR ({' OR '.join(clauses)}))", params
 
 
 def _normalize_entity_name(name: str) -> str:
