@@ -119,6 +119,23 @@ table:
 - `last_error_message` with a bounded length
 - optional `fact_count`
 
+### Migration rollback and recovery
+
+Schema migrations must be forward-only and transactional: each migration runs
+inside a transaction, commits only after its post-migration checks pass, and
+must not drop or rewrite user data in place. Before applying a migration,
+create a verified SQLite backup and record the source schema version. Run
+`PRAGMA integrity_check` on both the source database and the backup before
+proceeding.
+
+There is no automatic in-place downgrade. If a migration fails or the upgraded
+database fails integrity or startup checks, stop the provider, preserve the
+failed database for diagnosis, and restore the verified backup to a new
+database path. Re-run the previous provider version against that restored copy,
+then retry the migration only after the failure is understood. The migration
+test must cover interruption before commit and confirm that the original
+database and queued extraction work remain recoverable.
+
 Use a new schema version and make migration idempotent.
 
 ### Implementation
@@ -316,6 +333,19 @@ superseded, or forgotten.
   one transaction before superseding originals.
 - If embedding generation is remote, perform it before the transaction and
   validate the result; keep database mutation atomic.
+
+### Remote embedding failure semantics
+
+Remote embedding calls are completed and validated before the lifecycle
+transaction opens. A timeout, transport error, rate limit, or invalid vector
+therefore produces no lifecycle writes: originals remain active and the caller
+retries with bounded exponential backoff. Once the transaction begins, it
+performs database-only work; any SQLite or validation failure rolls back the
+entire replacement, claim, relation-evidence, entity-link, embedding, and
+audit set. SQLite crash recovery provides the same rollback guarantee after a
+process exit. After the retry budget is exhausted, retain the original memory,
+record a bounded failure diagnostic, and leave the operation retryable or
+dead-lettered according to the package's job policy.
 
 ### Acceptance tests
 
