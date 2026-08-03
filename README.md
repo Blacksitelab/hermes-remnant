@@ -6,7 +6,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 
 **Repository:** [https://github.com/Blacksitelab/hermes-remnant](https://github.com/Blacksitelab/hermes-remnant)  
 **Local path:** `/mnt/data/dev/hermes-remnant`  
-**Author / commits:** Sven (`sven@blacksitelab.com`)
+
 
 ---
 
