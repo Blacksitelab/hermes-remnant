@@ -167,8 +167,8 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "key": "extract_url",
-        "description": "Extraction LLM OpenAI-compatible endpoint",
-        "default": "http://your-ollama-host.local:11434/v1/chat/completions",
+        "description": "Extraction LLM chat endpoint (Ollama /api/chat or OpenAI-compatible /v1)",
+        "default": "http://your-ollama-host.local:11434/api/chat",
         "required": False,
     },
     {
@@ -181,6 +181,13 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "extract_enabled",
         "description": "Enable async LLM extraction of facts",
         "default": True,
+        "required": False,
+    },
+    {
+        "key": "llm_protocol",
+        "description": "Chat protocol; auto infers from the configured endpoint path",
+        "default": "auto",
+        "choices": ["auto", "ollama_native", "openai_compatible"],
         "required": False,
     },
     {

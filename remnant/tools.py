@@ -364,12 +364,15 @@ def handle_tool_call(
     aid = agent_id or config.agent_id
     if tool_name == "memory_search":
         query = str(args.get("query", "")).strip()
-        limit = int(args.get("limit", config.search_limit))
+        try:
+            limit = max(1, min(int(args.get("limit", config.search_limit)), 100))
+        except (TypeError, ValueError):
+            limit = max(1, min(int(config.search_limit), 100))
         strategy = str(args.get("strategy") or config.default_search_strategy).strip()
         if strategy not in ("keyword", "semantic", "auto", "graph"):
             strategy = config.default_search_strategy
-        # profile_scope: explicit arg, else None (search() falls back to the
-        # provider-configured scope). An empty list is treated as "no scoping".
+        # profile_scope may narrow the provider-configured scope, but search()
+        # caps it so an explicit empty list cannot disable configured policy.
         raw_scope = args.get("profile_scope")
         profile_scope: list[str] | None
         if raw_scope is None:

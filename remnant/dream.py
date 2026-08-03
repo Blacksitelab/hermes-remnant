@@ -54,6 +54,8 @@ from .config import (
 from .db import RemnantDB, _unpack_embedding
 from .embed import Embedder, cosine
 from .ingest import store_memory
+from .llm import LLMResponseError, chat
+from .scope import SHAREABLE_VISIBILITIES, is_shareable_visibility
 from .search import decay_trust_scores as search_decay_trust_scores
 
 log = logging.getLogger("remnant.dream")
@@ -167,6 +169,10 @@ def _run_dream(
 
     since_ts = _window_start(db, mode, now)
     recent = db.get_recent_memories(since_ts=since_ts, limit=200)
+    # Cloud judgment is only allowed to see explicitly shareable memories.
+    # Private memories may still be retrieved by normal agent search, but they
+    # must never enter a cross-agent or cloud-assisted dream prompt.
+    recent = [m for m in recent if is_shareable_visibility(m.get("visibility"))]
     if not recent:
         # Nothing new; still record the run so cooldown resets.
         db.set_state(ts_key, now)
@@ -301,13 +307,11 @@ def _select_candidate_pairs(
     # active set (per the spec: "find top-5 similar active memories"); we
     # dedupe against the seed memory via `seen_pairs` rather than excluding
     # recent memories outright, so two newly-stored facts can still connect.
-    # For night mode we include cross-agent shared/fleet memories for dedup;
-    # for day mode we look across the shared corpus.
-    corpus = db.get_memories_for_agent_scope(
-        agent_id=None if mode == "night" else None,
-        visibility=None if mode == "night" else "shared",
-        limit=500,
-    )
+    # The cloud prompt is always restricted to explicitly shareable memories.
+    # Keep the corpus bounded locally, then apply the same rule to both day and
+    # night so a private recent memory cannot leak through a shared candidate.
+    corpus = db.get_memories_for_agent_scope(agent_id=None, visibility=None, limit=500)
+    corpus = [m for m in corpus if m.get("visibility") in SHAREABLE_VISIBILITIES]
     corpus_by_id = {m["id"]: m for m in corpus}
     corpus_ids = list(corpus_by_id.keys())
     if not corpus_ids:
@@ -428,15 +432,15 @@ def _cloud_judge(
     user_content = _build_prompt(pairs)
     try:
         with httpx.Client(timeout=timeout) as client:
-            first = _call(client, url, model, _SYSTEM_PROMPT, user_content)
+            first = _call(client, url, model, _SYSTEM_PROMPT, user_content, timeout=timeout)
             judgments = _parse_judgments(first, pairs)
             if not judgments:
                 return []
             eval_content = _build_eval_prompt(pairs, judgments)
-            second = _call(client, url, model, _EVAL_PROMPT, eval_content)
+            second = _call(client, url, model, _EVAL_PROMPT, eval_content, timeout=timeout)
             refined = _parse_judgments(second, pairs)
             return refined if refined is not None else judgments
-    except (httpx.HTTPError, KeyError, ValueError) as e:
+    except (httpx.HTTPError, LLMResponseError, KeyError, ValueError) as e:
         log.warning("dream cloud call failed: %s", e)
         return []
 
@@ -447,22 +451,19 @@ def _call(
     model: str,
     system: str,
     user_content: str,
+    *,
+    timeout: float,
 ) -> str:
-    resp = client.post(
-        url,
-        json={
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user_content},
-            ],
-            "temperature": 0.1,
-            "max_tokens": 768,
-        },
+    return chat(
+        url=url,
+        model=model,
+        system=system,
+        user=user_content,
+        timeout=timeout,
+        temperature=0.1,
+        max_tokens=768,
+        client=client,
     )
-    resp.raise_for_status()
-    data = resp.json()
-    return str(data["choices"][0]["message"]["content"])
 
 
 def _build_prompt(pairs: list[dict[str, Any]]) -> str:
@@ -572,7 +573,13 @@ def _merge_same_fact(
     are then superseded via ``memory_edit``'s supersede path so the audit log
     + entity-graph carry-over still runs. Returns 1 on success, 0 on failure.
     """
-    ids = [mid for mid in pair_ids if db.get_memory(mid) is not None]
+    memories = [db.get_memory(mid) for mid in pair_ids]
+    if any(m is None for m in memories):
+        return 0
+    if any(not is_shareable_visibility(m.get("visibility")) for m in memories if m):
+        log.warning("refusing dream merge containing a private memory")
+        return 0
+    ids = [str(m["id"]) for m in memories if m]
     if len(ids) < 2:
         return 0
     parts: list[str] = []
@@ -590,8 +597,11 @@ def _merge_same_fact(
     combined = " | ".join(dict.fromkeys(parts))
     merged_tags = list(dict.fromkeys(merged_tags))
     # Pick a representative agent (the first original) for the merged memory.
-    first = db.get_memory(ids[0]) or {}
+    first = memories[0] or {}
     agent_id = first.get("agent") or config.agent_id
+    visibility = (
+        "shared" if any(m.get("visibility") == "shared" for m in memories if m) else "fleet"
+    )
     # Supersede the originals BEFORE storing the merged memory so the dedup
     # path inside ``store_memory`` (which only considers ``status='active'``
     # candidates) does not collapse the combined content back onto one of
@@ -610,7 +620,7 @@ def _merge_same_fact(
         entity=(merged_tags[0] if merged_tags else "general"),
         session_id="dream",
         agent_id=agent_id,
-        visibility="shared",
+        visibility=visibility,
         entities=None,
         source="dream",
         tags=merged_tags or None,

@@ -28,7 +28,7 @@ from typing import Any
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import extract_and_link_entities, extract_entities, link_memory_entities
+from .entity import extract_and_link_entities
 
 log = logging.getLogger("remnant.vault")
 
@@ -378,10 +378,16 @@ def index_vault(
 
     if not vault_root.is_dir():
         log.warning("vault: path does not exist or is not a directory: %s", vault_root)
-        forgotten = db.mark_vault_forgotten_for_missing(seen_paths)
-        return {"indexed": 0, "skipped": 0, "forgotten": len(forgotten)}
+        # An unavailable root is not an empty successful scan. Treating it as
+        # one would mark every indexed note forgotten during a mount outage or
+        # configuration typo.
+        return {"indexed": 0, "skipped": 0, "forgotten": 0, "failed": 1}
 
-    for abs_path in _walk_markdown(vault_root, config.vault_exclude):
+    markdown_paths = _walk_markdown(vault_root, config.vault_exclude)
+    if markdown_paths is None:
+        log.warning("vault: unable to complete directory scan: %s", vault_root)
+        return {"indexed": indexed, "skipped": skipped, "forgotten": 0, "failed": 1}
+    for abs_path in markdown_paths:
         rel = _relative_path(abs_path, vault_root)
         seen_paths.add(rel)
         if not force:
@@ -403,7 +409,7 @@ def index_vault(
 
 def _walk_markdown(
     vault_root: Path, exclude_patterns: list[str]
-) -> list[Path]:
+) -> list[Path] | None:
     """Yield markdown files under `vault_root` that pass the exclusion filter.
 
     Sorted for stable, deterministic indexing order. Uses a manual walk so the
@@ -415,19 +421,24 @@ def _walk_markdown(
     try:
         top_entries = sorted(vault_root.iterdir(), key=lambda p: p.name)
     except OSError:
-        return out
+        return None
     for entry in top_entries:
-        rel = _relative_path(entry, vault_root)
-        if not _should_index(rel, exclude_patterns):
-            continue
-        if entry.is_dir():
-            for p in sorted(entry.rglob("*")):
-                if p.is_file() and p.suffix.lower() in _MARKDOWN_SUFFIXES:
-                    prel = _relative_path(p, vault_root)
-                    if _should_index(prel, exclude_patterns):
-                        out.append(p)
-        elif entry.is_file() and entry.suffix.lower() in _MARKDOWN_SUFFIXES:
-            out.append(entry)
+        try:
+            rel = _relative_path(entry, vault_root)
+            if not _should_index(rel, exclude_patterns):
+                continue
+            if entry.is_dir():
+                for p in sorted(entry.rglob("*")):
+                    if p.is_file() and p.suffix.lower() in _MARKDOWN_SUFFIXES:
+                        prel = _relative_path(p, vault_root)
+                        if _should_index(prel, exclude_patterns):
+                            out.append(p)
+            elif entry.is_file() and entry.suffix.lower() in _MARKDOWN_SUFFIXES:
+                out.append(entry)
+        except OSError:
+            # A partial walk is unsafe: reconciliation must not interpret
+            # unreadable subtrees as deleted notes.
+            return None
     return out
 
 

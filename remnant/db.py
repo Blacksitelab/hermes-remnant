@@ -21,7 +21,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 10
+from .scope import normalize_profile_scope
+
+SCHEMA_VERSION = 11
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -53,7 +55,12 @@ CREATE TABLE IF NOT EXISTS turns (
     agent_id TEXT NOT NULL,
     user_text TEXT NOT NULL,
     assistant_text TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    extraction_status TEXT NOT NULL DEFAULT 'pending',
+    extraction_attempts INTEGER NOT NULL DEFAULT 0,
+    extraction_fact_count INTEGER,
+    extraction_completed_at REAL,
+    extraction_error TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_turns_session ON turns(session_id);
 
@@ -158,6 +165,9 @@ CREATE TABLE IF NOT EXISTS extraction_queue (
     enqueued_at REAL NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending',
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    started_at REAL,
+    last_error TEXT,
     FOREIGN KEY(turn_id) REFERENCES turns(id)
 );
 CREATE INDEX IF NOT EXISTS idx_queue_status ON extraction_queue(status);
@@ -270,7 +280,7 @@ CREATE TABLE IF NOT EXISTS prefetch_stats (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL,
     outcome TEXT NOT NULL,          -- 'injected' or 'empty'
-    reason TEXT,                    -- why empty (e.g. 'deadline', 'no_results', 'greeting', 'diff_suppression')
+    reason TEXT,                    -- why empty (deadline/no_results/greeting/etc.)
     elapsed_ms REAL,                 -- wall-clock time spent in prefetch()
     result_count INTEGER DEFAULT 0,  -- number of memories injected (0 if empty)
     token_estimate INTEGER DEFAULT 0,
@@ -408,6 +418,43 @@ class RemnantDB:
                 cur.execute("ALTER TABLE entity_aliases ADD COLUMN agent TEXT")
             except sqlite3.OperationalError:
                 pass
+
+        # Phase 11: durable extraction lifecycle. A queue row alone cannot
+        # distinguish a successful zero-fact extraction from a failed request,
+        # because successful jobs are deleted after processing.
+        cur.execute("PRAGMA table_info(turns)")
+        turn_cols = {row["name"] for row in cur.fetchall()}
+        turn_additions = {
+            "extraction_status": "TEXT NOT NULL DEFAULT 'pending'",
+            "extraction_attempts": "INTEGER NOT NULL DEFAULT 0",
+            "extraction_fact_count": "INTEGER",
+            "extraction_completed_at": "REAL",
+            "extraction_error": "TEXT",
+        }
+        for name, declaration in turn_additions.items():
+            if name not in turn_cols:
+                try:
+                    cur.execute(f"ALTER TABLE turns ADD COLUMN {name} {declaration}")
+                except sqlite3.OperationalError:
+                    pass
+
+        cur.execute("PRAGMA table_info(extraction_queue)")
+        queue_cols = {row["name"] for row in cur.fetchall()}
+        queue_additions = {
+            "next_attempt_at": "REAL NOT NULL DEFAULT 0",
+            "started_at": "REAL",
+            "last_error": "TEXT",
+        }
+        for name, declaration in queue_additions.items():
+            if name not in queue_cols:
+                try:
+                    cur.execute(f"ALTER TABLE extraction_queue ADD COLUMN {name} {declaration}")
+                except sqlite3.OperationalError:
+                    pass
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_queue_ready "
+            "ON extraction_queue(status, next_attempt_at)"
+        )
         # Phase 6 (migration): content_hash + seen_count on memories, and
         # widen the source CHECK to allow 'import' and 'hindsight'. CREATE
         # TABLE IF NOT EXISTS never alters an existing table, so backfill the
@@ -470,7 +517,9 @@ class RemnantDB:
             """
             CREATE TABLE memories_new (
                 id TEXT PRIMARY KEY,
-                type TEXT NOT NULL CHECK(type IN ('fact','observation','conversation','document','thread')),
+                type TEXT NOT NULL CHECK(
+                    type IN ('fact','observation','conversation','document','thread')
+                ),
                 content TEXT NOT NULL,
                 source TEXT NOT NULL CHECK(source IN (
                     'conversation','vault','email','cron','sensor',
@@ -651,42 +700,100 @@ class RemnantDB:
             if agent_id is None:
                 cur.execute(
                     "SELECT * FROM extraction_queue WHERE status='pending' "
-                    "ORDER BY id DESC LIMIT 1"
+                    "AND next_attempt_at <= ? ORDER BY id DESC LIMIT 1",
+                    (time.time(),),
                 )
             else:
                 cur.execute(
                     "SELECT * FROM extraction_queue WHERE status='pending' AND agent_id=? "
-                    "ORDER BY id DESC LIMIT 1",
-                    (agent_id,),
+                    "AND next_attempt_at <= ? ORDER BY id DESC LIMIT 1",
+                    (agent_id, time.time()),
                 )
             row = cur.fetchone()
             if row is None:
                 return None
             qid = int(row["id"])
             cur.execute(
-                "UPDATE extraction_queue SET attempts=attempts+1, status='running' WHERE id=?",
-                (qid,),
+                "UPDATE extraction_queue SET attempts=attempts+1, status='running', "
+                "started_at=? WHERE id=?",
+                (time.time(), qid),
+            )
+            cur.execute(
+                "UPDATE turns SET extraction_status='running', "
+                "extraction_attempts=extraction_attempts+1, extraction_error=NULL "
+                "WHERE id=?",
+                (int(row["turn_id"]),),
             )
             return dict(row)
 
-    def complete_extraction(self, queue_id: int) -> None:
+    def complete_extraction(self, queue_id: int, *, fact_count: int = 0) -> None:
         with self.transaction() as cur:
+            cur.execute("SELECT turn_id FROM extraction_queue WHERE id=?", (queue_id,))
+            row = cur.fetchone()
+            if row is None:
+                return
+            cur.execute(
+                "UPDATE turns SET extraction_status='completed', extraction_fact_count=?, "
+                "extraction_completed_at=?, extraction_error=NULL WHERE id=?",
+                (max(0, int(fact_count)), time.time(), int(row["turn_id"])),
+            )
             cur.execute("DELETE FROM extraction_queue WHERE id=?", (queue_id,))
 
-    def fail_extraction(self, queue_id: int) -> None:
-        """Return the job to pending so the worker retries on next tick."""
+    def fail_extraction(self, queue_id: int, *, error: str = "") -> None:
+        """Retry a failed job with backoff, then retain a dead-letter marker."""
         with self.transaction() as cur:
+            cur.execute("SELECT turn_id, attempts FROM extraction_queue WHERE id=?", (queue_id,))
+            row = cur.fetchone()
+            if row is None:
+                return
+            attempts = int(row["attempts"] or 0)
+            bounded_error = str(error or "extraction failed")[:500]
+            if attempts < 3:
+                delay = min(300.0, 2.0 ** max(0, attempts - 1))
+                cur.execute(
+                    "UPDATE extraction_queue SET status='pending', next_attempt_at=?, "
+                    "started_at=NULL, last_error=? WHERE id=?",
+                    (time.time() + delay, bounded_error, queue_id),
+                )
+                cur.execute(
+                    "UPDATE turns SET extraction_status='retry_wait', "
+                    "extraction_error=? WHERE id=?",
+                    (bounded_error, int(row["turn_id"])),
+                )
+                return
             cur.execute(
-                "UPDATE extraction_queue SET status='pending' WHERE id=? AND attempts < 3",
-                (queue_id,),
+                "UPDATE turns SET extraction_status='dead_letter', extraction_error=? WHERE id=?",
+                (bounded_error, int(row["turn_id"])),
             )
-            # After 3 attempts give up and drop the row; turn is still persisted.
             cur.execute("DELETE FROM extraction_queue WHERE id=? AND attempts >= 3", (queue_id,))
 
     def pending_count(self) -> int:
         with self.read() as cur:
             cur.execute("SELECT COUNT(*) AS c FROM extraction_queue WHERE status='pending'")
             return int(cur.fetchone()["c"])
+
+    def recover_stale_extractions(self, *, max_age_s: float = 900.0) -> int:
+        """Return abandoned running jobs to the retryable queue."""
+        cutoff = time.time() - max(1.0, float(max_age_s))
+        with self.transaction() as cur:
+            cur.execute(
+                "SELECT id, turn_id FROM extraction_queue "
+                "WHERE status='running' AND COALESCE(started_at, enqueued_at) < ?",
+                (cutoff,),
+            )
+            rows = cur.fetchall()
+            for row in rows:
+                cur.execute(
+                    "UPDATE extraction_queue SET status='pending', next_attempt_at=0, "
+                    "started_at=NULL, last_error=? WHERE id=?",
+                    ("recovered stale running job", int(row["id"])),
+                )
+                cur.execute(
+                    "UPDATE turns SET extraction_status='retry_wait', "
+                    "extraction_error=? WHERE id=?",
+                    ("recovered stale running job", int(row["turn_id"])),
+                )
+            return len(rows)
 
     def get_unextracted_turns(
         self, agent_id: str | None = None, limit: int = 100
@@ -705,7 +812,8 @@ class RemnantDB:
             "LEFT JOIN extraction_queue q ON q.turn_id = t.id "
             "LEFT JOIN memories m ON m.source_id = CAST(t.id AS TEXT) "
             "AND m.source = 'conversation' "
-            "WHERE q.id IS NULL AND m.id IS NULL"
+            "WHERE q.id IS NULL AND m.id IS NULL "
+            "AND COALESCE(t.extraction_status, 'pending') IN ('pending', 'retry_wait')"
         )
         params: list[Any] = []
         if agent_id is not None:
@@ -878,6 +986,7 @@ class RemnantDB:
         *,
         agent_id: str | None = None,
         visibility: str | None = None,
+        profile_scope: list[str] | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """BM25 keyword search over active memories, optionally filtered.
@@ -900,11 +1009,12 @@ class RemnantDB:
         )
         params: list[Any] = [fts_query]
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault')"
+            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
             params.append(visibility)
+        sql, params = _append_profile_scope_sql(sql, params, profile_scope)
         sql += " ORDER BY score ASC LIMIT ?"
         params.append(limit)
         with self.read() as cur:
@@ -955,6 +1065,7 @@ class RemnantDB:
         *,
         agent_id: str | None = None,
         visibility: str | None = None,
+        profile_scope: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Return active memories in `memory_ids` with their embeddings attached.
 
@@ -977,11 +1088,12 @@ class RemnantDB:
         )
         params: list[Any] = list(memory_ids)
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault')"
+            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
             params.append(visibility)
+        sql, params = _append_profile_scope_sql(sql, params, profile_scope)
         with self.read() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
@@ -997,6 +1109,7 @@ class RemnantDB:
         *,
         agent_id: str | None = None,
         visibility: str | None = None,
+        profile_scope: list[str] | None = None,
         limit: int = 5_000,
     ) -> list[dict[str, Any]]:
         """Return a bounded, authorization-scoped embedding corpus.
@@ -1019,6 +1132,7 @@ class RemnantDB:
         if visibility is not None:
             sql += " AND m.visibility=?"
             params.append(visibility)
+        sql, params = _append_profile_scope_sql(sql, params, profile_scope)
         sql += " ORDER BY m.updated_at DESC LIMIT ?"
         params.append(max(1, int(limit)))
         with self.read() as cur:
@@ -1380,7 +1494,7 @@ class RemnantDB:
         )
         params: list[Any] = [entity_id]
         if agent_id is not None:
-            sql += " AND m.agent=?"
+            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
             params.append(agent_id)
         with self.read() as cur:
             cur.execute(sql, params)
@@ -1394,6 +1508,7 @@ class RemnantDB:
         *,
         depth: int = 2,
         agent_id: str | None = None,
+        profile_scope: list[str] | None = None,
     ) -> dict[str, Any]:
         """BFS over `relations` up to `depth` hops. Pure SQLite, no LLM.
 
@@ -1447,14 +1562,15 @@ class RemnantDB:
             placeholders = ",".join("?" for _ in order)
             sql = (
                 "SELECT DISTINCT m.id, m.content, m.visibility, m.agent AS agent_id, "
-                "m.timestamp AS created_at, m.updated_at "
+                "m.source, m.source_id, m.timestamp AS created_at, m.updated_at "
                 f"FROM memory_entities me JOIN memories m ON m.id = me.memory_id "
                 f"WHERE me.entity_id IN ({placeholders}) AND m.status='active'"
             )
             params = list(order)
             if agent_id is not None:
-                sql += " AND m.agent=?"
+                sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
                 params.append(agent_id)
+            sql, params = _append_profile_scope_sql(sql, params, profile_scope)
             with self.read() as cur:
                 cur.execute(sql, params)
                 memories_out = [dict(r) for r in cur.fetchall()]
@@ -1468,6 +1584,7 @@ class RemnantDB:
         agent_id: str | None = None,
         depth: int = 2,
         limit: int = 20,
+        profile_scope: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """Resolve entity names from the query, traverse the graph, and return
         linked active memories. Pure SQLite (no embedding / LLM work).
@@ -1481,7 +1598,9 @@ class RemnantDB:
             return []
         seen: dict[str, dict[str, Any]] = {}
         for eid in seed_ids:
-            res = self.traverse_graph(eid, depth=depth, agent_id=agent_id)
+            res = self.traverse_graph(
+                eid, depth=depth, agent_id=agent_id, profile_scope=profile_scope
+            )
             for m in res["memories"]:
                 mid = m["id"]
                 if mid not in seen:
@@ -1792,7 +1911,8 @@ class RemnantDB:
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 cur.execute(
-                    f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET status='forgotten', updated_at=? "
+                    f"WHERE id IN ({placeholders})",
                     [_now_iso(), *ids],
                 )
             cur.execute("DELETE FROM vault_passages WHERE path=? AND ordinal>?", (path, ordinal))
@@ -1843,7 +1963,8 @@ class RemnantDB:
             if ids:
                 placeholders = ",".join("?" for _ in ids)
                 cur.execute(
-                    f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                    f"UPDATE memories SET status='forgotten', updated_at=? "
+                    f"WHERE id IN ({placeholders})",
                     [_now_iso(), *ids],
                 )
             cur.execute("DELETE FROM vault_passages WHERE path=?", (path,))
@@ -1871,7 +1992,8 @@ class RemnantDB:
                 if ids:
                     placeholders = ",".join("?" for _ in ids)
                     cur.execute(
-                        f"UPDATE memories SET status='forgotten', updated_at=? WHERE id IN ({placeholders})",
+                        f"UPDATE memories SET status='forgotten', updated_at=? "
+                        f"WHERE id IN ({placeholders})",
                         [_now_iso(), *ids],
                     )
                     forgotten.extend(ids)
@@ -2199,6 +2321,30 @@ def _to_fts_query(query: str) -> str:
     if not tokens:
         return ""
     return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)
+
+
+def _append_profile_scope_sql(
+    sql: str,
+    params: list[Any],
+    profile_scope: list[str] | None,
+    *,
+    alias: str = "m",
+) -> tuple[str, list[Any]]:
+    """Apply vault profile scope before ranking and LIMIT.
+
+    Non-vault memories are not path-scoped. An empty effective scope therefore
+    excludes vault rows while retaining ordinary facts.
+    """
+    if profile_scope is None:
+        return sql, params
+    prefixes = normalize_profile_scope(profile_scope)
+    if not prefixes:
+        return sql + f" AND {alias}.source <> 'vault'", params
+    clauses: list[str] = []
+    for prefix in prefixes:
+        clauses.append(f"{alias}.source_id=? OR {alias}.source_id LIKE ?")
+        params.extend([prefix, prefix + "/%"])
+    return sql + f" AND ({alias}.source <> 'vault' OR ({' OR '.join(clauses)}))", params
 
 
 def _normalize_entity_name(name: str) -> str:

@@ -24,8 +24,9 @@ import httpx
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import _COMMON_NOUNS, _FUNCTION_WORDS, _STOPWORDS, _STOPLIST
+from .entity import _COMMON_NOUNS, _FUNCTION_WORDS, _STOPLIST, _STOPWORDS
 from .ingest import is_transient, store_memory
+from .llm import LLMResponseError, chat
 
 log = logging.getLogger("remnant.extract")
 
@@ -112,6 +113,9 @@ class ExtractionWorker:
         on its first iteration before handling the regular queue.
         """
         try:
+            recovered = self._db.recover_stale_extractions()
+            if recovered:
+                log.info("recovered %d stale extraction jobs", recovered)
             self._pending_startup = self._db.get_unextracted_turns(
                 self._config.agent_id, limit=200
             )
@@ -174,13 +178,21 @@ class ExtractionWorker:
             if job is None:
                 return
             try:
-                self._process(job)
-                self._db.complete_extraction(int(job["id"]))
+                fact_count = self._process(job) or 0
+                self._db.complete_extraction(int(job["id"]), fact_count=int(fact_count))
             except Exception as e:
                 log.warning("extraction failed for turn %s: %s", job["turn_id"], e)
-                self._db.fail_extraction(int(job["id"]))
+                self._db.fail_extraction(int(job["id"]), error=str(e))
 
-    def _process(self, job: dict[str, Any]) -> None:
+    def _process(self, job: dict[str, Any]) -> int:
+        """Process one claimed extraction job and return its parsed fact count.
+
+        Exceptions intentionally propagate to ``_drain``.  That method is the
+        durable queue boundary: it records a completed zero-fact result or
+        transitions the claim to retry/dead-letter state.  Direct callers must
+        therefore handle extraction and persistence errors themselves; this
+        method is not a best-effort, never-raises helper.
+        """
         t0 = time.perf_counter()
         facts = self._extract(job["user_text"], job["assistant_text"])
         for f in facts:
@@ -217,6 +229,7 @@ class ExtractionWorker:
             "extraction complete turn_id=%s facts=%s duration_ms=%.1f",
             job["turn_id"], len(facts), duration_ms,
         )
+        return len(facts)
 
     def _extract(self, user_text: str, assistant_text: str) -> list[dict[str, Any]]:
         if not self._config.extract_enabled:
@@ -224,25 +237,17 @@ class ExtractionWorker:
         content = f"USER: {user_text}\nASSISTANT: {assistant_text}"
         t0 = time.perf_counter()
         try:
-            resp = self._client.post(
-                self._config.extract_url,
-                json={
-                    "model": self._config.extract_model,
-                    "messages": [
-                        {"role": "system", "content": _EXTRACT_PROMPT},
-                        {"role": "user", "content": content},
-                    ],
-                    "stream": False,
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 4096,
-                    },
-                    "keep_alive": -1,
-                },
+            text = chat(
+                url=self._config.extract_url,
+                model=self._config.extract_model,
+                system=_EXTRACT_PROMPT,
+                user=content,
+                timeout=self._config.extract_timeout,
+                protocol=getattr(self._config, "llm_protocol", None),
+                temperature=0.1,
+                max_tokens=4096,
+                client=self._client,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            text = data["message"]["content"]
             facts = _parse_facts(text)
             duration_ms = (time.perf_counter() - t0) * 1000.0
             log.debug(
@@ -250,13 +255,13 @@ class ExtractionWorker:
                 duration_ms, len(facts),
             )
             return facts
-        except (httpx.HTTPError, KeyError, ValueError, json.JSONDecodeError) as e:
+        except (httpx.HTTPError, LLMResponseError, ValueError, json.JSONDecodeError) as e:
             duration_ms = (time.perf_counter() - t0) * 1000.0
             log.warning(
                 "extraction failed duration_ms=%.1f error=%s",
                 duration_ms, e,
             )
-            return []
+            raise
 
     def stop(self) -> None:
         self._stop.set()
@@ -315,7 +320,12 @@ def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]
         if not raw or len(raw.strip()) == 0:
             continue
         key = raw.lower()
-        if key in _STOPWORDS_LOWER or key in _STOPLIST or key in _FUNCTION_WORDS or key in _COMMON_NOUNS:
+        if (
+            key in _STOPWORDS_LOWER
+            or key in _STOPLIST
+            or key in _FUNCTION_WORDS
+            or key in _COMMON_NOUNS
+        ):
             continue
         # Drop short lowercase noise; keep all-caps acronyms (e.g. ``AI``)
         # and title-cased proper-noun initials (e.g. ``Ai``).
