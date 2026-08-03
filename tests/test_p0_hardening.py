@@ -5,10 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
+import pytest
 
 from remnant.config import RemnantConfig
 from remnant.db import default_db_path, open_db
 from remnant.dream import night_dream
+from remnant.extract import ExtractionWorker
 from remnant.llm import chat
 from remnant.search import search
 from remnant.vault import index_vault
@@ -148,6 +150,26 @@ def test_failed_extraction_is_retryable_and_not_successful():
         assert turn_row["extraction_status"] == "retry_wait"
     finally:
         db.close()
+
+
+def test_extraction_process_contract_propagates_failures(monkeypatch):
+    worker = ExtractionWorker(object(), object(), RemnantConfig())
+    monkeypatch.setattr(
+        worker,
+        "_extract",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("endpoint unavailable")),
+    )
+    try:
+        with pytest.raises(RuntimeError, match="endpoint unavailable"):
+            worker._process(
+                {
+                    "turn_id": 1,
+                    "user_text": "hello",
+                    "assistant_text": "hi",
+                }
+            )
+    finally:
+        worker.stop()
 
 
 def test_llm_adapter_normalizes_native_and_openai_responses():

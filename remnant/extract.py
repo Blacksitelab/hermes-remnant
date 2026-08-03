@@ -185,6 +185,14 @@ class ExtractionWorker:
                 self._db.fail_extraction(int(job["id"]), error=str(e))
 
     def _process(self, job: dict[str, Any]) -> int:
+        """Process one claimed extraction job and return its parsed fact count.
+
+        Exceptions intentionally propagate to ``_drain``.  That method is the
+        durable queue boundary: it records a completed zero-fact result or
+        transitions the claim to retry/dead-letter state.  Direct callers must
+        therefore handle extraction and persistence errors themselves; this
+        method is not a best-effort, never-raises helper.
+        """
         t0 = time.perf_counter()
         facts = self._extract(job["user_text"], job["assistant_text"])
         for f in facts:
