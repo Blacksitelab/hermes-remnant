@@ -45,18 +45,30 @@ class _SessionEmbedder:
     in a prefetch call. Falls back to the underlying embedder transparently.
     """
 
-    def __init__(self, embedder: Embedder, query: str, qvec: list[float] | None = None):
+    def __init__(
+        self,
+        embedder: Embedder,
+        query: str,
+        qvec: list[float] | None = None,
+        *,
+        query_attempted: bool = False,
+    ):
         self._embedder = embedder
         self._query = query
         self._qvec: list[float] | None = qvec
+        self._query_attempted = query_attempted
 
     def embed(self, text: str) -> list[float] | None:
         # Reuse the cached query vector when the text matches the session query,
         # otherwise delegate to the real embedder (which has its own SQLite cache).
         # A None qvec means the query embedding failed upstream; we propagate
         # None so semantic search skips cosine comparison rather than zero-scoring.
-        if text == self._query and self._qvec is not None:
-            return self._qvec
+        if text == self._query:
+            # ``None`` is a meaningful cached failure.  Retrying here would
+            # issue another blocking network request after prefetch has already
+            # spent its embedding budget.
+            if self._query_attempted:
+                return self._qvec
         return self._embedder.embed(text)
 
 # --- Hermes ABC -----------------------------------------------------------
@@ -166,6 +178,12 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "required": False,
     },
     {
+        "key": "embed_keep_alive",
+        "description": "Ollama embedding model residency (finite duration recommended)",
+        "default": "10m",
+        "required": False,
+    },
+    {
         "key": "extract_url",
         "description": "Extraction LLM chat endpoint (Ollama /api/chat or OpenAI-compatible /v1)",
         "default": "http://your-ollama-host.local:11434/api/chat",
@@ -175,6 +193,12 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "extract_model",
         "description": "Extraction LLM model name",
         "default": "gemma4:12b",
+        "required": False,
+    },
+    {
+        "key": "extract_keep_alive",
+        "description": "Ollama extraction model residency (finite duration recommended)",
+        "default": "2m",
         "required": False,
     },
     {
@@ -231,6 +255,12 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "key": "vault_reindex_interval_s",
         "description": "Minimum seconds between automatic vault re-index passes",
         "default": DEFAULT_VAULT_REINDEX_INTERVAL_S,
+        "required": False,
+    },
+    {
+        "key": "prefetch_embedding_timeout_ms",
+        "description": "Maximum milliseconds reserved for a prefetch query embedding",
+        "default": 250,
         "required": False,
     },
 ]
@@ -368,7 +398,13 @@ class RemnantMemoryProvider(MemoryProvider):
 
     # -- prefetch (Phase 2) ---------------------------------------------------
 
-    def _session_embedder(self, session_id: str, query: str) -> _SessionEmbedder | None:
+    def _session_embedder(
+        self,
+        session_id: str,
+        query: str,
+        *,
+        timeout_s: float | None = None,
+    ) -> _SessionEmbedder | None:
         """Return an embedder wrapper that caches the query vector per session.
 
         Computes the single Ollama query embedding once (the only network call
@@ -380,7 +416,12 @@ class RemnantMemoryProvider(MemoryProvider):
         cached = self._session_query_vec.get(session_id)
         if cached is None:
             try:
-                cached = self._embedder.embed(query)
+                try:
+                    cached = self._embedder.embed(query, timeout=timeout_s)
+                except TypeError:
+                    # Keep compatibility with lightweight test/custom
+                    # embedders that expose only embed(text).
+                    cached = self._embedder.embed(query)
             except Exception:
                 cached = None
             if cached:
@@ -388,7 +429,12 @@ class RemnantMemoryProvider(MemoryProvider):
         # When embed() returned None (remote failure), pass None as the cached
         # qvec so _SessionEmbedder.embed propagates None and semantic search is
         # skipped instead of scoring against a zero vector.
-        return _SessionEmbedder(self._embedder, query, qvec=cached)
+        return _SessionEmbedder(
+            self._embedder,
+            query,
+            qvec=cached,
+            query_attempted=True,
+        )
 
     def prefetch(
         self, query: str, *, session_id: str = "",

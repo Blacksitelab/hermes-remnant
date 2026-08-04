@@ -49,9 +49,10 @@ class Embedder:
         self._model = config.embed_model
         self._url = config.embed_url
         self._timeout = config.embed_timeout
+        self._keep_alive = getattr(config, "embed_keep_alive", "10m")
         self._client = httpx.Client(timeout=self._timeout)
 
-    def embed(self, text: str) -> list[float] | None:
+    def embed(self, text: str, *, timeout: float | None = None) -> list[float] | None:
         """Return the embedding for `text`, hitting the cache when possible.
 
         Returns ``None`` when the remote embedding call fails (and nothing is
@@ -68,17 +69,27 @@ class Embedder:
         cached = self._db.get_cached_embedding(self._model, text_hash)
         if cached is not None:
             return cached
-        vec = self._embed_remote(text)
+        vec = self._embed_remote(text, timeout=timeout)
         if vec is None:
             return None
         self._db.put_cached_embedding(self._model, text_hash, vec)
         return vec
 
-    def _embed_remote(self, text: str) -> list[float] | None:
+    def _embed_remote(self, text: str, *, timeout: float | None = None) -> list[float] | None:
         try:
+            # A prefetch call supplies a much smaller per-request timeout than
+            # the general client timeout.  Passing it to the request is
+            # essential: a client-level 30s timeout defeats prefetch's 500ms
+            # deadline when Ollama accepts a connection but queues the work.
+            request_timeout = self._timeout if timeout is None else max(0.001, float(timeout))
             resp = self._client.post(
                 self._url,
-                json={"model": self._model, "prompt": text, "keep_alive": -1},
+                timeout=request_timeout,
+                json={
+                    "model": self._model,
+                    "prompt": text,
+                    "keep_alive": getattr(self, "_keep_alive", "10m"),
+                },
             )
             resp.raise_for_status()
             data = resp.json()

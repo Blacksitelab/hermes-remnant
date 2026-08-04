@@ -109,15 +109,30 @@ def test_load_config_defaults(hermes_home: Path):
     cfg = load_config(str(hermes_home))
     assert cfg.embed_model == "nomic-embed-text"
     assert cfg.embed_url == "http://your-ollama-host.local:11434/api/embeddings"
+    assert cfg.embed_keep_alive == "10m"
     assert cfg.extract_model == "gemma4:12b"
+    assert cfg.extract_keep_alive == "2m"
+    assert cfg.prefetch_embedding_timeout_ms == 250
     assert cfg.default_visibility == "private"
 
 
 def test_save_and_reload_config(hermes_home: Path):
-    save_config({"extract_enabled": False, "agent_id": "fleet-1"}, str(hermes_home))
+    save_config(
+        {
+            "extract_enabled": False,
+            "agent_id": "fleet-1",
+            "embed_keep_alive": "1h",
+            "prefetch_embedding_timeout_ms": 175,
+        },
+        str(hermes_home),
+    )
+    # A later partial setup update must not reset hand-tuned safety settings.
+    save_config({"agent_id": "fleet-2"}, str(hermes_home))
     cfg = load_config(str(hermes_home))
     assert cfg.extract_enabled is False
-    assert cfg.agent_id == "fleet-1"
+    assert cfg.agent_id == "fleet-2"
+    assert cfg.embed_keep_alive == "1h"
+    assert cfg.prefetch_embedding_timeout_ms == 175
     # Defaults preserved for unspecified fields
     assert cfg.embed_model == "nomic-embed-text"
 

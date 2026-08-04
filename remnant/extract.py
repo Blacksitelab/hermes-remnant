@@ -96,6 +96,7 @@ class ExtractionWorker:
         self._db = db
         self._embedder = embedder
         self._config = config
+        self._keep_alive = getattr(config, "extract_keep_alive", "2m")
         self._client = httpx.Client(timeout=config.extract_timeout)
         self._stop = threading.Event()
         self._executor: Any = None
@@ -247,6 +248,7 @@ class ExtractionWorker:
                 temperature=0.1,
                 max_tokens=4096,
                 client=self._client,
+                keep_alive=self._keep_alive,
             )
             facts = _parse_facts(text)
             duration_ms = (time.perf_counter() - t0) * 1000.0

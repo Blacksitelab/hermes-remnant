@@ -17,7 +17,6 @@ from typing import Any
 
 from .config import RemnantConfig
 from .db import RemnantDB
-from .embed import Embedder
 from .search import search as hybrid_search
 
 # Intent classifier: keywords that signal the user is asking about something
@@ -227,16 +226,15 @@ def prefetch(
 ) -> dict[str, Any]:
     """Run hybrid retrieval, dedup, budget, and diff-based suppression.
 
-    Returns ``{}`` when memory isn't needed, the deadline is exceeded, the
-    token budget would be blown, or the injected context is unchanged since
-    the last call in this session. Otherwise returns::
+    Returns ``{}`` when memory isn't needed, no usable result is found, the
+    token budget cannot fit any result, or the injected context is unchanged
+    since the last call in this session. Otherwise returns::
 
         {"context": <compact block str>, "memories": [...], "token_estimate": int,
          "hash": <sha256 hex>, "session_id": <sid>}
     """
     cfg: RemnantConfig = provider._config
     db: RemnantDB = provider._db
-    embedder: Embedder = provider._embedder
     agent_id = cfg.agent_id
 
     def _record(outcome: str, reason: str | None, t0: float,
@@ -265,15 +263,11 @@ def prefetch(
     deadline_s = deadline_ms / 1000.0
     t0 = time.monotonic()
 
-    # Single network call for the query embedding; cached per session by the
-    # provider. We pass the session-scoped embedder wrapper if present.
-    session_embedder = provider._session_embedder(session_id, query) or embedder
-
     limit = cfg.search_limit
 
-    # Run hybrid retrieval exactly once for the original request. Query
-    # expansion is useful lexical recall, but embedding every expansion turns a
-    # 500ms prefetch budget into several unbounded network requests.
+    # Build a local keyword baseline first.  This is intentionally before any
+    # network call: if Ollama is busy or unavailable, BM25 results remain
+    # usable and can still be injected within the prefetch deadline.
     seen_ids: set[str] = set()
     merged: list[dict[str, Any]] = []
     expansions = [query]
@@ -293,28 +287,73 @@ def prefetch(
     except Exception:
         pass  # Never let graph expansion break prefetch.
 
-    for term in expansions:
-        if time.monotonic() - t0 > deadline_s:
-            _record("empty", "deadline", t0)
-            return {}
-        try:
-            results = hybrid_search(
-                db, cfg, term,
-                agent_id=agent_id,
-                limit=limit,
-                strategy="auto" if term == query else "keyword",
-                embedder=session_embedder,
-            )
-        except Exception:
-            results = []
+    def _merge(results: list[dict[str, Any]]) -> None:
         for r in results:
             mid = r.get("id")
             if mid and mid not in seen_ids:
                 seen_ids.add(mid)
                 merged.append(r)
 
+    for term in expansions:
+        if time.monotonic() - t0 >= deadline_s:
+            break
+        try:
+            results = hybrid_search(
+                db, cfg, term,
+                agent_id=agent_id,
+                limit=limit,
+                strategy="keyword",
+                embedder=None,
+            )
+        except Exception:
+            results = []
+        _merge(results)
+
+    # Try one bounded semantic pass after the lexical baseline exists.  The
+    # request timeout is shorter than the overall deadline and leaves room for
+    # formatting/SQLite work.  A failed attempt is a normal degraded path, not
+    # a reason to throw away the keyword baseline.
+    semantic_ready = False
+    embedding_budget_ms = int(getattr(cfg, "prefetch_embedding_timeout_ms", 250) or 0)
+    remaining_ms = max(0.0, deadline_s * 1000.0 - (time.monotonic() - t0) * 1000.0)
+    embedding_budget_ms = min(embedding_budget_ms, max(0, int(remaining_ms - 50)))
+    session_embedder = None
+    if embedding_budget_ms > 0:
+        session_embedder = provider._session_embedder(
+            session_id,
+            query,
+            timeout_s=embedding_budget_ms / 1000.0,
+        )
+        semantic_ready = bool(provider._session_query_vec.get(session_id))
+        semantic_remaining_ms = (
+            deadline_s * 1000.0 - (time.monotonic() - t0) * 1000.0
+        )
+        # Exact-vector ranking is local but can still scan thousands of BLOBs;
+        # do not start it when there is no room left for ranking and formatting.
+        if semantic_ready and semantic_remaining_ms >= 100:
+            try:
+                semantic_results = hybrid_search(
+                    db,
+                    cfg,
+                    query,
+                    agent_id=agent_id,
+                    limit=limit,
+                    strategy="auto",
+                    embedder=session_embedder,
+                )
+            except Exception:
+                semantic_results = []
+            # Put the hybrid ranking ahead of expansion-only keyword results,
+            # while still retaining every lexical result not already present.
+            original_merged = list(merged)
+            merged.clear()
+            seen_ids.clear()
+            _merge(semantic_results)
+            _merge(original_merged)
+
     if not merged:
-        _record("empty", "no_results", t0)
+        reason = "deadline" if time.monotonic() - t0 >= deadline_s else "no_results"
+        _record("empty", reason, t0)
         return {}
 
     # Dedup against current conversation messages.
@@ -336,7 +375,9 @@ def prefetch(
             f"- [{m.get('visibility','private')}] {_safe_memory_text(m.get('content', ''))}"
         )
         if running + line_tokens > budget:
-            break
+            # A single oversized vault note must not prevent later, compact
+            # facts from being injected.
+            continue
         selected.append(m)
         running += line_tokens
     if not selected:
@@ -348,9 +389,9 @@ def prefetch(
         _record("empty", "budget_overflow", t0)
         return {}
 
-    if time.monotonic() - t0 > deadline_s:
-        _record("empty", "deadline_post_format", t0)
-        return {}
+    # The remote portion is strictly bounded above.  If local formatting runs
+    # a few milliseconds over, preserve the already-safe lexical fallback
+    # rather than converting a useful result into an empty injection.
 
     ctx_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
     # Diff-based suppression: same context as last turn in this session.
@@ -359,7 +400,8 @@ def prefetch(
         return {}
     provider._last_injected_hash[session_id] = ctx_hash
 
-    _record("injected", None, t0, count=len(selected),
+    injection_reason = None if semantic_ready else "semantic_timeout_keyword_fallback"
+    _record("injected", injection_reason, t0, count=len(selected),
             tokens=_approx_tokens(context))
     return {
         "context": context,
@@ -373,4 +415,10 @@ def prefetch(
     }
 
 
-__all__ = ["prefetch", "_needs_memory", "_expand_queries", "_graph_expand", "_entity_lookup_phrases"]
+__all__ = [
+    "prefetch",
+    "_needs_memory",
+    "_expand_queries",
+    "_graph_expand",
+    "_entity_lookup_phrases",
+]
