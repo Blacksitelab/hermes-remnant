@@ -319,8 +319,10 @@ The default vault path can be overridden with the `REMNANT_VAULT_PATH` env var b
 agent_id: default
 embed_url: http://your-ollama-host.local:11434/api/embeddings
 embed_model: nomic-embed-text
+embed_keep_alive: 10m
 extract_url: http://your-ollama-host.local:11434/v1/chat/completions
 extract_model: gemma4:12b
+extract_keep_alive: 2m
 extract_enabled: true
 default_visibility: private
 vault_path: /path/to/your/obsidian-vault
@@ -337,7 +339,13 @@ dream_night_model: deepseek-v4-flash:cloud
 dream_cooldown_minutes: 120
 injection_token_budget: 2000
 injection_prefetch_deadline_ms: 500
+prefetch_embedding_timeout_ms: 250
 ```
+
+Prefetch always establishes a local BM25 baseline before attempting the remote
+query embedding. If Ollama is busy or unavailable, that keyword context is
+injected instead of blocking or dropping recall. Keep-alive values are finite by
+default because extraction and embedding commonly share one Ollama host.
 
 **GLiNER entity extraction** is enabled by default when the `gliner` package is installed. No configuration needed — the model (`urchade/gliner_small_v2`) is downloaded automatically on first use from HuggingFace (no token required). If `gliner` is not installed, the regex extractor runs automatically.
 

@@ -46,6 +46,7 @@ def chat(
     protocol: str | None = None,
     temperature: float = 0.1,
     max_tokens: int = 4096,
+    keep_alive: str | int | float = "2m",
     client: httpx.Client | None = None,
 ) -> str:
     """Call a configured chat endpoint and return normalized text.
@@ -64,7 +65,7 @@ def chat(
             "messages": messages,
             "stream": False,
             "options": {"temperature": temperature, "num_predict": max_tokens},
-            "keep_alive": -1,
+            "keep_alive": keep_alive,
         }
     else:
         payload = {

@@ -16,9 +16,11 @@ from typing import Any
 DEFAULT_EMBED_URL = "http://your-ollama-host.local:11434/api/embeddings"
 DEFAULT_EMBED_MODEL = "nomic-embed-text"
 EMBED_DIM = 768
+DEFAULT_EMBED_KEEP_ALIVE = "10m"
 
 DEFAULT_EXTRACT_URL = "http://your-ollama-host.local:11434/api/chat"
 DEFAULT_EXTRACT_MODEL = "gemma4:12b"
+DEFAULT_EXTRACT_KEEP_ALIVE = "2m"
 
 # Phase 4: Obsidian vault indexing. The vault is the single source of truth for
 # notes; we index it as type='document' memories. Excluded folders hold agent
@@ -78,6 +80,10 @@ QUEUE_MAX = 256
 DEFAULT_INJECTION_TOKEN_BUDGET = 2000
 DEFAULT_INJECTION_PREFETCH_DEADLINE_MS = 500
 DEFAULT_PREFETCH_ENABLED = True
+# Maximum time reserved for the one remote query-embedding call inside
+# prefetch().  The remainder of the 500ms prefetch budget is kept for local
+# search, formatting, and SQLite diagnostics.
+DEFAULT_PREFETCH_EMBEDDING_TIMEOUT_MS = 250
 # Upper bound for the local exact-vector scan. The default covers a personal
 # or small fleet store while keeping retrieval predictable; use an ANN index
 # once the corpus grows beyond this operational ceiling.
@@ -100,6 +106,9 @@ class RemnantConfig:
     embed_model: str = DEFAULT_EMBED_MODEL
     embed_dim: int = EMBED_DIM
     embed_timeout: float = 30.0
+    # Ollama model residency must be finite: extraction and embedding share a
+    # host and an indefinitely pinned model can starve the other workload.
+    embed_keep_alive: str | int | float = DEFAULT_EMBED_KEEP_ALIVE
     extract_url: str = DEFAULT_EXTRACT_URL
     extract_model: str = DEFAULT_EXTRACT_MODEL
     extract_timeout: float = 120.0
@@ -108,6 +117,7 @@ class RemnantConfig:
     # ``auto`` infers Ollama-native vs OpenAI-compatible chat behavior from the
     # endpoint path. Deployments can pin the protocol during migration.
     llm_protocol: str = "auto"
+    extract_keep_alive: str | int | float = DEFAULT_EXTRACT_KEEP_ALIVE
     reflect_url: str = DEFAULT_REFLECT_URL
     reflect_model: str = DEFAULT_REFLECT_MODEL
     reflect_timeout: float = 60.0
@@ -124,6 +134,7 @@ class RemnantConfig:
     diary_path: str = DEFAULT_DREAM_DIARY_PATH
     injection_token_budget: int = DEFAULT_INJECTION_TOKEN_BUDGET
     injection_prefetch_deadline_ms: int = DEFAULT_INJECTION_PREFETCH_DEADLINE_MS
+    prefetch_embedding_timeout_ms: int = DEFAULT_PREFETCH_EMBEDDING_TIMEOUT_MS
     prefetch_enabled: bool = DEFAULT_PREFETCH_ENABLED
     dedup_cosine_threshold: float = DEDUP_COSINE_THRESHOLD
     dedup_candidates: int = DEDUP_CANDIDATES
@@ -212,7 +223,8 @@ def save_config(values: dict[str, Any], hermes_home: str | Path) -> Path:
         except (OSError, json.JSONDecodeError):
             existing = {}
     # Preserve settings not exposed by the current dashboard schema. This is
-    # important for hand-tuned timeouts, budgets, and rollout flags.
+    # important for hand-tuned timeouts, budgets, and rollout flags, including
+    # finite keep-alive values.
     merged = RemnantConfig.from_dict({**existing, **(values or {})}).to_dict()
     fd, temp_name = tempfile.mkstemp(prefix=".remnant-", suffix=".json", dir=p.parent)
     try:
