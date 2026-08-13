@@ -22,7 +22,7 @@
 - Existing databases migrate additively to schema 14; no memory rows are
   deleted or re-scoped by the migration.
 - New correctness behaviors default to `false` for compatibility. Enable the
-  six release-track flags together for a canary, measure the evaluation and
+  seven release-track flags together for a canary, measure the evaluation and
   health gates, then make the rollout decision per deployment.
 - Rollback is configuration-only: disable the flags and retain the evidence
   and claim metadata for later inspection.
