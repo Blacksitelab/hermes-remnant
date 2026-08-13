@@ -19,6 +19,7 @@ _HISTORY_RE = re.compile(
     r"\b(when|then|before|previously|used to|historical|history|at that time)\b",
     re.I,
 )
+_DATE_RE = re.compile(r"\b(20\d{2}-[01]\d-[0-3]\d)\b")
 
 
 def retrieval_query(query: str) -> str:
@@ -86,6 +87,12 @@ def resolve_results(
     if not results:
         return []
     now = now or datetime.now(timezone.utc)
+    date_match = _DATE_RE.search(query or "")
+    if date_match:
+        try:
+            now = datetime.fromisoformat(date_match.group(1)).replace(tzinfo=timezone.utc)
+        except ValueError:
+            pass
     claims = db.get_claims_for_memories([str(row.get("id")) for row in results if row.get("id")])
     history = bool(_HISTORY_RE.search(query or ""))
     enriched: list[dict[str, Any]] = []
@@ -138,7 +145,7 @@ def resolve_results(
 
     selected = list(unclaimed)
     for items in groups.values():
-        if history:
+        if history and not date_match:
             selected.extend(items)
             continue
         matching = [item for item in items if item.get("condition_match")]

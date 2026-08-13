@@ -14,6 +14,7 @@ Strategies:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
@@ -160,6 +161,14 @@ def search(
     # viewer is treated as a non-owner anonymous search (locked content masked).
     viewer = agent_id if agent_id is not None else config.agent_id
     lexical_query = retrieval_query(query)
+    history_intent = bool(
+        re.search(
+            r"\b(when|then|before|previously|used to|historical|history|at that time)\b",
+            query,
+            re.I,
+        )
+        or re.search(r"\b20\d{2}-[01]\d-[0-3]\d\b", query)
+    )
 
     if strategy == "graph":
         from .graph import graph_search
@@ -179,6 +188,7 @@ def search(
             lexical_query,
             agent_id=agent_id,
             profile_scope=scope,
+            include_historical=history_intent and config.claim_aware_ranking_enabled,
             limit=limit * 3 if (visibility or scope) else limit,
         )
         results = _attach_source(db, results)
@@ -210,6 +220,7 @@ def search(
         lexical_query,
         agent_id=agent_id,
         profile_scope=scope,
+        include_historical=history_intent and config.claim_aware_ranking_enabled,
         limit=max(limit * 3, 100),
     )
     sem = _semantic_rank(

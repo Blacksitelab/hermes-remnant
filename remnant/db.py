@@ -1300,6 +1300,7 @@ class RemnantDB:
         agent_id: str | None = None,
         visibility: str | None = None,
         profile_scope: list[str] | None = None,
+        include_historical: bool = False,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """BM25 keyword search over active memories, optionally filtered.
@@ -1318,7 +1319,8 @@ class RemnantDB:
             "m.timestamp AS created_at, m.updated_at, "
             "bm25(memories_fts) AS score "
             "FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid "
-            "WHERE memories_fts MATCH ? AND m.status='active'"
+            "WHERE memories_fts MATCH ? AND "
+            + ("m.status IN ('active','superseded')" if include_historical else "m.status='active'")
         )
         params: list[Any] = [fts_query]
         if agent_id is not None:
