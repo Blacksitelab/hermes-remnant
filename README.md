@@ -362,6 +362,14 @@ recent_turn_overlay_enabled: true
 relation_evidence_enabled: true
 ```
 
+The 2,000-token injection budget is the recommended ceiling. Resolved context
+allocates it deterministically across current claims (60%), uncertainty and
+conditional evidence (20%), supporting document/provenance passages (15%),
+and recent unprocessed turns (5%), redistributing unused capacity while
+preferring complete compact claims. Integrations that expose the Hermes
+deployment tokenizer can pass it to the recall service; standalone operation
+uses a conservative offline counter.
+
 Prefetch always establishes a local BM25 baseline before attempting the remote
 query embedding. If Ollama is busy or unavailable, that keyword context is
 injected instead of blocking or dropping recall. Keep-alive values are finite by
@@ -490,6 +498,13 @@ python -m remnant.evaluate --cases retrieval-cases.json
 python -m remnant.maintenance health
 python -m remnant.maintenance migrate-default-agent --agent claire  # dry run
 python -m remnant.maintenance migrate-default-agent --agent claire --yes
+```
+
+Run the scale-envelope harness separately from unit CI before changing the
+exact-vector ceiling:
+
+```bash
+python -m remnant.evaluation.scale --sizes 5000 --probes 5 --output scale-report.json
 ```
 
 ### Release-track claim resolution

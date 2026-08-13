@@ -13,6 +13,14 @@ paraphrases, distractors, next-turn recall, vault/conversation competition,
 visibility, and runtime identity isolation. Each category contains twenty
 scenarios and includes explicit observation/query timestamps.
 
+The held-out adversarial corpus at
+`evaluation/cases/heldout-adversarial.jsonl` contains 120 natural-language
+scenarios (ten per category). It intentionally avoids the synthetic
+`signal-*` identifiers used by the leadership regression corpus and exercises
+question wording, inflection, possessives, conditions, pending turns, and
+shared-vault/private-agent boundaries. It is a release gate, not a claim of
+cross-provider superiority.
+
 Reports include recall@1/3/5, MRR, nDCG@5, context precision, wrong-answer rate,
 stale-claim exposure, duplicate occupancy, token estimates, per-stage latency,
 category summaries, ranking profile, schema, embedding model, commit, and seed.
@@ -23,6 +31,9 @@ Release procedure:
 ```bash
 python -m remnant.evaluate --cases evaluation/cases/leadership.jsonl --layer retrieval
 python -m remnant.evaluate --cases evaluation/cases/leadership.jsonl --layer context
+python -m remnant.evaluate --cases evaluation/cases/heldout-adversarial.jsonl --layer retrieval
+python -m remnant.evaluate --cases evaluation/cases/heldout-adversarial.jsonl --layer context
+python -m remnant.evaluation.scale --sizes 5000 --probes 5 --output scale-report.json
 python -m pytest -q
 python -m ruff check remnant tests
 python -m build

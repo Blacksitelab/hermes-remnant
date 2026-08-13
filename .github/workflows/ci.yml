@@ -33,6 +33,13 @@ jobs:
           r=evaluate_scenarios(load_cases('evaluation/cases/leadership.jsonl'))['summary'];
           assert r['cases'] == 240 and r['recall_at_5'] >= .85 and
           r['stale_claim_exposure'] == 0"
+      - name: Run held-out adversarial evaluation
+        run: >-
+          python -c "from remnant.evaluation.schema import load_cases;
+          from remnant.evaluation.runner import evaluate_scenarios;
+          r=evaluate_scenarios(load_cases('evaluation/cases/heldout-adversarial.jsonl'))['summary'];
+          assert r['cases'] == 120 and r['recall_at_5'] >= .85 and
+          r['stale_claim_exposure'] == 0 and r['duplicate_top_k_occupancy'] == 0"
       - name: Lint whole repository
         run: python -m ruff check remnant tests
       - name: Smoke-test fresh database and health

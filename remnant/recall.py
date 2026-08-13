@@ -44,6 +44,9 @@ class RecallRequest:
     token_budget: int | None = None
     include_pending: bool = False
     output_mode: OutputMode = "results"
+    # Hermes may supply its deployment tokenizer.  Offline callers leave this
+    # unset and the conservative character fallback remains deterministic.
+    token_counter: Callable[[str], int] | None = None
 
 
 @dataclass
@@ -259,7 +262,9 @@ class RecallService:
         if request.output_mode == "context":
             budget = effective_budget
             if getattr(self.config, "resolved_context_enabled", False):
-                context = compile_context(results, token_budget=budget)
+                context = compile_context(
+                    results, token_budget=budget, token_counter=request.token_counter
+                )
             else:
                 context = _legacy_context(results, budget)
             diagnostics["token_estimate"] = conservative_token_count(context)

@@ -44,7 +44,11 @@ def _seed_case(db: Any, case: dict[str, Any]) -> tuple[dict[str, str], dict[str,
             agent = str(turn.get("agent") or case["persona"])
             if turn.get("pending"):
                 turn_id = db.insert_turn_with_extraction(
-                    session_id=str(turn.get("session_id") or case["case_id"]),
+                    session_id=str(
+                        turn.get("session_id")
+                        or case["query"].get("session_id")
+                        or case["case_id"]
+                    ),
                     agent_id=agent,
                     user_text=str(turn["user"]),
                     assistant_text=str(turn.get("assistant") or ""),

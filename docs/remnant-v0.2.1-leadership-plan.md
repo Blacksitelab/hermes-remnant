@@ -1,13 +1,14 @@
 # Remnant v0.2.1 leadership plan
 
-Status: implementation handoff
+Status: implementation branch
 
 Implementation status: WP-01, WP-02, the production-ranker portion of WP-03,
 the first calibrated-lane portion of WP-04, the evidence safeguard in WP-05,
 and the named setup profiles in WP-09 are implemented on the current branch.
-Held-out corpus expansion, tokenizer-aware allocation, large-corpus benchmark,
-ANN selection, provider-neutral comparison, and optional profile/session
-synthesis remain gated follow-up work.
+Held-out/adversarial gates, tokenizer-aware allocation, and the reproducible
+scale-envelope harness are implemented on the current branch. ANN selection,
+provider-neutral comparison, and optional profile/session synthesis remain
+measurement-gated follow-up work.
 
 Repository scope: `Blacksitelab/hermes-remnant` only
 
@@ -313,6 +314,15 @@ Implementation:
    supported target. Keep exact search as the oracle.
 5. Any ANN candidate must lose no more than `0.01` recall@5 and must demonstrate
    a material latency or memory improvement.
+
+The scale harness is intentionally excluded from ordinary CI because the 1m
+store is a deployment measurement, not a unit test. Run a small smoke locally
+with `python -m remnant.evaluation.scale --sizes 5000 --probes 5`, then publish
+the full envelope with the default sizes on the target hardware. The report
+records Python, SQLite, dimensions, seed, embedding gaps, cache state, ingest
+throughput, database size, peak memory, exact-vector latency, full recall-path
+latency, and recall@5. Exact search remains the oracle until a candidate meets
+the stated recall and improvement gates.
 
 ## WP-08: Close product-level gaps
 

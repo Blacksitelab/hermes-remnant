@@ -433,6 +433,7 @@ def prefetch(
             messages=messages,
             token_budget=budget,
             output_mode="context",
+            token_counter=getattr(provider, "_token_counter", None),
         ),
         candidates=merged,
     )
