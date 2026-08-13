@@ -912,6 +912,19 @@ class RemnantDB:
                 (_now_iso(), memory_id),
             )
 
+    def find_active_memory_by_content(
+        self, content: str, *, agent_id: str
+    ) -> dict[str, Any] | None:
+        """Find one exact active memory for a mirrored built-in write."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM memories WHERE content=? AND agent=? AND status='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (content, agent_id),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
+
     # -- structured claims ----------------------------------------------------
 
     def create_claim(

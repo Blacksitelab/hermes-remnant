@@ -180,6 +180,9 @@ class RemnantConfig:
     ranking_profile: str = "legacy"
     recent_turn_overlay_limit: int = 3
     recent_turn_overlay_max_age_s: int = 900
+    prefetch_cache_ttl_s: int = 60
+    prefetch_cache_max_entries: int = 32
+    runtime_user_aliases: dict[str, str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

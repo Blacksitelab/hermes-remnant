@@ -15,6 +15,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from .db import SCHEMA_VERSION, RemnantDB, default_db_path, open_db
+from .identity import effective_identity
 
 
 def health_report(db: RemnantDB) -> dict[str, Any]:
@@ -120,7 +121,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--dry-run", action="store_true", help="Preview only; this is the default."
     )
     migrate.add_argument("--yes", action="store_true", help="Apply the migration.")
+    identity = subparsers.add_parser(
+        "identity", help="Preview a privacy-preserving runtime identity mapping."
+    )
+    identity.add_argument("--configured-agent", default="default")
+    identity.add_argument("--session", default="diagnostic")
+    identity.add_argument("--platform", default="cli")
+    identity.add_argument("--agent-identity", default="")
+    identity.add_argument("--workspace", default="")
+    identity.add_argument("--user-id", default="")
     args = parser.parse_args(argv)
+    if args.command == "identity":
+        report = effective_identity(
+            configured_agent=args.configured_agent,
+            session_id=args.session,
+            runtime_identity_enabled=True,
+            platform=args.platform,
+            agent_identity=args.agent_identity,
+            agent_workspace=args.workspace,
+            user_id=args.user_id,
+        ).diagnostic()
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0
     db = open_db(default_db_path())
     try:
         if args.command == "health":

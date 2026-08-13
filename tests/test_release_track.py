@@ -98,7 +98,7 @@ def test_runtime_identity_scopes_provider_and_non_primary_skips_writes(
         platform="cli",
     )
     try:
-        assert provider._config.agent_id == "hermes:coder"  # type: ignore[union-attr]
+        assert provider._config.agent_id.startswith("identity:v1:")  # type: ignore[union-attr]
         provider.sync_turn("should not persist", "", session_id="s1")
         assert provider._db.pending_extraction_count(agent_id="hermes:coder") == 0  # type: ignore[union-attr]
     finally:
