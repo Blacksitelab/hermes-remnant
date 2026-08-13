@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .db import RemnantDB
+from .reconcile import decide_reconciliation
 
 
 def _claim_parts(subject: str, fact: str) -> tuple[str, str]:
@@ -90,6 +91,7 @@ def record_claim_from_memory(
     claim_data: dict[str, Any] | None = None,
     reconciliation_enabled: bool = False,
     source_turn_id: int | None = None,
+    agent_id: str | None = None,
 ) -> str | None:
     """Project a fact into an immutable, optionally reconciled claim.
 
@@ -101,11 +103,15 @@ def record_claim_from_memory(
     if not subject or subject.lower() == "general":
         return None
     predicate, object_value = _claim_parts(subject, fact)
+    if data_predicate := str((claim_data or {}).get("predicate") or "").strip():
+        predicate = re.sub(r"\s+", "_", data_predicate.casefold())
+    if data_object := str((claim_data or {}).get("object") or "").strip():
+        object_value = data_object
     if not object_value:
         return None
     data = dict(claim_data or {})
     observed_at = str(data.get("observed_at") or _now_iso())
-    active = db.get_active_claim(subject, predicate)
+    active = db.get_active_claim(subject, predicate, agent_id=agent_id)
     conflict_type = classify_claim_conflict(fact=fact, existing=active, claim_data=data)
     if not reconciliation_enabled:
         if (
@@ -113,16 +119,19 @@ def record_claim_from_memory(
             and _normalise_value(active.get("object")) != _normalise_value(object_value)
             and not contradicted
         ):
-            db.supersede_claims(subject=subject, predicate=predicate)
+            db.supersede_claims(subject=subject, predicate=predicate, agent_id=agent_id)
         conflict_type = "update" if active else "compatible"
-    elif (
-        active
-        and conflict_type == "update"
-        and float(data.get("confidence", confidence) or confidence) >= 0.75
-    ):
-        db.supersede_claims(subject=subject, predicate=predicate)
-    elif conflict_type == "duplicate":
+    decision = decide_reconciliation(
+        conflict_type=conflict_type,
+        confidence=float(data.get("confidence", confidence) or confidence),
+        active=active,
+    )
+    if reconciliation_enabled and decision.supersede:
+        db.supersede_claims(subject=subject, predicate=predicate, agent_id=agent_id)
+    elif reconciliation_enabled and decision.decision == "duplicate":
         return str(active.get("id")) if active else None
+    if reconciliation_enabled:
+        conflict_type = decision.decision
 
     qualifiers = data.get("qualifiers")
     if not isinstance(qualifiers, dict):
@@ -132,7 +141,7 @@ def record_claim_from_memory(
         qualifiers["conditions"] = conditions
     status = "contradicted" if contradicted or conflict_type == "contradiction" else "active"
     resolution_status = "contradicted" if status == "contradicted" else conflict_type
-    return db.create_claim(
+    claim_id = db.create_claim(
         memory_id=memory_id,
         subject=subject,
         predicate=predicate,
@@ -152,6 +161,23 @@ def record_claim_from_memory(
         extractor_version=data.get("extractor_version"),
         source_turn_id=source_turn_id,
     )
+    if reconciliation_enabled:
+        db.write_audit(
+            actor="system",
+            action="claim_reconcile",
+            memory_id=memory_id,
+            details={
+                "claim_id": claim_id,
+                "candidate_claim_id": active.get("id") if active else None,
+                "decision": decision.decision,
+                "rule": decision.rule,
+                "rule_version": "reconcile-v1",
+                "confidence": decision.confidence,
+                "source_turn_id": source_turn_id,
+                "superseded": decision.supersede,
+            },
+        )
+    return claim_id
 
 
 __all__ = ["record_claim_from_memory", "classify_claim_conflict"]

@@ -286,6 +286,7 @@ def store_memory(
         claim_data=claim_data,
         reconciliation_enabled=bool(getattr(config, "claim_reconciliation_enabled", False)),
         source_turn_id=source_turn_id,
+        agent_id=agent_id,
     )
 
     # Corroboration boost (issue #11): for each entity linked to this new

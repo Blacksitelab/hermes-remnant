@@ -9,7 +9,7 @@
   "recall_at_1": 1.0,
   "recall_at_3": 1.0,
   "recall_at_5": 1.0,
-  "remnant_schema": 12,
+  "remnant_schema": 13,
   "stale_claim_exposure": 0,
   "wrong_answer_rate": null
 }

@@ -14,6 +14,7 @@ from typing import Any
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
+from .lifecycle import MemoryLifecycle
 
 log = logging.getLogger("remnant.edit")
 
@@ -100,39 +101,19 @@ def _do_update(
         return {"error": f"memory not found: {memory_id}"}
     if not _can_mutate(before, agent_id):
         return {"error": "memory is owned by another agent"}
-    # Reuse the old memory's scope defaults.
-    vis = visibility or before.get("visibility") or config.default_visibility
-    aid = agent_id or before.get("agent") or config.agent_id
-    # Re-embed the new content if an embedder is available.
-    embedding = embedder.embed(new_content) if embedder else None
-    new_mid = db.insert_memory(
-        content=new_content,
-        source="manual",
-        agent=aid,
-        visibility=vis,
-        source_id=str(before.get("source_id")) if before.get("source_id") else None,
-        type=before.get("type") or "fact",
-        tags=before.get("tags") if isinstance(before.get("tags"), list) else None,
-        metadata={
-            **(before.get("metadata") or {}),
-            "updated_from": memory_id,
-            **({"session_id": session_id} if session_id else {}),
-        },
-        confidence=before.get("confidence") or 0.5,
-        embedding=embedding or None,
-        embed_model=getattr(embedder, "_model", None) if embedder else None,
-    )
-    # Supersede the old memory and point it at the new one.
-    db.supersede(memory_id, new_mid, actor=actor)
-    # Re-link the same entities to the new memory so the graph stays connected.
-    _carry_over_entity_links(db, old_id=memory_id, new_id=new_mid, agent_id=aid)
-    audit_id = db.write_audit(
-        actor=actor,
-        action="update",
-        memory_id=new_mid,
-        details={"before_id": memory_id, "before": _snapshot(before), "after_id": new_mid},
-    )
-    return {"memory_id": new_mid, "superseded_id": memory_id, "audit_id": audit_id}
+    try:
+        result = MemoryLifecycle(db, config, embedder).replace(
+            original_ids=[memory_id],
+            content=new_content,
+            actor=actor,
+            agent_id=agent_id,
+            visibility=visibility,
+            session_id=session_id,
+            action="update",
+        )
+    except (KeyError, PermissionError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {**result, "superseded_id": memory_id}
 
 
 def _do_merge(
@@ -166,42 +147,19 @@ def _do_merge(
         if not _can_mutate(m, agent_id):
             return {"error": "memory is owned by another agent"}
         originals.append(m)
-    # Inherit agent + visibility from the first original.
-    first = originals[0]
-    aid = agent_id or first.get("agent") or config.agent_id
-    vis = visibility or first.get("visibility") or config.default_visibility
-    embedding = embedder.embed(new_content) if embedder else None
-    merged_tags: list[str] = []
-    for o in originals:
-        tags = o.get("tags")
-        if isinstance(tags, list):
-            merged_tags.extend(tags)
-    merged_tags = list(dict.fromkeys(merged_tags))
-    new_mid = db.insert_memory(
-        content=new_content,
-        source="manual",
-        agent=aid,
-        visibility=vis,
-        type="fact",
-        tags=merged_tags or None,
-        metadata={
-            "merged_from": ids,
-            **({"session_id": session_id} if session_id else {}),
-        },
-        embedding=embedding or None,
-        embed_model=getattr(embedder, "_model", None) if embedder else None,
-    )
-    # Supersede every original and re-link its entities to the merged memory.
-    for o in originals:
-        db.supersede(o["id"], new_mid, actor=actor)
-        _carry_over_entity_links(db, old_id=o["id"], new_id=new_mid, agent_id=aid)
-    audit_id = db.write_audit(
-        actor=actor,
-        action="merge",
-        memory_id=new_mid,
-        details={"merged_from": ids, "after_id": new_mid},
-    )
-    return {"memory_id": new_mid, "superseded_ids": ids, "audit_id": audit_id}
+    try:
+        result = MemoryLifecycle(db, config, embedder).replace(
+            original_ids=ids,
+            content=new_content,
+            actor=actor,
+            agent_id=agent_id,
+            visibility=visibility,
+            session_id=session_id,
+            action="merge",
+        )
+    except (KeyError, PermissionError, ValueError) as exc:
+        return {"error": str(exc)}
+    return {**result, "superseded_ids": ids}
 
 
 def _do_forget(
@@ -225,14 +183,9 @@ def _do_forget(
         return {"error": f"memory not found: {memory_id}"}
     if not _can_mutate(before, agent_id):
         return {"error": "memory is owned by another agent"}
-    audit_id = db.set_memory_field(
-        memory_id,
-        "status",
-        "forgotten",
-        actor=actor,
-        action="forget",
-        details={"before": _snapshot(before), "after_status": "forgotten"},
-    )["audit_id"]
+    audit_id = MemoryLifecycle(db, config, embedder).forget(
+        memory_id, actor=actor, agent_id=agent_id
+    )
     return {"memory_id": memory_id, "status": "forgotten", "audit_id": audit_id}
 
 
@@ -302,15 +255,14 @@ def _do_visibility(
         return {"error": f"memory not found: {memory_id}"}
     if not _can_mutate(before, agent_id):
         return {"error": "memory is owned by another agent"}
-    res = db.set_memory_field(
+    audit_id = MemoryLifecycle(db, config, embedder).visibility(
         memory_id,
-        "visibility",
-        target,
+        value=target,
         actor=actor,
+        agent_id=agent_id,
         action=action,
-        details={"before": before.get("visibility"), "after": target},
     )
-    return {"memory_id": memory_id, "visibility": target, "audit_id": res["audit_id"]}
+    return {"memory_id": memory_id, "visibility": target, "audit_id": audit_id}
 
 
 def _do_share(

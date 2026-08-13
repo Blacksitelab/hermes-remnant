@@ -17,6 +17,7 @@ import logging
 import re
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -65,7 +66,9 @@ _EXTRACT_PROMPT = (
     '"visibility": "private", "confidence": 0.0, "conflict_type": null, '
     '"observed_at": null, "event_at": null, "valid_from": null, "valid_to": null, '
     '"scope_type": null, "scope_value": null, "conditions": [], '
-    '"modality": "asserted", "entities": [{"name": "<name>", "type": "<type>", '
+    '"modality": "asserted", "durability": "durable", '
+    '"subject": "<subject>", "predicate": "<predicate>", "object": "<object>", '
+    '"entities": [{"name": "<name>", "type": "<type>", '
     '"aliases": ["<alias>", ...]}]}]}\n'
     "\n"
     "Visibility must be one of: private, shared, fleet. Default to private.\n"
@@ -228,11 +231,17 @@ class ExtractionWorker:
         facts = self._extract(job["user_text"], job["assistant_text"])
         for f in facts:
             fact_text = f.get("fact", "").strip()
-            entity = f.get("entity", "").strip() or "general"
+            entity = str(f.get("subject") or f.get("entity") or "").strip() or "general"
             visibility = f.get("visibility", self._config.default_visibility)
             if not fact_text:
                 continue
             structured = bool(getattr(self._config, "structured_claim_extraction_v2", False))
+            store_hypothetical = bool(self._config.extra.get("store_hypothetical"))
+            if structured and (
+                f.get("durability") == "discard"
+                or (f.get("modality") == "hypothetical" and not store_hypothetical)
+            ):
+                continue
             if is_transient(fact_text, allow_temporal=structured):
                 log.debug("rejected transient fact: %s", fact_text)
                 continue
@@ -243,6 +252,11 @@ class ExtractionWorker:
             if not typed_entities and entity and entity != "general":
                 typed_entities = [{"name": entity, "type": None, "aliases": []}]
             typed_entities = filter_typed_entities(typed_entities)
+            claim_data = dict(f)
+            if not claim_data.get("observed_at"):
+                claim_data["observed_at"] = datetime.fromtimestamp(
+                    float(job.get("enqueued_at") or time.time()), timezone.utc
+                ).isoformat().replace("+00:00", "Z")
             store_memory(
                 self._db,
                 self._embedder,
@@ -259,7 +273,7 @@ class ExtractionWorker:
                     "structured_claim_v2": structured,
                     "extractor_version": "claims-v2" if structured else "legacy",
                 },
-                claim_data=f,
+                claim_data=claim_data,
             )
         duration_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
@@ -350,8 +364,34 @@ def _normalise_facts(value: Any) -> list[dict[str, Any]]:
             row["confidence"] = min(1.0, max(0.0, float(row.get("confidence", 0.5))))
         except (TypeError, ValueError):
             row["confidence"] = 0.5
+        durability = str(row.get("durability") or "durable").casefold()
+        row["durability"] = (
+            durability
+            if durability in {"durable", "temporary_but_relevant", "discard"}
+            else "discard"
+        )
+        modality = str(row.get("modality") or "asserted").casefold()
+        row["modality"] = (
+            modality
+            if modality in {"asserted", "inferred", "hypothetical", "negated"}
+            else "inferred"
+        )
+        for field in ("observed_at", "event_at", "valid_from", "valid_to"):
+            timestamp = row.get(field)
+            if timestamp and not _valid_timestamp(timestamp):
+                row[field] = None
+                diagnostics = row.setdefault("diagnostics", [])
+                diagnostics.append(f"invalid_{field}")
         out.append(row)
     return out
+
+
+def _valid_timestamp(value: Any) -> bool:
+    try:
+        datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return True
+    except (TypeError, ValueError):
+        return False
 
 
 def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:

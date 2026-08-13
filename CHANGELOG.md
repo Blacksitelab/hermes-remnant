@@ -7,7 +7,7 @@
 - Hermes lifecycle parity for queued prefetch, session end, pre-compression,
   built-in memory writes, delegation, session switching, and backup paths.
 - Runtime agent/workspace identity scoping with non-primary write protection.
-- Schema 12 claim metadata for observation/event time, validity, scope,
+- Schema 13 claim metadata for observation/event time, validity, scope,
   modality, conflict type, resolution status, extractor version, and source
   turn provenance.
 - Opt-in structured extraction, conservative claim reconciliation, claim-aware
@@ -19,7 +19,7 @@
 
 ### Compatibility and rollout
 
-- Existing databases migrate additively to schema 12; no memory rows are
+- Existing databases migrate additively to schema 13; no memory rows are
   deleted or re-scoped by the migration.
 - New correctness behaviors default to `false` for compatibility. Enable the
   six release-track flags together for a canary, measure the evaluation and
