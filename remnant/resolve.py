@@ -21,6 +21,13 @@ _HISTORY_RE = re.compile(
 )
 
 
+def retrieval_query(query: str) -> str:
+    """Remove intent-only temporal words that weaken strict lexical search."""
+    value = _HISTORY_RE.sub(" ", query or "")
+    value = re.sub(r"\s+", " ", value).strip(" ?.,")
+    return value or str(query or "").strip()
+
+
 def _parse_qualifiers(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -93,6 +100,27 @@ def resolve_results(
             item["valid_at_query"] = _is_valid_at(claim, now)
         enriched.append(item)
 
+    # Candidate lanes may return the same evidence text through multiple rows
+    # or legacy duplicate memories. Prefer a claim-bearing projection, then
+    # confidence and relevance, before claim grouping consumes context slots.
+    by_content: dict[str, dict[str, Any]] = {}
+    for item in enriched:
+        key = re.sub(r"\s+", " ", str(item.get("content") or "").casefold()).strip()
+        previous = by_content.get(key)
+        item_key = (
+            bool(item.get("claim")),
+            float((item.get("claim") or {}).get("confidence", 0.0) or 0.0),
+            float(item.get("score", 0.0) or 0.0),
+        )
+        previous_key = (
+            bool((previous or {}).get("claim")),
+            float(((previous or {}).get("claim") or {}).get("confidence", 0.0) or 0.0),
+            float((previous or {}).get("score", 0.0) or 0.0),
+        )
+        if previous is None or item_key > previous_key:
+            by_content[key] = item
+    enriched = list(by_content.values())
+
     groups: dict[tuple[str, str, str, str], list[dict[str, Any]]] = {}
     unclaimed: list[dict[str, Any]] = []
     for item in enriched:
@@ -153,4 +181,4 @@ def resolve_results(
     return selected
 
 
-__all__ = ["resolve_results"]
+__all__ = ["resolve_results", "retrieval_query"]
