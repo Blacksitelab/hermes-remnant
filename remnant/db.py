@@ -23,7 +23,7 @@ from typing import Any
 
 from .scope import normalize_profile_scope
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -146,6 +146,24 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_relations_a ON relations(entity_a);
 CREATE INDEX IF NOT EXISTS idx_relations_b ON relations(entity_b);
 
+CREATE TABLE IF NOT EXISTS relation_evidence (
+    entity_a TEXT NOT NULL,
+    entity_b TEXT NOT NULL,
+    relation_type TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    claim_id TEXT,
+    strength REAL NOT NULL DEFAULT 0.5,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(entity_a, entity_b, relation_type, memory_id),
+    FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_relation_evidence_memory
+    ON relation_evidence(memory_id, active);
+CREATE INDEX IF NOT EXISTS idx_relation_evidence_relation
+    ON relation_evidence(entity_a, entity_b, relation_type, active);
+
 CREATE TABLE IF NOT EXISTS embeddings (
     memory_id TEXT PRIMARY KEY,
     model TEXT,
@@ -226,6 +244,15 @@ CREATE TABLE IF NOT EXISTS claims (
         CHECK(status IN ('active', 'superseded', 'contradicted')),
     valid_from TEXT,
     valid_to TEXT,
+    observed_at TEXT,
+    event_at TEXT,
+    scope_type TEXT,
+    scope_value TEXT,
+    modality TEXT DEFAULT 'asserted',
+    conflict_type TEXT,
+    resolution_status TEXT DEFAULT 'active',
+    extractor_version TEXT,
+    source_turn_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
@@ -290,6 +317,19 @@ CREATE TABLE IF NOT EXISTS prefetch_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_prefetch_outcome ON prefetch_stats(outcome);
 CREATE INDEX IF NOT EXISTS idx_prefetch_created ON prefetch_stats(created_at);
+
+CREATE TABLE IF NOT EXISTS operation_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    elapsed_ms REAL NOT NULL DEFAULT 0,
+    input_units INTEGER NOT NULL DEFAULT 0,
+    output_units INTEGER NOT NULL DEFAULT 0,
+    agent_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operation_metrics_kind
+    ON operation_metrics(operation, outcome, created_at);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -455,6 +495,32 @@ class RemnantDB:
             "CREATE INDEX IF NOT EXISTS idx_queue_ready "
             "ON extraction_queue(status, next_attempt_at)"
         )
+        # Phase 12: additive claim metadata.  Existing claim status values are
+        # intentionally retained for backwards-compatible CHECK constraints;
+        # richer lifecycle state lives in resolution_status/conflict_type.
+        cur.execute("PRAGMA table_info(claims)")
+        claim_cols = {row["name"] for row in cur.fetchall()}
+        claim_additions = {
+            "observed_at": "TEXT",
+            "event_at": "TEXT",
+            "scope_type": "TEXT",
+            "scope_value": "TEXT",
+            "modality": "TEXT DEFAULT 'asserted'",
+            "conflict_type": "TEXT",
+            "resolution_status": "TEXT DEFAULT 'active'",
+            "extractor_version": "TEXT",
+            "source_turn_id": "INTEGER",
+        }
+        for name, declaration in claim_additions.items():
+            if name not in claim_cols:
+                try:
+                    cur.execute(f"ALTER TABLE claims ADD COLUMN {name} {declaration}")
+                except sqlite3.OperationalError:
+                    pass
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claims_resolution "
+            "ON claims(subject, predicate, resolution_status, valid_from, valid_to)"
+        )
         # Phase 6 (migration): content_hash + seen_count on memories, and
         # widen the source CHECK to allow 'import' and 'hindsight'. CREATE
         # TABLE IF NOT EXISTS never alters an existing table, so backfill the
@@ -618,6 +684,36 @@ class RemnantDB:
                 self._conn.commit()
         except Exception:
             # Stats are best-effort — never break prefetch over logging.
+            pass
+
+    def record_operation(
+        self,
+        operation: str,
+        outcome: str,
+        *,
+        elapsed_ms: float = 0.0,
+        input_units: int = 0,
+        output_units: int = 0,
+        agent_id: str | None = None,
+    ) -> None:
+        """Persist bounded counters only; never prompts, responses, or secrets."""
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO operation_metrics(operation, outcome, elapsed_ms, "
+                    "input_units, output_units, agent_id, created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        str(operation)[:64], str(outcome)[:32], max(0.0, float(elapsed_ms)),
+                        max(0, int(input_units)), max(0, int(output_units)), agent_id,
+                        _now_iso(),
+                    ),
+                )
+                self._conn.execute(
+                    "DELETE FROM operation_metrics WHERE id <= "
+                    "COALESCE((SELECT MAX(id) - 10000 FROM operation_metrics), 0)"
+                )
+                self._conn.commit()
+        except Exception:
             pass
 
     # -- turns -----------------------------------------------------------------
@@ -870,12 +966,239 @@ class RemnantDB:
                 )
             return mid
 
+    def replace_memories_atomic(
+        self,
+        *,
+        original_ids: list[str],
+        content: str,
+        source: str,
+        agent: str | None,
+        visibility: str,
+        type: str,
+        tags: list[str] | None,
+        metadata: dict[str, Any] | None,
+        confidence: float,
+        trust_score: float,
+        embedding: list[float] | None,
+        embed_model: str | None,
+        claim_projection: dict[str, Any] | None,
+        actor: str,
+        action: str,
+    ) -> dict[str, Any]:
+        """Create a replacement and supersede originals in one transaction."""
+        if not original_ids:
+            raise ValueError("at least one original memory is required")
+        now = _now_iso()
+        new_id = _uuid()
+        tags_json = json.dumps(tags) if tags else None
+        metadata_json = json.dumps(metadata, default=str) if metadata else None
+        with self.transaction() as cur:
+            placeholders = ",".join("?" for _ in original_ids)
+            cur.execute(
+                f"SELECT id, content, agent, visibility, status, trust_score, tags "
+                f"FROM memories WHERE id IN ({placeholders})",
+                original_ids,
+            )
+            originals = [dict(row) for row in cur.fetchall()]
+            if {row["id"] for row in originals} != set(original_ids):
+                raise KeyError("one or more original memories do not exist")
+            if any(row["status"] != "active" for row in originals):
+                raise ValueError("all original memories must be active")
+            cur.execute(
+                "INSERT INTO memories(id, type, content, source, source_id, agent, "
+                "visibility, timestamp, confidence, trust_score, verified, superseded_by, "
+                "status, tags, metadata, content_hash, seen_count, created_at, updated_at) "
+                "VALUES(?,?,?,?,NULL,?,?,?,?,?,0,NULL,'active',?,?,NULL,1,?,?)",
+                (
+                    new_id, type, content, source, agent, visibility, now, confidence,
+                    trust_score, tags_json, metadata_json, now, now,
+                ),
+            )
+            if embedding:
+                cur.execute(
+                    "INSERT INTO embeddings(memory_id, model, embedding, dimensions, created_at) "
+                    "VALUES(?,?,?,?,?)",
+                    (new_id, embed_model, _pack_embedding(embedding), len(embedding), now),
+                )
+            new_claim_id: str | None = None
+            if claim_projection:
+                new_claim_id = _uuid()
+                cur.execute(
+                    "INSERT INTO claims(id, memory_id, subject, predicate, object, qualifiers, "
+                    "confidence, status, valid_from, valid_to, observed_at, event_at, "
+                    "scope_type, scope_value, modality, conflict_type, resolution_status, "
+                    "extractor_version, source_turn_id, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,'active',?,NULL,?,?,?,?,?,?,?,'active',?,?,?)",
+                    (
+                        new_claim_id,
+                        new_id,
+                        claim_projection["subject"],
+                        claim_projection["predicate"],
+                        claim_projection["object"],
+                        json.dumps(claim_projection.get("qualifiers"), default=str)
+                        if claim_projection.get("qualifiers")
+                        else None,
+                        float(claim_projection.get("confidence") or confidence),
+                        claim_projection.get("valid_from") or now,
+                        claim_projection.get("observed_at") or now,
+                        claim_projection.get("event_at"),
+                        claim_projection.get("scope_type"),
+                        claim_projection.get("scope_value"),
+                        claim_projection.get("modality") or "asserted",
+                        "update",
+                        claim_projection.get("extractor_version") or "lifecycle-v1",
+                        claim_projection.get("source_turn_id"),
+                        now,
+                        now,
+                    ),
+                )
+            for original_id in original_ids:
+                cur.execute(
+                    "INSERT OR IGNORE INTO memory_entities("
+                    "memory_id, entity_id, relation_role, agent) "
+                    "SELECT ?, entity_id, relation_role, agent FROM memory_entities "
+                    "WHERE memory_id=?",
+                    (new_id, original_id),
+                )
+                cur.execute(
+                    "INSERT OR IGNORE INTO relation_evidence(entity_a, entity_b, "
+                    "relation_type, memory_id, claim_id, strength, active, created_at, "
+                    "updated_at) SELECT entity_a, entity_b, relation_type, ?, ?, strength, "
+                    "1, ?, ? FROM relation_evidence WHERE memory_id=? AND active=1",
+                    (new_id, new_claim_id, now, now, original_id),
+                )
+                cur.execute(
+                    "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? "
+                    "WHERE id=? AND status='active'",
+                    (new_id, now, original_id),
+                )
+                cur.execute(
+                    "UPDATE claims SET status='superseded', resolution_status='superseded', "
+                    "valid_to=COALESCE(valid_to, ?), updated_at=? WHERE memory_id=? "
+                    "AND status='active'",
+                    (now, now, original_id),
+                )
+                cur.execute(
+                    "UPDATE relation_evidence SET active=0, updated_at=? WHERE memory_id=?",
+                    (now, original_id),
+                )
+                self._write_audit(
+                    cur,
+                    actor,
+                    "supersede",
+                    original_id,
+                    {"superseded_by": new_id},
+                )
+            snapshots = [
+                {
+                    "id": row["id"],
+                    "content": row["content"],
+                    "visibility": row["visibility"],
+                    "status": row["status"],
+                    "trust_score": row["trust_score"],
+                    "tags": row["tags"],
+                }
+                for row in originals
+            ]
+            audit_id = self._write_audit(
+                cur,
+                actor,
+                action,
+                new_id,
+                {
+                    "original_ids": original_ids,
+                    "replacement_id": new_id,
+                    "before_id": original_ids[0] if len(original_ids) == 1 else None,
+                    "before": snapshots[0] if len(snapshots) == 1 else snapshots,
+                    "after_id": new_id,
+                    "merged_from": original_ids if len(original_ids) > 1 else None,
+                },
+            )
+        return {"memory_id": new_id, "claim_id": new_claim_id, "audit_id": audit_id}
+
+    def transition_memory_atomic(
+        self,
+        memory_id: str,
+        *,
+        status: str | None = None,
+        visibility: str | None = None,
+        actor: str,
+        action: str,
+    ) -> int:
+        """Atomically transition memory, claims, relation evidence, and audit."""
+        if status is None and visibility is None:
+            raise ValueError("status or visibility is required")
+        now = _now_iso()
+        with self.transaction() as cur:
+            cur.execute("SELECT * FROM memories WHERE id=?", (memory_id,))
+            before = cur.fetchone()
+            if before is None:
+                raise KeyError(memory_id)
+            if status is not None:
+                cur.execute(
+                    "UPDATE memories SET status=?, updated_at=? WHERE id=?",
+                    (status, now, memory_id),
+                )
+                if status != "active":
+                    cur.execute(
+                        "UPDATE claims SET resolution_status='historical', "
+                        "valid_to=COALESCE(valid_to, ?), updated_at=? WHERE memory_id=?",
+                        (now, now, memory_id),
+                    )
+                    cur.execute(
+                        "UPDATE relation_evidence SET active=0, updated_at=? WHERE memory_id=?",
+                        (now, memory_id),
+                    )
+            if visibility is not None:
+                cur.execute(
+                    "UPDATE memories SET visibility=?, updated_at=? WHERE id=?",
+                    (visibility, now, memory_id),
+                )
+            before_detail: Any = (
+                before["visibility"]
+                if visibility is not None and status is None
+                else {
+                    "id": memory_id,
+                    "content": before["content"],
+                    "visibility": before["visibility"],
+                    "status": before["status"],
+                    "trust_score": before["trust_score"],
+                }
+            )
+            return self._write_audit(
+                cur,
+                actor,
+                action,
+                memory_id,
+                {
+                    "before": before_detail,
+                    "before_status": before["status"],
+                    "after_status": status or before["status"],
+                    "before_visibility": before["visibility"],
+                    "after_visibility": visibility or before["visibility"],
+                    "after": visibility or before["visibility"],
+                },
+            )
+
     def deactivate_memory(self, memory_id: str) -> None:
         with self.transaction() as cur:
             cur.execute(
                 "UPDATE memories SET status='inactive', updated_at=? WHERE id=?",
                 (_now_iso(), memory_id),
             )
+
+    def find_active_memory_by_content(
+        self, content: str, *, agent_id: str
+    ) -> dict[str, Any] | None:
+        """Find one exact active memory for a mirrored built-in write."""
+        with self.read() as cur:
+            cur.execute(
+                "SELECT * FROM memories WHERE content=? AND agent=? AND status='active' "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (content, agent_id),
+            )
+            row = cur.fetchone()
+        return dict(row) if row else None
 
     # -- structured claims ----------------------------------------------------
 
@@ -889,6 +1212,17 @@ class RemnantDB:
         confidence: float = 0.5,
         qualifiers: dict[str, Any] | None = None,
         status: str = "active",
+        observed_at: str | None = None,
+        event_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        scope_type: str | None = None,
+        scope_value: str | None = None,
+        modality: str = "asserted",
+        conflict_type: str | None = None,
+        resolution_status: str | None = None,
+        extractor_version: str | None = None,
+        source_turn_id: int | None = None,
     ) -> str:
         """Create a versioned claim projection backed by ``memory_id``."""
         now = _now_iso()
@@ -896,28 +1230,43 @@ class RemnantDB:
         with self.transaction() as cur:
             cur.execute(
                 "INSERT INTO claims(id, memory_id, subject, predicate, object, qualifiers, "
-                "confidence, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "confidence, status, valid_from, valid_to, observed_at, event_at, "
+                "scope_type, scope_value, modality, conflict_type, resolution_status, "
+                "extractor_version, source_turn_id, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     claim_id, memory_id, subject, predicate, object,
                     json.dumps(qualifiers, default=str) if qualifiers else None,
-                    confidence, status, now, now,
+                    confidence, status, valid_from, valid_to, observed_at or now,
+                    event_at, scope_type, scope_value, modality, conflict_type,
+                    resolution_status or status, extractor_version, source_turn_id,
+                    now, now,
                 ),
             )
         return claim_id
 
     def supersede_claims(
-        self, *, subject: str, predicate: str, except_memory_id: str | None = None
+        self,
+        *,
+        subject: str,
+        predicate: str,
+        except_memory_id: str | None = None,
+        agent_id: str | None = None,
     ) -> list[str]:
         """Mark active conflicting versions as superseded and retain their history."""
         with self.transaction() as cur:
             sql = (
-                "SELECT id FROM claims WHERE subject=? COLLATE NOCASE "
-                "AND predicate=? COLLATE NOCASE AND status='active'"
+                "SELECT c.id FROM claims c JOIN memories m ON m.id=c.memory_id "
+                "WHERE c.subject=? COLLATE NOCASE "
+                "AND c.predicate=? COLLATE NOCASE AND c.status='active'"
             )
             params: list[Any] = [subject, predicate]
             if except_memory_id:
-                sql += " AND memory_id<>?"
+                sql += " AND c.memory_id<>?"
                 params.append(except_memory_id)
+            if agent_id is not None:
+                sql += " AND m.agent=?"
+                params.append(agent_id)
             cur.execute(sql, params)
             ids = [str(row["id"]) for row in cur.fetchall()]
             if ids:
@@ -943,15 +1292,22 @@ class RemnantDB:
                 pass
         return claim
 
-    def get_active_claim(self, subject: str, predicate: str) -> dict[str, Any] | None:
+    def get_active_claim(
+        self, subject: str, predicate: str, *, agent_id: str | None = None
+    ) -> dict[str, Any] | None:
         """Return the newest active version of a subject/predicate claim."""
         with self.read() as cur:
-            cur.execute(
-                "SELECT * FROM claims WHERE subject=? COLLATE NOCASE "
-                "AND predicate=? COLLATE NOCASE AND status='active' "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (subject, predicate),
+            sql = (
+                "SELECT c.* FROM claims c JOIN memories m ON m.id=c.memory_id "
+                "WHERE c.subject=? COLLATE NOCASE AND c.predicate=? COLLATE NOCASE "
+                "AND c.status='active'"
             )
+            params: list[Any] = [subject, predicate]
+            if agent_id is not None:
+                sql += " AND m.agent=?"
+                params.append(agent_id)
+            sql += " ORDER BY c.updated_at DESC LIMIT 1"
+            cur.execute(sql, params)
             row = cur.fetchone()
         return dict(row) if row else None
 
@@ -987,6 +1343,7 @@ class RemnantDB:
         agent_id: str | None = None,
         visibility: str | None = None,
         profile_scope: list[str] | None = None,
+        include_historical: bool = False,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """BM25 keyword search over active memories, optionally filtered.
@@ -1005,7 +1362,8 @@ class RemnantDB:
             "m.timestamp AS created_at, m.updated_at, "
             "bm25(memories_fts) AS score "
             "FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid "
-            "WHERE memories_fts MATCH ? AND m.status='active'"
+            "WHERE memories_fts MATCH ? AND "
+            + ("m.status IN ('active','superseded')" if include_historical else "m.status='active'")
         )
         params: list[Any] = [fts_query]
         if agent_id is not None:
@@ -1473,6 +1831,24 @@ class RemnantDB:
                 "created_at=excluded.created_at",
                 (a, b, relation_type, strength, source_memory_id, _now_iso()),
             )
+            if source_memory_id:
+                now = _now_iso()
+                cur.execute(
+                    "SELECT id FROM claims WHERE memory_id=?",
+                    (source_memory_id,),
+                )
+                claim = cur.fetchone()
+                cur.execute(
+                    "INSERT INTO relation_evidence(entity_a, entity_b, relation_type, "
+                    "memory_id, claim_id, strength, active, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,1,?,?) ON CONFLICT(entity_a, entity_b, "
+                    "relation_type, memory_id) DO UPDATE SET strength=excluded.strength, "
+                    "active=1, updated_at=excluded.updated_at",
+                    (
+                        a, b, relation_type, source_memory_id,
+                        claim["id"] if claim else None, strength, now, now,
+                    ),
+                )
 
     def get_relations(self, entity_id: str) -> list[dict[str, Any]]:
         with self.read() as cur:
@@ -1509,6 +1885,7 @@ class RemnantDB:
         depth: int = 2,
         agent_id: str | None = None,
         profile_scope: list[str] | None = None,
+        evidence_only: bool = False,
     ) -> dict[str, Any]:
         """BFS over `relations` up to `depth` hops. Pure SQLite, no LLM.
 
@@ -1523,9 +1900,16 @@ class RemnantDB:
             if not frontier:
                 break
             placeholders = ",".join("?" for _ in frontier)
+            relation_source = (
+                "(SELECT entity_a, entity_b FROM relation_evidence WHERE active=1 "
+                "GROUP BY entity_a, entity_b)"
+                if evidence_only
+                else "relations"
+            )
             sql = (
-                f"SELECT entity_a AS other FROM relations WHERE entity_b IN ({placeholders}) "
-                f"UNION SELECT entity_b AS other FROM relations WHERE entity_a IN ({placeholders})"
+                f"SELECT entity_a AS other FROM {relation_source} "
+                f"WHERE entity_b IN ({placeholders}) UNION SELECT entity_b AS other "
+                f"FROM {relation_source} WHERE entity_a IN ({placeholders})"
             )
             params = list(frontier) + list(frontier)
             with self.read() as cur:
@@ -1585,6 +1969,7 @@ class RemnantDB:
         depth: int = 2,
         limit: int = 20,
         profile_scope: list[str] | None = None,
+        evidence_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Resolve entity names from the query, traverse the graph, and return
         linked active memories. Pure SQLite (no embedding / LLM work).
@@ -1599,7 +1984,11 @@ class RemnantDB:
         seen: dict[str, dict[str, Any]] = {}
         for eid in seed_ids:
             res = self.traverse_graph(
-                eid, depth=depth, agent_id=agent_id, profile_scope=profile_scope
+                eid,
+                depth=depth,
+                agent_id=agent_id,
+                profile_scope=profile_scope,
+                evidence_only=evidence_only,
             )
             for m in res["memories"]:
                 mid = m["id"]
@@ -2273,6 +2662,60 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
+
+    def get_pending_turns(
+        self,
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        max_age_s: float = 900.0,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return recent turns whose extraction has not reached a terminal state.
+
+        This is the read-after-write overlay source.  It deliberately returns
+        only raw turns and never treats them as durable claims; callers must
+        label them as unprocessed and apply the normal authorization scope.
+        """
+        cutoff = time.time() - max(0.0, float(max_age_s))
+        sql = (
+            "SELECT id, session_id, agent_id, user_text, assistant_text, "
+            "created_at, extraction_status FROM turns "
+            "WHERE created_at >= ? AND extraction_status IN "
+            "('pending','running','retry_wait')"
+        )
+        params: list[Any] = [cutoff]
+        if agent_id is not None:
+            sql += " AND agent_id=?"
+            params.append(agent_id)
+        if session_id is not None:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def pending_extraction_count(
+        self, *, agent_id: str | None = None, session_id: str | None = None
+    ) -> int:
+        """Return the number of non-terminal extraction turns."""
+        sql = (
+            "SELECT COUNT(*) AS n FROM turns "
+            "WHERE extraction_status IN ('pending','running','retry_wait')"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND agent_id=?"
+            params.append(agent_id)
+        if session_id is not None:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        return int(row["n"] if row else 0)
 
     def get_memories_for_agent_scope(
         self, *, agent_id: str | None = None, visibility: str | None = "shared",

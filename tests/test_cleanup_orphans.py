@@ -15,7 +15,7 @@ def db(tmp_path):
 
 def test_cleanup_orphans_dry_run_finds_orphans(db):
     # Insert a normal active memory
-    mid1 = db.insert_memory(content="Active memory", agent="test")
+    db.insert_memory(content="Active memory", agent="test")
     # Insert a forgotten orphan (no source_id, no vault_files)
     mid2 = db.insert_memory(content="Orphaned memory", agent="test")
     db.deactivate_memory(mid2)

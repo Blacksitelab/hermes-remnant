@@ -61,9 +61,25 @@ _ANTONYMS = [
 ]
 
 
-def is_transient(text: str) -> bool:
-    """True if the fact looks like transient state and should be rejected."""
-    return bool(_TRANSIENT_RE.search(text or ""))
+def is_transient(text: str, *, allow_temporal: bool = False) -> bool:
+    """Return whether text is pure transient telemetry.
+
+    ``allow_temporal`` is used by structured extraction: words such as
+    ``currently`` and ``now`` are useful evidence for a state transition and
+    are preserved as claim metadata.  The legacy default remains strict for
+    callers that want to reject operational chatter.
+    """
+    value = text or ""
+    if allow_temporal:
+        return bool(
+            re.search(
+                r"\b\d{1,3}\s*%\b|\bpercent\b|"
+                r"\b\d{1,2}:\d{2}\s*(?:am|pm)?\b",
+                value,
+                re.I,
+            )
+        )
+    return bool(_TRANSIENT_RE.search(value))
 
 
 def _initial_trust_score(source: str) -> float:
@@ -139,6 +155,7 @@ def store_memory(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     source_text: str | None = None,
+    claim_data: dict[str, Any] | None = None,
 ) -> str | None:
     """Store a fact with dedup + contradiction flagging. Returns memory id.
 
@@ -168,7 +185,8 @@ def store_memory(
     sentence/paragraph.
     """
     fact = fact.strip()
-    if not fact or is_transient(fact):
+    allow_temporal = bool((metadata or {}).get("structured_claim_v2"))
+    if not fact or is_transient(fact, allow_temporal=allow_temporal):
         return None
 
     # Dedup: BM25 candidates, then text-normalization + cosine similarity.
@@ -265,6 +283,10 @@ def store_memory(
         fact=fact,
         confidence=0.5,
         contradicted=bool(contradiction_targets),
+        claim_data=claim_data,
+        reconciliation_enabled=bool(getattr(config, "claim_reconciliation_enabled", False)),
+        source_turn_id=source_turn_id,
+        agent_id=agent_id,
     )
 
     # Corroboration boost (issue #11): for each entity linked to this new

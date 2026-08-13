@@ -12,8 +12,14 @@ transaction, then wakes the background worker.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import re
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from .config import (
@@ -28,13 +34,15 @@ from .db import RemnantDB, default_db_path, open_db
 from .dream import day_dream, night_dream
 from .embed import Embedder
 from .extract import ExtractionWorker
+from .identity import EffectiveIdentity, effective_identity
 from .import_sources import import_hindsight, import_memory_store
-from .ingest import ingest_turn
+from .ingest import ingest_turn, store_memory
 from .prefetch import prefetch as _run_prefetch
 from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
+__version__ = "0.2.0"
 
 
 class _SessionEmbedder:
@@ -263,6 +271,55 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "default": 250,
         "required": False,
     },
+    {
+        "key": "runtime_identity_enabled",
+        "description": "Scope memories by Hermes runtime agent identity/workspace",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "structured_claim_extraction_v2",
+        "description": "Preserve temporal and conditional claim metadata during extraction",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "claim_reconciliation_enabled",
+        "description": "Classify duplicates, updates, conditions, and unresolved conflicts",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "claim_aware_ranking_enabled",
+        "description": "Resolve claim evidence before selecting injected memories",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "resolved_context_enabled",
+        "description": "Render provenance-aware, prompt-injection-resistant context",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "recent_turn_overlay_enabled",
+        "description": "Temporarily expose recent unprocessed turns for read-after-write recall",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "relation_evidence_enabled",
+        "description": "Traverse only relations backed by active memory evidence",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
 ]
 
 
@@ -281,6 +338,15 @@ class RemnantMemoryProvider(MemoryProvider):
         self._last_injected_hash: dict[str, str] = {}
         self._session_query_vec: dict[str, list[float]] = {}
         self._session_query: dict[str, str] = {}
+        self._queued_prefetch: OrderedDict[
+            tuple[str, str, str, str, str, int], tuple[float, dict[str, Any]]
+        ] = OrderedDict()
+        self._prefetch_executor: ThreadPoolExecutor | None = None
+        self._prefetch_lock = threading.Lock()
+        self._runtime_identity: dict[str, str] = {}
+        self._effective_identity: EffectiveIdentity | None = None
+        self._agent_context: str = "primary"
+        self._memory_generation: int = 0
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -289,8 +355,13 @@ class RemnantMemoryProvider(MemoryProvider):
         return "remnant"
 
     def is_available(self) -> bool:
-        """No network calls. We are available as long as we can write files."""
-        return True
+        """Check local prerequisites without contacting Ollama or Hermes."""
+        try:
+            from .maintenance import availability_report
+
+            return bool(availability_report(db_path=default_db_path())["available"])
+        except (OSError, TypeError, ValueError):
+            return False
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         hermes_home = kwargs.get("hermes_home")
@@ -299,11 +370,31 @@ class RemnantMemoryProvider(MemoryProvider):
         self._hermes_home = str(hermes_home)
         self._session_id = session_id or "default"
         self._config = load_config(self._hermes_home)
+        self._agent_context = str(kwargs.get("agent_context") or "primary")
+        self._runtime_identity = {
+            key: str(kwargs.get(key) or "").strip()
+            for key in (
+                "agent_identity", "agent_workspace", "user_id", "user_id_alt",
+                "platform", "parent_session_id",
+            )
+            if kwargs.get(key)
+        }
+        self._effective_identity = effective_identity(
+            configured_agent=self._config.agent_id,
+            session_id=self._session_id,
+            runtime_identity_enabled=self._config.runtime_identity_enabled,
+            aliases=self._config.runtime_user_aliases,
+            **kwargs,
+        )
+        self._config.agent_id = self._effective_identity.storage_key
         db_path = default_db_path()
         self._db = open_db(db_path)
         self._embedder = Embedder(self._db, self._config)
         self._worker = ExtractionWorker(self._db, self._embedder, self._config)
         self._worker.start()
+        self._prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="remnant-prefetch"
+        )
         # Issue #13: sweep for turns that were stored but never extracted
         # (e.g. crash between insert_turn and enqueue_extraction) before the
         # worker starts draining the regular queue, then wake it to process.
@@ -320,6 +411,9 @@ class RemnantMemoryProvider(MemoryProvider):
             # Phase 4: no background vault watcher process is started here.
             # Re-index is driven by an external cron/timer calling
             # `reindex_vault()`; nothing to stop on shutdown.
+            if self._prefetch_executor is not None:
+                self._prefetch_executor.shutdown(wait=True, cancel_futures=True)
+                self._prefetch_executor = None
             if self._embedder is not None:
                 self._embedder.close()
             if self._db is not None:
@@ -333,6 +427,12 @@ class RemnantMemoryProvider(MemoryProvider):
 
     def save_config(self, values: dict[str, Any], hermes_home: str) -> None:
         save_config(values, hermes_home)
+
+    def identity_diagnostic(self) -> dict[str, str | bool]:
+        """Return the effective mapping without exposing raw platform user IDs."""
+        if self._effective_identity is None:
+            return {"initialized": False}
+        return {"initialized": True, **self._effective_identity.diagnostic()}
 
     # -- tools ----------------------------------------------------------------
 
@@ -380,6 +480,9 @@ class RemnantMemoryProvider(MemoryProvider):
         """Persist the turn and enqueue extraction without blocking."""
         if self._db is None or self._config is None:
             return
+        if self._agent_context not in {"primary", ""}:
+            log.debug("skipping memory write from agent context=%s", self._agent_context)
+            return
         sid = session_id or self._session_id or "default"
         try:
             ingest_turn(
@@ -392,9 +495,70 @@ class RemnantMemoryProvider(MemoryProvider):
         except Exception as e:
             log.warning("sync_turn failed: %s", e)
             return
+        self._invalidate_prefetch()
         # Wake the background worker so it picks up the new job promptly.
         if self._worker is not None:
             self._worker.wake()
+
+    def _prefetch_key(
+        self, query: str, session_id: str
+    ) -> tuple[str, str, str, str, str, int]:
+        cfg = self._config
+        identity = (
+            self._effective_identity.viewer_key
+            if self._effective_identity is not None
+            else (cfg.agent_id if cfg is not None else "default")
+        )
+        normalized = re.sub(r"\s+", " ", str(query or "").casefold()).strip()
+        query_hash = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        profile_json = json.dumps(
+            sorted(cfg.profile_scope) if cfg is not None else [], separators=(",", ":")
+        )
+        profile_hash = hashlib.sha256(profile_json.encode("utf-8")).hexdigest()
+        return (
+            identity,
+            session_id or "default",
+            query_hash,
+            profile_hash,
+            cfg.embed_model if cfg is not None else "",
+            self._memory_generation,
+        )
+
+    def _invalidate_prefetch(self) -> None:
+        with self._prefetch_lock:
+            self._memory_generation += 1
+            self._queued_prefetch.clear()
+
+    def _take_queued_prefetch(
+        self, key: tuple[str, str, str, str, str, int]
+    ) -> dict[str, Any] | None:
+        now = time.monotonic()
+        ttl = max(0.0, float(getattr(self._config, "prefetch_cache_ttl_s", 60)))
+        with self._prefetch_lock:
+            if ttl <= 0:
+                self._queued_prefetch.clear()
+                return None
+            expired = [
+                cache_key
+                for cache_key, (created, _) in self._queued_prefetch.items()
+                if now - created > ttl
+            ]
+            for cache_key in expired:
+                self._queued_prefetch.pop(cache_key, None)
+            entry = self._queued_prefetch.pop(key, None)
+        return entry[1] if entry is not None else None
+
+    def _store_queued_prefetch(
+        self,
+        key: tuple[str, str, str, str, str, int],
+        result: dict[str, Any],
+    ) -> None:
+        maximum = max(1, int(getattr(self._config, "prefetch_cache_max_entries", 32)))
+        with self._prefetch_lock:
+            self._queued_prefetch[key] = (time.monotonic(), result)
+            self._queued_prefetch.move_to_end(key)
+            while len(self._queued_prefetch) > maximum:
+                self._queued_prefetch.popitem(last=False)
 
     # -- prefetch (Phase 2) ---------------------------------------------------
 
@@ -452,11 +616,129 @@ class RemnantMemoryProvider(MemoryProvider):
         # Reset the per-session query-vector cache when the query changes so a
         # new query re-embeds; an identical query reuses the cached vector.
         if self._session_query.get(sid) != query:
+            old_query = self._session_query.get(sid)
             self._session_query.pop(sid, None)
             self._session_query_vec.pop(sid, None)
             self._session_query[sid] = query
+            if old_query is not None:
+                with self._prefetch_lock:
+                    self._queued_prefetch.pop(self._prefetch_key(old_query, sid), None)
+        key = self._prefetch_key(query, sid)
+        queued = self._take_queued_prefetch(key)
+        if queued is not None:
+            return str(queued.get("context") or "")
         result = _run_prefetch(self, query, sid, messages=messages)
         return str(result.get("context") or "")
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Compute the next-turn recall off the response critical path."""
+        if self._db is None or self._config is None or self._embedder is None:
+            return
+        sid = session_id or self._session_id or "default"
+        key = self._prefetch_key(query, sid)
+
+        def run() -> None:
+            try:
+                result = _run_prefetch(self, query, sid)
+            except Exception:
+                log.warning("queued prefetch failed", exc_info=True)
+                result = {}
+            if self._prefetch_key(query, sid) == key:
+                self._store_queued_prefetch(key, result)
+
+        if self._prefetch_executor is not None:
+            self._prefetch_executor.submit(run)
+        else:
+            run()
+
+    def on_memory_write(
+        self,
+        action: str,
+        target: str,
+        content: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        """Mirror built-in durable memory writes into Remnant."""
+        if (
+            action not in {"add", "replace", "remove"}
+            or self._db is None
+            or self._config is None
+            or self._embedder is None
+            or self._agent_context not in {"primary", ""}
+        ):
+            return
+        meta = dict(metadata or {})
+        if action in {"replace", "remove"}:
+            old_content = str(meta.get("old_content") or content or "").strip()
+            old = self._db.find_active_memory_by_content(
+                old_content, agent_id=self._config.agent_id
+            )
+            if old is not None:
+                self._db.deactivate_memory(str(old["id"]))
+                self._invalidate_prefetch()
+            if action == "remove":
+                return
+        if not content:
+            return
+        try:
+            store_memory(
+                self._db,
+                self._embedder,
+                self._config,
+                fact=str(content).strip(),
+                entity=str(meta.get("entity") or ("user" if target == "user" else "general")),
+                session_id=str(meta.get("session_id") or self._session_id or "default"),
+                agent_id=self._config.agent_id,
+                visibility=str(meta.get("visibility") or self._config.default_visibility),
+                source="manual",
+                metadata={"write_origin": "builtin_memory", **meta},
+            )
+        except Exception:
+            log.warning("failed to mirror built-in memory write", exc_info=True)
+        else:
+            self._invalidate_prefetch()
+        if self._worker is not None:
+            self._worker.wake()
+
+    def on_pre_compress(self, messages: list[dict[str, Any]]) -> str:
+        """Offer a bounded recall block to Hermes' compressor."""
+        if not messages:
+            return ""
+        query = ""
+        for message in reversed(messages):
+            if isinstance(message, dict) and message.get("role") == "user":
+                query = str(message.get("content") or "").strip()
+                if query:
+                    break
+        if not query:
+            return ""
+        try:
+            return self.prefetch(query, session_id=self._session_id)
+        except Exception:
+            log.debug("pre-compress recall failed", exc_info=True)
+            return ""
+
+    def on_delegation(
+        self,
+        task: str,
+        result: str,
+        *,
+        child_session_id: str = "",
+        **kwargs: Any,
+    ) -> None:
+        """Persist the parent-side outcome of delegated work."""
+        if self._agent_context not in {"primary", ""}:
+            return
+        self.sync_turn(
+            f"Delegated task (child session {child_session_id or 'unknown'}): {task}",
+            f"Delegated result: {result}",
+            session_id=self._session_id,
+        )
+
+    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+        """Give already-queued turn extraction a short bounded flush window."""
+        if self._worker is not None:
+            self._worker.wait_until_idle(timeout_s=1.5, session_id=self._session_id)
 
     def on_session_switch(
         self,
@@ -477,6 +759,11 @@ class RemnantMemoryProvider(MemoryProvider):
             self._last_injected_hash.pop(sid, None)
             self._session_query_vec.pop(sid, None)
             self._session_query.pop(sid, None)
+        with self._prefetch_lock:
+            self._queued_prefetch = OrderedDict(
+                (key, value) for key, value in self._queued_prefetch.items()
+                if key[1] not in affected
+            )
 
     def backup_paths(self) -> list[str]:
         """Expose the shared database to Hermes' external-backup mechanism."""

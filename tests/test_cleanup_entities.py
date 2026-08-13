@@ -13,8 +13,8 @@ import pytest
 from remnant.cleanup_entities import cleanup_entities, find_noise_entities
 from remnant.config import RemnantConfig
 from remnant.db import default_db_path, open_db
-from remnant.ingest import store_memory
 from remnant.embed import Embedder
+from remnant.ingest import store_memory
 
 
 def _hash(text: str) -> str:

@@ -1,6 +1,12 @@
 # Remnant hardening and retrieval improvement plan
 
-Status: proposed
+Status: superseded for new implementation work
+
+Packages 1 through 5 were substantially delivered by PRs #35 and #37, with
+the subsequent prefetch-responsiveness work delivered by PR #38. For the
+current baseline and the remaining competitive roadmap, use
+`docs/remnant-leadership-implementation-plan.md`. Keep this document as the
+audit record and detailed rationale for the completed hardening work.
 
 Audit baseline: `hermes-remnant@0b6cab6` and `hermes-agent@794d6c4`
 

@@ -99,7 +99,8 @@ def find_noise_entities(
         with db.read() as cur:
             cur.execute(
                 "SELECT COUNT(DISTINCT memory_id) AS c FROM memory_entities "
-                "WHERE entity_id=? AND memory_id IN (SELECT id FROM memories WHERE status='active')",
+                "WHERE entity_id=? AND memory_id IN "
+                "(SELECT id FROM memories WHERE status='active')",
                 (eid,),
             )
             count = int(cur.fetchone()["c"])
@@ -157,8 +158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Clean noise entities from the Remnant entity graph."
     )
     parser.add_argument(
-        "--db", type=Path, default=None,
-        help="Path to the Remnant SQLite DB (default: REMNANT_DB_HOME or ~/.hermes/remnant/remnant.db)",
+        "--db",
+        type=Path,
+        default=None,
+        help="Database path (default: REMNANT_DB_HOME or ~/.hermes/remnant/remnant.db)",
     )
     parser.add_argument(
         "--dry-run", action="store_true",

@@ -1,0 +1,52 @@
+name: Remnant CI
+
+on:
+  push:
+    branches: [main, "codex/**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install package and development tools
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Run deterministic leadership evaluation
+        run: >-
+          python -c "from remnant.evaluation.schema import load_cases;
+          from remnant.evaluation.runner import evaluate_scenarios;
+          r=evaluate_scenarios(load_cases('evaluation/cases/leadership.jsonl'))['summary'];
+          assert r['cases'] == 240 and r['recall_at_5'] >= .85 and
+          r['stale_claim_exposure'] == 0"
+      - name: Lint whole repository
+        run: python -m ruff check remnant tests
+      - name: Smoke-test fresh database and health
+        run: >-
+          python -c "import tempfile; from pathlib import Path;
+          from remnant.db import SCHEMA_VERSION, open_db;
+          from remnant.maintenance import health_report;
+          p=Path(tempfile.mkdtemp())/'fresh.db'; db=open_db(p);
+          report=health_report(db); db.close();
+          assert report['schema_version'] == SCHEMA_VERSION and report['integrity'] == 'ok'"
+      - name: Build wheel and sdist
+        run: python -m build
+      - name: Smoke-test built wheel
+        run: >-
+          python -m pip install --force-reinstall dist/*.whl &&
+          cd "$(mktemp -d)" &&
+          python -c "import remnant; assert remnant.__version__ == '0.2.0'"

@@ -446,7 +446,13 @@ def handle_tool_call(
         depth = int(args.get("depth", 2))
         if not entity:
             return {"error": "entity is required"}
-        res = graph_traverse(db, entity, agent_id=aid, depth=depth)
+        res = graph_traverse(
+            db,
+            entity,
+            agent_id=aid,
+            depth=depth,
+            evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
+        )
         return {
             "entity": res["entity"],
             "entities": [

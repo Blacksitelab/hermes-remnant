@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Re-extract entities and rebuild relations for all active memories.
 
 Issue #21/#22 follow-up: existing memories were extracted with the old
@@ -19,8 +20,8 @@ import sys
 import time
 from pathlib import Path
 
-from remnant.entity import extract_high_signal_entities, seed_relations
 from remnant.db import RemnantDB
+from remnant.entity import extract_high_signal_entities, seed_relations
 
 
 def reextract(
@@ -60,7 +61,7 @@ def reextract(
         return {"dry_run": True, "memories": total, "entities_before": ent_before, "links_before": me_before, "relations_before": rel_before}
 
     # Step 1: Clear existing memory_entities and relations
-    print(f"Step 1: Clearing existing entity links and relations...")
+    print("Step 1: Clearing existing entity links and relations...")
     c.execute("DELETE FROM memory_entities")
     me_deleted = c.rowcount
     c.execute("DELETE FROM relations")
@@ -109,7 +110,7 @@ def reextract(
     print(f"  Done: {total} memories in {elapsed:.1f}s, {total_entities_linked} entities linked, {total_relations_seeded} relations seeded")
 
     # Step 3: Clean up orphaned entities (no memory links)
-    print(f"Step 3: Cleaning up orphaned entities...")
+    print("Step 3: Cleaning up orphaned entities...")
     c.execute("""DELETE FROM entities WHERE id NOT IN (
         SELECT DISTINCT entity_id FROM memory_entities
     )""")
@@ -118,7 +119,7 @@ def reextract(
     print(f"  Deleted {orphans} orphaned entities")
 
     # Step 4: VACUUM
-    print(f"Step 4: VACUUM...")
+    print("Step 4: VACUUM...")
     conn.execute("VACUUM")
     conn.commit()
 
@@ -139,13 +140,13 @@ def reextract(
     import os
     db_size = os.path.getsize(db_path) / 1024 / 1024
 
-    print(f"\n=== Results ===")
+    print("\n=== Results ===")
     print(f"Entities: {ent_after}")
     print(f"Memory-entity links: {me_after}")
     print(f"Relations: {rel_after}")
     print(f"Orphaned entities deleted: {orphans}")
     print(f"DB size: {db_size:.1f} MB")
-    print(f"\nTop 10 entities:")
+    print("\nTop 10 entities:")
     for name, links in top_entities:
         print(f"  {name}: {links}")
 
@@ -173,7 +174,7 @@ def main():
         db_path = args.db
     else:
         from remnant.config import load_config
-        config = load_config("/home/jd/.hermes")
+        load_config("/home/jd/.hermes")
         # Try to find the DB path from config or default location
         db_path = str(Path("/home/jd/.hermes/remnant/remnant.db"))
 

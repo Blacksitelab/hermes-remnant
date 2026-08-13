@@ -14,12 +14,14 @@ Strategies:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any
 
 from .config import RRF_K, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder, cosine
+from .resolve import retrieval_query
 from .scope import (
     effective_profile_scope,
     normalize_profile_scope,
@@ -158,12 +160,26 @@ def search(
     # an explicit agent_id wins, else the provider-configured agent_id. A None
     # viewer is treated as a non-owner anonymous search (locked content masked).
     viewer = agent_id if agent_id is not None else config.agent_id
+    lexical_query = retrieval_query(query)
+    history_intent = bool(
+        re.search(
+            r"\b(when|then|before|previously|used to|historical|history|at that time)\b",
+            query,
+            re.I,
+        )
+        or re.search(r"\b20\d{2}-[01]\d-[0-3]\d\b", query)
+    )
 
     if strategy == "graph":
         from .graph import graph_search
 
         results = graph_search(
-            db, query, agent_id=agent_id, limit=limit, profile_scope=scope
+            db,
+            lexical_query,
+            agent_id=agent_id,
+            limit=limit,
+            profile_scope=scope,
+            evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
         )
         results = _attach_source(db, results)
         results = _profile_scope_filter(results, scope)
@@ -174,9 +190,10 @@ def search(
 
     if strategy == "keyword":
         results = db.search_bm25(
-            query,
+            lexical_query,
             agent_id=agent_id,
             profile_scope=scope,
+            include_historical=history_intent and config.claim_aware_ranking_enabled,
             limit=limit * 3 if (visibility or scope) else limit,
         )
         results = _attach_source(db, results)
@@ -205,7 +222,11 @@ def search(
     # semantic signal is too weak for fusion, so we fall back to BM25-only
     # results instead of returning an empty list.
     kw = db.search_bm25(
-        query, agent_id=agent_id, profile_scope=scope, limit=max(limit * 3, 100)
+        lexical_query,
+        agent_id=agent_id,
+        profile_scope=scope,
+        include_historical=history_intent and config.claim_aware_ranking_enabled,
+        limit=max(limit * 3, 100),
     )
     sem = _semantic_rank(
         db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope

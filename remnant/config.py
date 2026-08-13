@@ -168,6 +168,23 @@ class RemnantConfig:
     # Issue #21/#22: max entities linked/related per memory. Caps the entity
     # graph to avoid complete-graph relation explosions and over-extraction.
     entity_max_entities: int = 15
+    # Release-track memory correctness features.  They are independently
+    # switchable so an upgraded installation can shadow and roll back each
+    # behavior without changing the underlying evidence rows.
+    structured_claim_extraction_v2: bool = False
+    claim_reconciliation_enabled: bool = False
+    claim_aware_ranking_enabled: bool = False
+    resolved_context_enabled: bool = False
+    recent_turn_overlay_enabled: bool = False
+    relation_evidence_enabled: bool = False
+    runtime_identity_enabled: bool = False
+    ranking_profile: str = "legacy"
+    recent_turn_overlay_limit: int = 3
+    recent_turn_overlay_max_age_s: int = 900
+    recent_turn_overlay_max_chars: int = 4000
+    prefetch_cache_ttl_s: int = 60
+    prefetch_cache_max_entries: int = 32
+    runtime_user_aliases: dict[str, str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:

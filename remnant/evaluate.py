@@ -10,8 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 from .config import RemnantConfig
 from .db import RemnantDB, default_db_path, open_db
@@ -79,11 +80,24 @@ def evaluate_cases(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate Remnant retrieval from JSON cases.")
-    parser.add_argument("--cases", type=Path, required=True, help="JSON array of retrieval cases.")
+    parser = argparse.ArgumentParser(description="Evaluate Remnant from versioned case files.")
+    parser.add_argument("--cases", type=Path, required=True, help="JSONL scenarios or legacy JSON.")
     parser.add_argument("--db", type=Path, default=None, help="Database path override.")
     parser.add_argument("--agent", default="default", help="Default agent identity for cases.")
+    parser.add_argument(
+        "--layer",
+        choices=("retrieval", "context", "answer"),
+        default="retrieval",
+        help="Leadership evaluation layer for schema-v1 JSONL cases.",
+    )
     args = parser.parse_args(argv)
+    if args.cases.suffix.casefold() == ".jsonl":
+        from .evaluation.runner import evaluate_scenarios, stable_report_json
+        from .evaluation.schema import load_cases
+
+        report = evaluate_scenarios(load_cases(args.cases), layer=args.layer)
+        print(stable_report_json(report), end="")
+        return 0
     cases = json.loads(args.cases.read_text(encoding="utf-8"))
     if not isinstance(cases, list):
         parser.error("--cases must contain a JSON array")

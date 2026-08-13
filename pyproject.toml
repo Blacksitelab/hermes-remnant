@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-remnant"
-version = "0.1.0"
+version = "0.2.0"
 description = "Memory engine plugin for Hermes Agent fleet"
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,10 +21,27 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+    "build>=1.2",
 ]
 
 [tool.hatch.build.targets.wheel]
 packages = ["remnant"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/remnant",
+    "/tests",
+    "/evaluation",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"remnant" = "remnant"
+"tests" = "tests"
+"evaluation" = "evaluation"
+"docs" = "docs"
 
 [tool.ruff]
 line-length = 100
