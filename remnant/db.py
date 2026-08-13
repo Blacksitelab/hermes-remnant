@@ -23,7 +23,7 @@ from typing import Any
 
 from .scope import normalize_profile_scope
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -317,6 +317,19 @@ CREATE TABLE IF NOT EXISTS prefetch_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_prefetch_outcome ON prefetch_stats(outcome);
 CREATE INDEX IF NOT EXISTS idx_prefetch_created ON prefetch_stats(created_at);
+
+CREATE TABLE IF NOT EXISTS operation_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    elapsed_ms REAL NOT NULL DEFAULT 0,
+    input_units INTEGER NOT NULL DEFAULT 0,
+    output_units INTEGER NOT NULL DEFAULT 0,
+    agent_id TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_operation_metrics_kind
+    ON operation_metrics(operation, outcome, created_at);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -671,6 +684,36 @@ class RemnantDB:
                 self._conn.commit()
         except Exception:
             # Stats are best-effort — never break prefetch over logging.
+            pass
+
+    def record_operation(
+        self,
+        operation: str,
+        outcome: str,
+        *,
+        elapsed_ms: float = 0.0,
+        input_units: int = 0,
+        output_units: int = 0,
+        agent_id: str | None = None,
+    ) -> None:
+        """Persist bounded counters only; never prompts, responses, or secrets."""
+        try:
+            with self._lock:
+                self._conn.execute(
+                    "INSERT INTO operation_metrics(operation, outcome, elapsed_ms, "
+                    "input_units, output_units, agent_id, created_at) VALUES(?,?,?,?,?,?,?)",
+                    (
+                        str(operation)[:64], str(outcome)[:32], max(0.0, float(elapsed_ms)),
+                        max(0, int(input_units)), max(0, int(output_units)), agent_id,
+                        _now_iso(),
+                    ),
+                )
+                self._conn.execute(
+                    "DELETE FROM operation_metrics WHERE id <= "
+                    "COALESCE((SELECT MAX(id) - 10000 FROM operation_metrics), 0)"
+                )
+                self._conn.commit()
+        except Exception:
             pass
 
     # -- turns -----------------------------------------------------------------
@@ -1842,6 +1885,7 @@ class RemnantDB:
         depth: int = 2,
         agent_id: str | None = None,
         profile_scope: list[str] | None = None,
+        evidence_only: bool = False,
     ) -> dict[str, Any]:
         """BFS over `relations` up to `depth` hops. Pure SQLite, no LLM.
 
@@ -1856,9 +1900,16 @@ class RemnantDB:
             if not frontier:
                 break
             placeholders = ",".join("?" for _ in frontier)
+            relation_source = (
+                "(SELECT entity_a, entity_b FROM relation_evidence WHERE active=1 "
+                "GROUP BY entity_a, entity_b)"
+                if evidence_only
+                else "relations"
+            )
             sql = (
-                f"SELECT entity_a AS other FROM relations WHERE entity_b IN ({placeholders}) "
-                f"UNION SELECT entity_b AS other FROM relations WHERE entity_a IN ({placeholders})"
+                f"SELECT entity_a AS other FROM {relation_source} "
+                f"WHERE entity_b IN ({placeholders}) UNION SELECT entity_b AS other "
+                f"FROM {relation_source} WHERE entity_a IN ({placeholders})"
             )
             params = list(frontier) + list(frontier)
             with self.read() as cur:
@@ -1918,6 +1969,7 @@ class RemnantDB:
         depth: int = 2,
         limit: int = 20,
         profile_scope: list[str] | None = None,
+        evidence_only: bool = False,
     ) -> list[dict[str, Any]]:
         """Resolve entity names from the query, traverse the graph, and return
         linked active memories. Pure SQLite (no embedding / LLM work).
@@ -1932,7 +1984,11 @@ class RemnantDB:
         seen: dict[str, dict[str, Any]] = {}
         for eid in seed_ids:
             res = self.traverse_graph(
-                eid, depth=depth, agent_id=agent_id, profile_scope=profile_scope
+                eid,
+                depth=depth,
+                agent_id=agent_id,
+                profile_scope=profile_scope,
+                evidence_only=evidence_only,
             )
             for m in res["memories"]:
                 mid = m["id"]

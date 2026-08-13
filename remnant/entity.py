@@ -31,8 +31,8 @@ Issue #5 additions:
 
 from __future__ import annotations
 
-import re
 import logging
+import re
 from typing import Any
 
 from .db import RemnantDB, _normalize_entity_name
@@ -459,7 +459,11 @@ def _cooccurring_pairs_from_text(
     pairs: set[tuple[str, str]] = set()
     for sentence in sentences:
         lower = sentence.lower()
-        present = [eid for eid in entity_ids if any(n in lower for n in names_by_id.get(eid, set()))]
+        present = [
+            eid
+            for eid in entity_ids
+            if any(name in lower for name in names_by_id.get(eid, set()))
+        ]
         if len(present) < 2:
             continue
         for i, a in enumerate(present):

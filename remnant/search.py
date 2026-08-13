@@ -174,7 +174,12 @@ def search(
         from .graph import graph_search
 
         results = graph_search(
-            db, lexical_query, agent_id=agent_id, limit=limit, profile_scope=scope
+            db,
+            lexical_query,
+            agent_id=agent_id,
+            limit=limit,
+            profile_scope=scope,
+            evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
         )
         results = _attach_source(db, results)
         results = _profile_scope_filter(results, scope)

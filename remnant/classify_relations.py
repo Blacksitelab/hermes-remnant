@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """Re-classify existing `related_to` relations into typed relations.
 
 Works directly on the production DB by re-reading the source memory text
@@ -15,7 +16,6 @@ import argparse
 import logging
 import re
 import sqlite3
-import sys
 from collections import Counter
 
 log = logging.getLogger("remnant.classify_relations")
@@ -84,18 +84,16 @@ def classify_relation_in_text(
     if pos_a < pos_b:
         first_name, second_name = na, nb
         first_pos, second_pos = pos_a, pos_b
-        a_is_first = True
     else:
         first_name, second_name = nb, na
         first_pos, second_pos = pos_b, pos_a
-        a_is_first = False
 
     # Extract text between the two entities
     between = lower[first_pos + len(first_name):second_pos].strip()
     # Also check text after second entity for "X is part of Y" patterns
-    after = lower[second_pos + len(second_name):].strip()[:100]
+    lower[second_pos + len(second_name):].strip()[:100]
     # And text before first entity
-    before = lower[:first_pos].strip()[-100:]
+    lower[:first_pos].strip()[-100:]
 
     # Check each verb type — directional types check the "between" text
     # for the verb, and determine direction from which entity comes first

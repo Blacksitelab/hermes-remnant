@@ -18,7 +18,6 @@ from remnant.embed import Embedder
 from remnant.ingest import store_memory
 from remnant.search import search
 
-
 # --- shared fakes (mirror test_dream.py) -----------------------------------
 
 

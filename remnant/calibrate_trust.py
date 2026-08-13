@@ -3,7 +3,7 @@
 Decay alone produces a flat distribution (everything converges to the floor).
 This script recalibrates trust scores using multiple signals:
 
-1. **Source quality**: vault (1.0 confidence) > import (0.9) > manual (0.5) 
+1. **Source quality**: vault (1.0 confidence) > import (0.9) > manual (0.5)
    > conversation (0.5) > hindsight (0.5)
 2. **Confidence**: higher confidence → higher baseline trust
 3. **Verified status**: verified memories get +0.1
@@ -52,7 +52,7 @@ def calibrate_trust(db_path: str, dry_run: bool = True) -> dict:
     c.execute("""
         SELECT id, source, confidence, trust_score, verified,
                created_at, updated_at
-        FROM memories 
+        FROM memories
         WHERE status = 'active'
     """)
     rows = c.fetchall()
@@ -164,7 +164,8 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     result = calibrate_trust(args.db, dry_run=not args.yes)
-    print(f"\n{'DRY RUN' if result['dry_run'] else 'APPLIED'}: {result['updated']}/{result['total']} memories updated")
+    label = "DRY RUN" if result["dry_run"] else "APPLIED"
+    print(f"\n{label}: {result['updated']}/{result['total']} memories updated")
 
 
 if __name__ == "__main__":

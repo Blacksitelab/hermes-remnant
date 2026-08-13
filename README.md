@@ -208,6 +208,18 @@ def register(ctx):
     ctx.register_memory_provider(RemnantMemoryProvider())
 ```
 
+Install from GitHub and select Remnant as the single active external memory provider:
+
+```bash
+hermes plugins install Blacksitelab/hermes-remnant
+hermes config set memory.provider remnant
+hermes memory status
+```
+
+Hermes also exposes provider selection through `hermes plugins` and
+`hermes memory setup`. Remnant continues to support keyword-only recall when
+the configured embedding or extraction service is unavailable.
+
 ---
 
 ## Tools exposed to agents
@@ -340,12 +352,47 @@ dream_cooldown_minutes: 120
 injection_token_budget: 2000
 injection_prefetch_deadline_ms: 500
 prefetch_embedding_timeout_ms: 250
+runtime_identity_enabled: false
+structured_claim_extraction_v2: false
+claim_reconciliation_enabled: false
+claim_aware_ranking_enabled: false
+resolved_context_enabled: false
+recent_turn_overlay_enabled: false
+relation_evidence_enabled: false
 ```
 
 Prefetch always establishes a local BM25 baseline before attempting the remote
 query embedding. If Ollama is busy or unavailable, that keyword context is
 injected instead of blocking or dropping recall. Keep-alive values are finite by
 default because extraction and embedding commonly share one Ollama host.
+
+For a canary, enable the correctness flags together after backing up the shared
+database. They remain off by default in 0.2.0 so rollback is configuration-only.
+
+## Operations and safe upgrades
+
+```bash
+# Bounded local health report; performs no network requests
+python -m remnant.maintenance health
+
+# Create and integrity-check a new backup (never overwrites)
+python -m remnant.maintenance backup --output /safe/path/remnant-before-0.2.db
+
+# Preview and then apply derived relation-evidence backfill
+python -m remnant.maintenance backfill-relation-evidence
+python -m remnant.maintenance backfill-relation-evidence --yes
+
+# Restore into a new path for validation; never overwrite the live database
+python -m remnant.maintenance restore \
+  --backup /safe/path/remnant-before-0.2.db \
+  --output /safe/path/remnant-restored.db
+```
+
+The health report includes schema/integrity, queue and dead-letter state,
+claim coverage and unresolved age, embedding model/dimension coverage,
+prefetch outcomes and latency, entity/relation evidence counts, and bounded
+operation counters. See [the provider comparison](docs/provider-comparison.md)
+for the current evidence-based positioning against Hermes' popular providers.
 
 **GLiNER entity extraction** is enabled by default when the `gliner` package is installed. No configuration needed — the model (`urchade/gliner_small_v2`) is downloaded automatically on first use from HuggingFace (no token required). If `gliner` is not installed, the regex extractor runs automatically.
 

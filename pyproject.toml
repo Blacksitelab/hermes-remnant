@@ -27,6 +27,22 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["remnant"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/remnant",
+    "/tests",
+    "/evaluation",
+    "/docs",
+    "/README.md",
+    "/CHANGELOG.md",
+]
+
+[tool.hatch.build.targets.sdist.force-include]
+"remnant" = "remnant"
+"tests" = "tests"
+"evaluation" = "evaluation"
+"docs" = "docs"
+
 [tool.ruff]
 line-length = 100
 

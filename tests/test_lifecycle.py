@@ -128,3 +128,26 @@ def test_relation_evidence_backfill_is_dry_run_and_idempotent(tmp_path: Path):
         assert backfill_relation_evidence(db, dry_run=False)["written"] == 0
     finally:
         db.close()
+
+
+def test_evidence_traversal_drops_relation_only_after_last_evidence_is_forgotten(
+    tmp_path: Path,
+):
+    db = open_db(tmp_path / "traversal.db")
+    try:
+        first = db.resolve_entity("Kris", "a")
+        second = db.resolve_entity("Remnant", "a")
+        memories = [
+            db.insert_memory(content=f"evidence {index}", agent="a") for index in range(2)
+        ]
+        for memory_id in memories:
+            db.link_entity(memory_id=memory_id, entity_id=first, agent_id="a")
+            db.link_entity(memory_id=memory_id, entity_id=second, agent_id="a")
+            db.add_relation(entity_a=first, entity_b=second, source_memory_id=memory_id)
+        lifecycle = MemoryLifecycle(db, RemnantConfig(agent_id="a"), None)
+        lifecycle.forget(memories[0], actor="test", agent_id="a")
+        assert len(db.traverse_graph(first, depth=1, evidence_only=True)["entities"]) == 2
+        lifecycle.forget(memories[1], actor="test", agent_id="a")
+        assert len(db.traverse_graph(first, depth=1, evidence_only=True)["entities"]) == 1
+    finally:
+        db.close()

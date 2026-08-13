@@ -176,6 +176,7 @@ class RemnantConfig:
     claim_aware_ranking_enabled: bool = False
     resolved_context_enabled: bool = False
     recent_turn_overlay_enabled: bool = False
+    relation_evidence_enabled: bool = False
     runtime_identity_enabled: bool = False
     ranking_profile: str = "legacy"
     recent_turn_overlay_limit: int = 3

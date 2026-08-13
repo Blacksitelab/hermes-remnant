@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import time
 
 import httpx
 
@@ -68,10 +69,27 @@ class Embedder:
         text_hash = _hash(text)
         cached = self._db.get_cached_embedding(self._model, text_hash)
         if cached is not None:
+            self._db.record_operation(
+                "embedding", "cache_hit", input_units=len(text), output_units=len(cached)
+            )
             return cached
+        started = time.perf_counter()
         vec = self._embed_remote(text, timeout=timeout)
         if vec is None:
+            self._db.record_operation(
+                "embedding",
+                "failure",
+                elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                input_units=len(text),
+            )
             return None
+        self._db.record_operation(
+            "embedding",
+            "remote_success",
+            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+            input_units=len(text),
+            output_units=len(vec),
+        )
         self._db.put_cached_embedding(self._model, text_hash, vec)
         return vec
 

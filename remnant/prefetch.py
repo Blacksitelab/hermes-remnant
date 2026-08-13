@@ -138,6 +138,7 @@ def _graph_expand(
     query: str,
     agent_id: str | None = None,
     max_terms: int = 5,
+    evidence_only: bool = False,
 ) -> list[str]:
     """Resolve entity mentions in the query against the graph and return
     canonical entity names (resolved + 1-hop neighbours) as search terms.
@@ -163,7 +164,9 @@ def _graph_expand(
         return []
     # 1-hop traversal to find related entity names.
     for eid in seed_ids:
-        result = db.traverse_graph(eid, depth=1, agent_id=agent_id)
+        result = db.traverse_graph(
+            eid, depth=1, agent_id=agent_id, evidence_only=evidence_only
+        )
         for ent in result.get("entities", []):
             name = ent.get("name")
             if name and name.lower() not in seen_names:
@@ -286,7 +289,12 @@ def prefetch(
     # entity graph and add canonical entity names as search terms. Pure
     # SQLite, <10ms — stays well within the prefetch deadline.
     try:
-        graph_terms = _graph_expand(db, query, agent_id=agent_id)
+        graph_terms = _graph_expand(
+            db,
+            query,
+            agent_id=agent_id,
+            evidence_only=bool(getattr(cfg, "relation_evidence_enabled", False)),
+        )
         for term in graph_terms:
             if term and term not in expansions:
                 expansions.append(term)

@@ -15,7 +15,6 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import re
 import threading
 import time
@@ -314,6 +313,13 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "type": "boolean",
         "required": False,
     },
+    {
+        "key": "relation_evidence_enabled",
+        "description": "Traverse only relations backed by active memory evidence",
+        "default": False,
+        "type": "boolean",
+        "required": False,
+    },
 ]
 
 
@@ -351,11 +357,9 @@ class RemnantMemoryProvider(MemoryProvider):
     def is_available(self) -> bool:
         """Check local prerequisites without contacting Ollama or Hermes."""
         try:
-            path = default_db_path()
-            parent = path.parent
-            if parent.exists():
-                return os.access(parent, os.W_OK)
-            return parent.parent.exists() and os.access(parent.parent, os.W_OK)
+            from .maintenance import availability_report
+
+            return bool(availability_report(db_path=default_db_path())["available"])
         except (OSError, TypeError, ValueError):
             return False
 

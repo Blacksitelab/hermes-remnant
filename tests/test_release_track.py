@@ -68,7 +68,7 @@ def test_health_report_exposes_schema_and_claim_lifecycle():
     db = open_db(default_db_path())
     try:
         report = health_report(db)
-        assert report["schema_version"] == 13
+        assert report["schema_version"] == 14
         assert "claims_by_resolution" in report
         assert "pending_extraction_age_s" in report
     finally:
@@ -132,5 +132,10 @@ def test_recent_turn_overlay_recalls_pending_turn_without_durable_match(
         context = provider.prefetch("what did I say in the previous turn?", session_id="s1")
         assert "Recent unprocessed turn" in context
         assert "Elegoo Centauri Carbon V1" in context
+        job = provider._db.claim_next_extraction(agent_id="default")  # type: ignore[union-attr]
+        provider._db.complete_extraction(job["id"], fact_count=0)  # type: ignore[union-attr]
+        provider._last_injected_hash.clear()
+        after = provider.prefetch("what did I say in the previous turn?", session_id="s1")
+        assert "Recent unprocessed turn" not in after
     finally:
         provider.shutdown()

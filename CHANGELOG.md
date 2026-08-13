@@ -7,7 +7,7 @@
 - Hermes lifecycle parity for queued prefetch, session end, pre-compression,
   built-in memory writes, delegation, session switching, and backup paths.
 - Runtime agent/workspace identity scoping with non-primary write protection.
-- Schema 13 claim metadata for observation/event time, validity, scope,
+- Schema 14 claim metadata for observation/event time, validity, scope,
   modality, conflict type, resolution status, extractor version, and source
   turn provenance.
 - Opt-in structured extraction, conservative claim reconciliation, claim-aware
@@ -19,7 +19,7 @@
 
 ### Compatibility and rollout
 
-- Existing databases migrate additively to schema 13; no memory rows are
+- Existing databases migrate additively to schema 14; no memory rows are
   deleted or re-scoped by the migration.
 - New correctness behaviors default to `false` for compatibility. Enable the
   six release-track flags together for a canary, measure the evaluation and
@@ -29,6 +29,6 @@
 
 ### Verification
 
-- 348 automated tests pass locally.
-- Release-track modules pass Ruff, `git diff --check`, bytecode compilation,
+- 379 automated tests pass locally.
+- The whole repository passes Ruff, `git diff --check`, bytecode compilation,
   and `python -m build` for the 0.2.0 wheel and sdist.

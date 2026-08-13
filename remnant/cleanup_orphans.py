@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
 
 from .db import RemnantDB, default_db_path
 

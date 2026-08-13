@@ -306,12 +306,27 @@ class ExtractionWorker:
                 "extraction LLM call succeeded duration_ms=%.1f facts=%s",
                 duration_ms, len(facts),
             )
+            self._db.record_operation(
+                "extraction",
+                "success",
+                elapsed_ms=duration_ms,
+                input_units=max(1, len(content) // 4),
+                output_units=max(1, len(text) // 4),
+                agent_id=self._config.agent_id,
+            )
             return facts
         except (httpx.HTTPError, LLMResponseError, ValueError, json.JSONDecodeError) as e:
             duration_ms = (time.perf_counter() - t0) * 1000.0
             log.warning(
                 "extraction failed duration_ms=%.1f error=%s",
                 duration_ms, e,
+            )
+            self._db.record_operation(
+                "extraction",
+                "failure",
+                elapsed_ms=duration_ms,
+                input_units=max(1, len(content) // 4),
+                agent_id=self._config.agent_id,
             )
             raise
 

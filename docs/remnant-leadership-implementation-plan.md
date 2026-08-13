@@ -10,7 +10,7 @@ Repository: `Blacksitelab/hermes-remnant` only
 
 Baseline: `85926f74dfac454cde6ac65385e359365059344f`
 
-Schema baseline: `SCHEMA_VERSION = 13` (release branch implementation)
+Schema baseline: `SCHEMA_VERSION = 14` (release branch implementation)
 
 Target: make Remnant the most correct, efficient, private, and operationally
 reliable memory provider for Hermes Agent.
