@@ -17,7 +17,7 @@ from typing import Any
 from .config import RemnantConfig
 from .db import RemnantDB, default_db_path, open_db
 from .embed import Embedder
-from .search import search
+from .recall import RecallRequest, RecallService
 
 
 def evaluate_cases(
@@ -38,15 +38,16 @@ def evaluate_cases(
             raise ValueError("every case requires non-empty query and expected_ids")
         limit = max(1, int(raw.get("limit", config.search_limit)))
         started = time.perf_counter()
-        rows = search(
-            db,
-            config,
-            query,
-            agent_id=raw.get("agent_id") or config.agent_id,
-            strategy=str(raw.get("strategy") or config.default_search_strategy),
-            limit=limit,
+        response = RecallService(db, config).recall(
+            RecallRequest(
+                query=query,
+                agent_id=raw.get("agent_id") or config.agent_id,
+                strategy=str(raw.get("strategy") or config.default_search_strategy),
+                limit=limit,
+            ),
             embedder=embedder,
         )
+        rows = response.results
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         returned = [str(row["id"]) for row in rows]
         matched = expected.intersection(returned)

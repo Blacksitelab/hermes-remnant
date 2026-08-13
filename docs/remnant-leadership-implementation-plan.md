@@ -1,6 +1,8 @@
 # Remnant leadership implementation plan
 
-Status: implementation handoff
+Status: superseded by `docs/remnant-v0.2.1-leadership-plan.md` for new
+configurations. This document remains the historical v0.2.0 implementation
+record and describes the original opt-in rollout.
 
 Release branch note: the first integrated implementation is tracked in
 `codex/remnant-release`; the feature flags remain opt-in until deployment

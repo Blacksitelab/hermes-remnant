@@ -352,13 +352,14 @@ dream_cooldown_minutes: 120
 injection_token_budget: 2000
 injection_prefetch_deadline_ms: 500
 prefetch_embedding_timeout_ms: 250
-runtime_identity_enabled: false
-structured_claim_extraction_v2: false
-claim_reconciliation_enabled: false
-claim_aware_ranking_enabled: false
-resolved_context_enabled: false
-recent_turn_overlay_enabled: false
-relation_evidence_enabled: false
+runtime_identity_enabled: false  # enable only with a stable gateway user identity
+structured_claim_extraction_v2: true
+claim_reconciliation_enabled: true
+claim_aware_ranking_enabled: true
+ranking_profile: claims-v1
+resolved_context_enabled: true
+recent_turn_overlay_enabled: true
+relation_evidence_enabled: true
 ```
 
 Prefetch always establishes a local BM25 baseline before attempting the remote
@@ -366,8 +367,11 @@ query embedding. If Ollama is busy or unavailable, that keyword context is
 injected instead of blocking or dropping recall. Keep-alive values are finite by
 default because extraction and embedding commonly share one Ollama host.
 
-For a canary, enable the correctness flags together after backing up the shared
-database. They remain off by default in 0.2.0 so rollback is configuration-only.
+The claim-aware correctness stack is the recommended default for new
+configurations. Existing explicit values are preserved, and every flag remains
+independently reversible. Keep runtime identity disabled unless Hermes supplies
+a stable platform user identity; its fail-closed anonymous fallback is scoped to
+one session and would otherwise prevent cross-session recall.
 
 ## Operations and safe upgrades
 
@@ -490,20 +494,26 @@ python -m remnant.maintenance migrate-default-agent --agent claire --yes
 
 ### Release-track claim resolution
 
-Remnant 0.2 adds an opt-in correctness track for installations that want
-temporal claims, conservative conflict handling, and provenance-aware prompt
-context. Enable these settings together in `remnant.json` during a canary:
+Remnant's recommended profile enables temporal claims, conservative conflict
+handling, provenance-aware prompt context, immediate recent-turn recall, and
+evidence-backed graph traversal:
 
 ```json
 {
   "structured_claim_extraction_v2": true,
   "claim_reconciliation_enabled": true,
   "claim_aware_ranking_enabled": true,
+  "ranking_profile": "claims-v1",
   "resolved_context_enabled": true,
   "recent_turn_overlay_enabled": true,
-  "runtime_identity_enabled": true
+  "relation_evidence_enabled": true,
+  "runtime_identity_enabled": false
 }
 ```
+
+Enable runtime identity only for deployments whose Hermes gateway provides a
+stable platform user identity. Leave it `false` for anonymous or session-only
+gateways.
 
 The flags are independent so an operator can roll back one behavior without
 discarding stored evidence. Claim rows retain source-turn, validity, scope,
@@ -513,9 +523,21 @@ remain private to the active agent/session. The Hermes lifecycle hooks also
 cover queued prefetch, built-in writes, context compression, delegation,
 session end, backup paths, and session switching.
 
-The release branch keeps legacy behavior as the default for existing databases;
-enable the release track only after running the evaluation and health gates in
-[`docs/remnant-leadership-implementation-plan.md`](docs/remnant-leadership-implementation-plan.md).
+Explicit legacy overrides remain supported. Run the evaluation and health gates
+in [`docs/remnant-v0.2.1-leadership-plan.md`](docs/remnant-v0.2.1-leadership-plan.md)
+before changing a production deployment that has pinned any of these flags.
+
+Named operational profiles are available for controlled rollout:
+
+```bash
+python -m remnant.maintenance config-profile --home ~/.hermes/profiles/default \
+  --name claim_aware                 # preview
+python -m remnant.maintenance config-profile --home ~/.hermes/profiles/default \
+  --name claim_aware --yes           # apply
+```
+
+The other profiles are `claim_aware_shadow` and `legacy`. The command reports
+every changed field and preserves unrelated settings.
 
 ### Type check (optional)
 

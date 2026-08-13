@@ -121,10 +121,26 @@ def record_claim_from_memory(
         ):
             db.supersede_claims(subject=subject, predicate=predicate, agent_id=agent_id)
         conflict_type = "update" if active else "compatible"
+    active_evidence = db.get_memory(str(active.get("memory_id"))) if active else None
+    candidate_evidence = {
+        "source": data.get("source"),
+        "verified": bool(data.get("verified")),
+        "trust_score": data.get("trust_score"),
+        "seen_count": data.get("seen_count", 1),
+        "explicit_correction": bool(
+            re.search(
+                r"\b(switched|changed|updated|now prefer|no longer|instead of|from .+ to)\b",
+                fact,
+                re.I,
+            )
+        ),
+    }
     decision = decide_reconciliation(
         conflict_type=conflict_type,
         confidence=float(data.get("confidence", confidence) or confidence),
         active=active,
+        active_evidence=active_evidence,
+        candidate_evidence=candidate_evidence,
     )
     if reconciliation_enabled and decision.supersede:
         db.supersede_claims(subject=subject, predicate=predicate, agent_id=agent_id)

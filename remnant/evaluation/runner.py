@@ -7,7 +7,6 @@ import json
 import os
 import re
 import tempfile
-import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -15,11 +14,9 @@ from typing import Any
 
 from ..claims import record_claim_from_memory
 from ..config import RemnantConfig
-from ..context import compile_context
+from ..context import conservative_token_count
 from ..db import SCHEMA_VERSION, open_db
-from ..prefetch import _approx_tokens
-from ..resolve import resolve_results
-from ..search import search
+from ..recall import RecallRequest, RecallService
 from .metrics import ranking_metrics, summarize
 from .schema import validate_case
 
@@ -121,51 +118,28 @@ def _evaluate_case(
             config = RemnantConfig(
                 agent_id=str(case["query"].get("agent") or case["persona"]),
                 default_search_strategy=str(case["query"].get("strategy") or "keyword"),
-                claim_aware_ranking_enabled=True,
-                resolved_context_enabled=True,
-                recent_turn_overlay_enabled=True,
                 prefetch_embedding_timeout_ms=0,
                 search_limit=5,
             )
-            started = time.perf_counter()
-            rows = search(
-                db,
-                config,
-                query,
-                agent_id=config.agent_id,
-                strategy=config.default_search_strategy,
-                limit=5,
+            query_at = datetime.fromisoformat(str(case["query"]["at"]).replace("Z", "+00:00"))
+            response = RecallService(db, config).recall(
+                RecallRequest(
+                    query=query,
+                    agent_id=config.agent_id,
+                    session_id=str(case["query"].get("session_id") or case["case_id"]),
+                    strategy=config.default_search_strategy,
+                    limit=5,
+                    now=query_at,
+                    include_pending=True,
+                    output_mode="context",
+                ),
                 embedder=DeterministicEmbedder(),
             )
-            for turn in db.get_pending_turns(
-                agent_id=config.agent_id,
-                session_id=str(case["query"].get("session_id") or case["case_id"]),
-                limit=3,
-            ):
-                pending_id = f"pending-{turn['id']}"
-                rows.insert(
-                    0,
-                    {
-                        "id": pending_id,
-                        "content": turn["user_text"],
-                        "visibility": "private",
-                        "score": 1.0,
-                        "pending": True,
-                        "claim_status": "unprocessed",
-                    },
-                )
-            search_ms = (time.perf_counter() - started) * 1000.0
-            query_at = datetime.fromisoformat(str(case["query"]["at"]).replace("Z", "+00:00"))
-            resolve_started = time.perf_counter()
-            resolved = resolve_results(db, rows, query=query, now=query_at)
-            resolve_ms = (time.perf_counter() - resolve_started) * 1000.0
-            returned_labels = [id_to_label.get(str(row.get("id")), "") for row in resolved]
+            returned_labels = [id_to_label.get(str(row.get("id")), "") for row in response.results]
             returned_labels = [label for label in returned_labels if label]
             expected_labels = set(case["expected"]["supporting_memory_labels"])
             metrics = ranking_metrics(returned_labels, expected_labels)
-            format_started = time.perf_counter()
-            context = compile_context(resolved)
-            format_ms = (time.perf_counter() - format_started) * 1000.0
+            context = response.context
             relevant_lines = sum(
                 1 for label in expected_labels if label_to_id[label][:12] in context
             )
@@ -185,11 +159,9 @@ def _evaluate_case(
                 "duplicate_top_k_occupancy": max(
                     0, len(returned_labels) - len(set(returned_labels))
                 ),
-                "injected_tokens": _approx_tokens(context),
+                "injected_tokens": conservative_token_count(context),
                 "timing_ms": {
-                    "search": round(search_ms, 3),
-                    "resolution": round(resolve_ms, 3),
-                    "formatting": round(format_ms, 3),
+                    "recall": response.diagnostics.get("elapsed_ms", 0.0),
                 },
             }
             if layer in {"context", "answer"}:

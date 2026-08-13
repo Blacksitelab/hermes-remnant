@@ -44,6 +44,24 @@ def test_relevance_is_demoted_not_erased_by_low_quality(tmp_path: Path):
         db.close()
 
 
+def test_ranker_normalizes_scores_within_search_lane(tmp_path: Path):
+    db = open_db(tmp_path / "lanes.db")
+    try:
+        first = db.insert_memory(content="first", source="manual")
+        second = db.insert_memory(content="second", source="conversation")
+        ranked = rank_results(
+            db,
+            [
+                {"id": first, "content": "first", "score": 100.0, "_score_lane": "keyword"},
+                {"id": second, "content": "second", "score": 0.9, "_score_lane": "semantic"},
+            ],
+        )
+        assert {row["ranking"]["score_lane"] for row in ranked} == {"keyword", "semantic"}
+        assert all("source_authority" in row["ranking"]["quality"] for row in ranked)
+    finally:
+        db.close()
+
+
 def test_context_truncates_items_and_stays_inside_budget():
     memories = [
         {"id": "one", "content": "x" * 900, "visibility": "private"},

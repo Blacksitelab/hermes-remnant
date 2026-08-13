@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 - claim-aware recall
+
+### Changed
+
+- Made structured claims, reconciliation, claim-aware ranking, resolved
+  context, recent-turn overlay, and evidence-backed relation traversal the
+  defaults for new configurations.
+- Kept runtime identity opt-in because gateways without a stable platform user
+  identity intentionally fall back to session isolation, which prevents
+  cross-session recall.
+- Added a dependency-ordered v0.2.1 implementation handoff plan focused on one
+  recall pipeline, provider-neutral evidence, calibrated ranking, and scale.
+
 ## 0.2.0 - release candidate
 
 ### Added
