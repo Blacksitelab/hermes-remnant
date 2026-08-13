@@ -4,11 +4,65 @@ from pathlib import Path
 
 from remnant import RemnantMemoryProvider
 from remnant.claims import record_claim_from_memory
-from remnant.config import save_config
+from remnant.config import RemnantConfig, apply_config_preset, load_config, save_config
 from remnant.context import compile_context
 from remnant.db import default_db_path, open_db
 from remnant.maintenance import health_report
 from remnant.resolve import resolve_results
+
+
+def test_claim_aware_profile_is_the_new_configuration_default(tmp_path: Path):
+    config = RemnantConfig()
+    assert config.structured_claim_extraction_v2 is True
+    assert config.claim_reconciliation_enabled is True
+    assert config.claim_aware_ranking_enabled is True
+    assert config.resolved_context_enabled is True
+    assert config.recent_turn_overlay_enabled is True
+    assert config.relation_evidence_enabled is True
+    assert config.ranking_profile == "claims-v1"
+    # Stable runtime identity is a deployment prerequisite, not a safe generic
+    # default: the identity fallback deliberately isolates anonymous sessions.
+    assert config.runtime_identity_enabled is False
+
+    schema_defaults = {
+        row["key"]: row.get("default")
+        for row in RemnantMemoryProvider().get_config_schema()
+    }
+    for key in (
+        "structured_claim_extraction_v2",
+        "claim_reconciliation_enabled",
+        "claim_aware_ranking_enabled",
+        "resolved_context_enabled",
+        "recent_turn_overlay_enabled",
+        "relation_evidence_enabled",
+    ):
+        assert schema_defaults[key] is True
+    assert schema_defaults["ranking_profile"] == "claims-v1"
+    assert schema_defaults["runtime_identity_enabled"] is False
+
+    # Explicit rollback values in an existing config must remain authoritative.
+    home = tmp_path / "legacy-overrides"
+    save_config(
+        {
+            "claim_aware_ranking_enabled": False,
+            "resolved_context_enabled": False,
+            "ranking_profile": "legacy",
+        },
+        home,
+    )
+    loaded = load_config(home)
+    assert loaded.claim_aware_ranking_enabled is False
+    assert loaded.resolved_context_enabled is False
+    assert loaded.ranking_profile == "legacy"
+
+
+def test_named_config_profiles_preserve_unrelated_settings():
+    values = {"agent_id": "coder", "injection_token_budget": 1234}
+    updated = apply_config_preset(values, "legacy")
+    assert updated["agent_id"] == "coder"
+    assert updated["injection_token_budget"] == 1234
+    assert updated["claim_aware_ranking_enabled"] is False
+    assert updated["ranking_profile"] == "legacy"
 
 
 def test_claim_metadata_migrates_and_resolves_without_losing_history():

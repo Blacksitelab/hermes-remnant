@@ -788,3 +788,29 @@ def test_search_tool_default_strategy_is_auto(provider: RemnantMemoryProvider):
     )
     parsed = json.loads(out)
     assert parsed["count"] >= 1
+
+
+def test_search_tool_uses_claim_resolution_and_reports_competing_evidence(
+    provider: RemnantMemoryProvider,
+):
+    provider.handle_tool_call(
+        "memory_store",
+        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        session_id="claims",
+    )
+    provider.handle_tool_call(
+        "memory_store",
+        {"fact": "Sven prefers light mode", "entity": "Sven"},
+        session_id="claims",
+    )
+    parsed = json.loads(
+        provider.handle_tool_call(
+            "memory_search",
+            {"query": "Sven preference", "strategy": "keyword", "limit": 1},
+            session_id="claims",
+        )
+    )
+    assert parsed["count"] == 1
+    assert parsed["results"][0]["claim_status"] == "unresolved"
+    assert len(parsed["results"][0]["claim_group"]) == 2
+    assert parsed["diagnostics"]["ranking_profile"] == "claims-v1"

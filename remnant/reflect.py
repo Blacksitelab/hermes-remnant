@@ -14,7 +14,7 @@ from .config import REFLECT_MAX_TOKENS, REFLECT_TOP_N, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
 from .llm import chat
-from .search import search as hybrid_search
+from .recall import RecallRequest, RecallService
 
 log = logging.getLogger("remnant.reflect")
 
@@ -33,24 +33,44 @@ def memory_reflect(
     config: RemnantConfig,
     embedder: Embedder,
     agent_id: str,
+    session_id: str = "default",
 ) -> dict[str, Any]:
     """Retrieve top-N memories for `question` and synthesize via local LLM."""
     question = (question or "").strip()
     if not question:
         return {"error": "question is required"}
 
-    results = hybrid_search(
-        db, config, question,
-        agent_id=agent_id, limit=REFLECT_TOP_N, strategy="auto",
+    response = RecallService(db, config).recall(
+        RecallRequest(
+            query=question,
+            agent_id=agent_id,
+            session_id=session_id or "default",
+            strategy="auto",
+            limit=REFLECT_TOP_N,
+            include_pending=bool(getattr(config, "recent_turn_overlay_enabled", False)),
+        ),
         embedder=embedder,
     )
+    results = response.results
     if not results:
         return {"synthesis": "", "source_ids": [], "count": 0}
 
     top = results[:REFLECT_TOP_N]
-    memory_block = "\n".join(
-        f"[mem:{m['id'][:8]}] {m.get('content', '')}" for m in top
-    )
+    blocks: list[str] = []
+    for memory in top:
+        line = f"[mem:{memory['id'][:8]}] {memory.get('content', '')}"
+        if memory.get("claim_status") in {"unresolved", "contradicted"}:
+            line += f" [status={memory['claim_status']}]"
+        group = memory.get("claim_group") or []
+        alternatives = [
+            str(row.get("content") or "")
+            for row in group[1:]
+            if row.get("content")
+        ]
+        if alternatives:
+            line += " [competing evidence: " + " | ".join(alternatives[:2]) + "]"
+        blocks.append(line)
+    memory_block = "\n".join(blocks)
     user_content = f"Question: {question}\n\nMemories:\n{memory_block}"
 
     synthesis = _call_llm(config, user_content)

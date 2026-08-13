@@ -99,6 +99,49 @@ REFLECT_MAX_TOKENS = 512
 
 CONFIG_FILENAME = "remnant.json"
 
+CONFIG_PRESETS: dict[str, dict[str, Any]] = {
+    "claim_aware": {
+        "structured_claim_extraction_v2": True,
+        "claim_reconciliation_enabled": True,
+        "claim_aware_ranking_enabled": True,
+        "resolved_context_enabled": True,
+        "recent_turn_overlay_enabled": True,
+        "relation_evidence_enabled": True,
+        "ranking_profile": "claims-v1",
+        "runtime_identity_enabled": False,
+    },
+    "legacy": {
+        "structured_claim_extraction_v2": False,
+        "claim_reconciliation_enabled": False,
+        "claim_aware_ranking_enabled": False,
+        "resolved_context_enabled": False,
+        "recent_turn_overlay_enabled": False,
+        "relation_evidence_enabled": False,
+        "ranking_profile": "legacy",
+        "runtime_identity_enabled": False,
+    },
+    "claim_aware_shadow": {
+        "structured_claim_extraction_v2": True,
+        "claim_reconciliation_enabled": True,
+        "claim_aware_ranking_enabled": False,
+        "resolved_context_enabled": False,
+        "recent_turn_overlay_enabled": True,
+        "relation_evidence_enabled": True,
+        "ranking_profile": "claims-v1",
+        "runtime_identity_enabled": False,
+    },
+}
+
+
+def apply_config_preset(values: dict[str, Any] | None, name: str) -> dict[str, Any]:
+    """Apply a named behavior profile while preserving unrelated settings."""
+    preset = CONFIG_PRESETS.get(str(name or "").strip().casefold())
+    if preset is None:
+        raise ValueError(f"unknown Remnant config preset: {name}")
+    merged = dict(values or {})
+    merged.update(preset)
+    return merged
+
 
 @dataclass
 class RemnantConfig:
@@ -168,17 +211,20 @@ class RemnantConfig:
     # Issue #21/#22: max entities linked/related per memory. Caps the entity
     # graph to avoid complete-graph relation explosions and over-extraction.
     entity_max_entities: int = 15
-    # Release-track memory correctness features.  They are independently
-    # switchable so an upgraded installation can shadow and roll back each
-    # behavior without changing the underlying evidence rows.
-    structured_claim_extraction_v2: bool = False
-    claim_reconciliation_enabled: bool = False
-    claim_aware_ranking_enabled: bool = False
-    resolved_context_enabled: bool = False
-    recent_turn_overlay_enabled: bool = False
-    relation_evidence_enabled: bool = False
+    # Claim-aware memory is the recommended operating profile.  Every switch
+    # remains independently overridable so an installation can shadow or roll
+    # back a behavior without discarding its underlying evidence rows.
+    structured_claim_extraction_v2: bool = True
+    claim_reconciliation_enabled: bool = True
+    claim_aware_ranking_enabled: bool = True
+    resolved_context_enabled: bool = True
+    recent_turn_overlay_enabled: bool = True
+    relation_evidence_enabled: bool = True
+    # Keep runtime identity opt-in until Hermes supplies a stable user/platform
+    # identity.  With no stable identity the fail-closed fallback is session
+    # scoped, which would otherwise prevent useful cross-session recall.
     runtime_identity_enabled: bool = False
-    ranking_profile: str = "legacy"
+    ranking_profile: str = "claims-v1"
     recent_turn_overlay_limit: int = 3
     recent_turn_overlay_max_age_s: int = 900
     recent_turn_overlay_max_chars: int = 4000

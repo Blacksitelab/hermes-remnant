@@ -20,7 +20,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from .config import RemnantConfig
+from .config import (
+    CONFIG_PRESETS,
+    RemnantConfig,
+    apply_config_preset,
+    load_config,
+    save_config,
+)
 from .db import SCHEMA_VERSION, RemnantDB, default_db_path, open_db
 from .identity import effective_identity
 from .lifecycle import backfill_relation_evidence
@@ -188,6 +194,7 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         unresolved_age_s = 0.0
     availability = availability_report(db_path=Path(db.path))
     total_prefetch = sum(prefetch.values())
+    scan_limit = RemnantConfig().semantic_scan_limit
     return {
         "availability": availability,
         "schema_version": SCHEMA_VERSION,
@@ -196,6 +203,16 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         "memory_rows": memory_rows,
         "fts_rows": fts_rows,
         "embedding_coverage": round(embeddings / memory_rows, 4) if memory_rows else 1.0,
+        "semantic_scan": {
+            "configured_limit": scan_limit,
+            "embedding_rows": embeddings,
+            "utilization": round(
+                min(1.0, embeddings / scan_limit), 4
+            )
+            if scan_limit
+            else 0.0,
+            "ann_recommended": embeddings > scan_limit,
+        },
         "embeddings": embeddings,
         "embeddings_by_model_dimension": embeddings_by_model,
         "claims": claim_rows,
@@ -333,6 +350,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     evidence.add_argument("--limit", type=int, default=1000)
     evidence.add_argument("--yes", action="store_true")
+    profile = subparsers.add_parser(
+        "config-profile", help="Preview or apply a named Remnant behavior profile."
+    )
+    profile.add_argument("--home", type=Path, required=True, help="Hermes profile directory.")
+    profile.add_argument("--name", choices=sorted(CONFIG_PRESETS), required=True)
+    profile.add_argument("--yes", action="store_true", help="Apply the profile.")
     args = parser.parse_args(argv)
     if args.command == "identity":
         report = effective_identity(
@@ -350,6 +373,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(
             json.dumps(
                 restore_database(args.backup, args.output), indent=2, sort_keys=True
+            )
+        )
+        return 0
+    if args.command == "config-profile":
+        current = load_config(args.home).to_dict()
+        updated = apply_config_preset(current, args.name)
+        changes = {
+            key: {"before": current.get(key), "after": updated.get(key)}
+            for key in CONFIG_PRESETS[args.name]
+            if current.get(key) != updated.get(key)
+        }
+        if args.yes:
+            save_config(updated, args.home)
+        print(
+            json.dumps(
+                {"profile": args.name, "home": str(args.home), "dry_run": not args.yes,
+                 "changes": changes},
+                indent=2,
+                sort_keys=True,
             )
         )
         return 0

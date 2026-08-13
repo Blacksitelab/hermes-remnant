@@ -185,6 +185,8 @@ def search(
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
+        for result in results:
+            result["_score_lane"] = "graph"
         results = results[:limit]
         return results
 
@@ -200,6 +202,8 @@ def search(
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
+        for result in results:
+            result["_score_lane"] = "keyword"
         results = results[:limit]
         return results
 
@@ -215,6 +219,8 @@ def search(
         ranked = _profile_scope_filter(ranked, scope)
         ranked = _scope_filter(ranked, visibility)
         ranked = _mask_locked(ranked, viewer_agent=viewer)
+        for result in ranked:
+            result["_score_lane"] = "semantic"
         ranked = ranked[:limit]
         return ranked
 
@@ -236,6 +242,8 @@ def search(
         results = _profile_scope_filter(results, scope)
         results = _scope_filter(results, visibility)
         results = _mask_locked(results, viewer_agent=viewer)
+        for result in results:
+            result["_score_lane"] = "keyword"
         results = results[:limit]
         return results
     fused = _rrf_fuse(kw, sem)
@@ -244,6 +252,8 @@ def search(
     fused = _profile_scope_filter(fused, scope)
     fused = _scope_filter(fused, visibility)
     fused = _mask_locked(fused, viewer_agent=viewer)
+    for result in fused:
+        result["_score_lane"] = "hybrid"
     fused = fused[:limit]
     return fused
 

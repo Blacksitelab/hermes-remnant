@@ -20,12 +20,24 @@ _HISTORY_RE = re.compile(
     re.I,
 )
 _DATE_RE = re.compile(r"\b(20\d{2}-[01]\d-[0-3]\d)\b")
+_RETRIEVAL_STOPWORDS = {
+    "a", "an", "and", "are", "can", "did", "does", "do", "for", "from",
+    "how", "i", "in", "is", "it", "me", "my", "of", "on", "please", "the",
+    "according", "another", "based", "computer", "mention", "mentioned", "please",
+    "say", "says", "tell", "told", "their", "then", "they", "to", "was", "we",
+    "what", "when", "where", "which", "who", "why", "would", "you", "your",
+}
 
 
 def retrieval_query(query: str) -> str:
-    """Remove intent-only temporal words that weaken strict lexical search."""
+    """Remove question/intent words that weaken strict lexical FTS search."""
     value = _HISTORY_RE.sub(" ", query or "")
-    value = re.sub(r"\s+", " ", value).strip(" ?.,")
+    tokens = [
+        token.removesuffix("'s").removesuffix("’s")
+        for token in re.findall(r"[\w'-]+", value)
+        if token.casefold() not in _RETRIEVAL_STOPWORDS
+    ]
+    value = " ".join(tokens).strip(" ?.,")
     return value or str(query or "").strip()
 
 

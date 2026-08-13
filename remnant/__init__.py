@@ -42,7 +42,7 @@ from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 
 class _SessionEmbedder:
@@ -273,7 +273,10 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "key": "runtime_identity_enabled",
-        "description": "Scope memories by Hermes runtime agent identity/workspace",
+        "description": (
+            "Scope memories by stable Hermes runtime identity/workspace; enable only "
+            "when the gateway supplies a stable platform user identity"
+        ),
         "default": False,
         "type": "boolean",
         "required": False,
@@ -281,42 +284,48 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "structured_claim_extraction_v2",
         "description": "Preserve temporal and conditional claim metadata during extraction",
-        "default": False,
+        "default": True,
         "type": "boolean",
         "required": False,
     },
     {
         "key": "claim_reconciliation_enabled",
         "description": "Classify duplicates, updates, conditions, and unresolved conflicts",
-        "default": False,
+        "default": True,
         "type": "boolean",
         "required": False,
     },
     {
         "key": "claim_aware_ranking_enabled",
         "description": "Resolve claim evidence before selecting injected memories",
-        "default": False,
+        "default": True,
         "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "ranking_profile",
+        "description": "Versioned ranking profile used for claim-aware recall",
+        "default": "claims-v1",
         "required": False,
     },
     {
         "key": "resolved_context_enabled",
         "description": "Render provenance-aware, prompt-injection-resistant context",
-        "default": False,
+        "default": True,
         "type": "boolean",
         "required": False,
     },
     {
         "key": "recent_turn_overlay_enabled",
         "description": "Temporarily expose recent unprocessed turns for read-after-write recall",
-        "default": False,
+        "default": True,
         "type": "boolean",
         "required": False,
     },
     {
         "key": "relation_evidence_enabled",
         "description": "Traverse only relations backed by active memory evidence",
-        "default": False,
+        "default": True,
         "type": "boolean",
         "required": False,
     },
@@ -347,6 +356,10 @@ class RemnantMemoryProvider(MemoryProvider):
         self._effective_identity: EffectiveIdentity | None = None
         self._agent_context: str = "primary"
         self._memory_generation: int = 0
+        # Optional Hermes-provided tokenizer callable. Standalone deployments
+        # leave this unset and context compilation uses its conservative
+        # deterministic fallback.
+        self._token_counter: Any = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -370,6 +383,8 @@ class RemnantMemoryProvider(MemoryProvider):
         self._hermes_home = str(hermes_home)
         self._session_id = session_id or "default"
         self._config = load_config(self._hermes_home)
+        supplied_counter = kwargs.get("token_counter")
+        self._token_counter = supplied_counter if callable(supplied_counter) else None
         self._agent_context = str(kwargs.get("agent_context") or "primary")
         self._runtime_identity = {
             key: str(kwargs.get(key) or "").strip()

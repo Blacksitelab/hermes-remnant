@@ -29,8 +29,8 @@ from .embed import Embedder
 from .graph import graph_traverse
 from .import_sources import import_hindsight, import_memory_store
 from .ingest import store_memory
+from .recall import RecallRequest, RecallService
 from .reflect import memory_reflect
-from .search import search
 from .threads import (
     create_thread,
     list_threads,
@@ -383,12 +383,19 @@ def handle_tool_call(
             profile_scope = None
         if not query:
             return {"error": "query is required"}
-        results = search(
-            db, config, query, agent_id=aid, limit=limit,
-            strategy=strategy, embedder=embedder,
-            profile_scope=profile_scope,
+        response = RecallService(db, config).recall(
+            RecallRequest(
+                query=query,
+                agent_id=aid,
+                session_id=session_id,
+                strategy=strategy,
+                limit=limit,
+                profile_scope=profile_scope,
+                include_pending=bool(getattr(config, "recent_turn_overlay_enabled", False)),
+            ),
+            embedder=embedder,
         )
-        claims = db.get_claims_for_memories([str(r["id"]) for r in results])
+        results = response.results
         return {
             "results": [
                 {
@@ -400,20 +407,24 @@ def handle_tool_call(
                     "source_id": r.get("source_id"),
                     "locked": r.get("locked", False),
                     "score": round(r.get("score", 0.0), 4),
+                    "ranking": r.get("ranking"),
+                    "claim_status": r.get("claim_status"),
                     **({
                         "claim": {
-                            "subject": claims[r["id"]]["subject"],
-                            "predicate": claims[r["id"]]["predicate"],
-                            "object": claims[r["id"]]["object"],
-                            "status": claims[r["id"]]["status"],
-                            "valid_from": claims[r["id"]].get("valid_from"),
-                            "valid_to": claims[r["id"]].get("valid_to"),
+                            "subject": r["claim"]["subject"],
+                            "predicate": r["claim"]["predicate"],
+                            "object": r["claim"]["object"],
+                            "status": r["claim"]["status"],
+                            "valid_from": r["claim"].get("valid_from"),
+                            "valid_to": r["claim"].get("valid_to"),
                         }
-                    } if r["id"] in claims else {}),
+                    } if r.get("claim") else {}),
+                    **({"claim_group": r["claim_group"]} if r.get("claim_group") else {}),
                 }
                 for r in results
             ],
             "count": len(results),
+            "diagnostics": response.diagnostics,
         }
     if tool_name == "memory_store":
         fact = str(args.get("fact", "")).strip()
@@ -440,7 +451,7 @@ def handle_tool_call(
         question = str(args.get("question", "")).strip()
         if not question:
             return {"error": "question is required"}
-        return memory_reflect(question, db, config, embedder, aid)
+        return memory_reflect(question, db, config, embedder, aid, session_id)
     if tool_name == "memory_graph":
         entity = str(args.get("entity", "")).strip()
         depth = int(args.get("depth", 2))
@@ -452,6 +463,15 @@ def handle_tool_call(
             agent_id=aid,
             depth=depth,
             evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
+        )
+        graph_response = RecallService(db, config).recall(
+            RecallRequest(
+                query=entity,
+                agent_id=aid,
+                strategy="graph",
+                limit=100,
+            ),
+            candidates=res["memories"],
         )
         return {
             "entity": res["entity"],
@@ -469,10 +489,13 @@ def handle_tool_call(
                     "id": m["id"],
                     "content": m["content"],
                     "visibility": m["visibility"],
+                    "claim_status": m.get("claim_status"),
+                    "ranking": m.get("ranking"),
                 }
-                for m in res["memories"]
+                for m in graph_response.results
             ],
-            "count": len(res["memories"]),
+            "count": len(graph_response.results),
+            "diagnostics": graph_response.diagnostics,
         }
     if tool_name == "memory_edit":
         action = str(args.get("action", "")).strip()

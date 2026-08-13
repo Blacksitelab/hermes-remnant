@@ -9,6 +9,18 @@ from .db import RemnantDB
 
 RANKING_PROFILE = "claims-v1"
 
+_SOURCE_AUTHORITY = {
+    "manual": 1.0,
+    "conversation": 0.9,
+    "import": 0.8,
+    "vault": 0.85,
+    "hindsight": 0.7,
+    "dream": 0.55,
+    "cron": 0.6,
+    "sensor": 0.65,
+    "email": 0.7,
+}
+
 
 def _quality_rows(db: RemnantDB, ids: list[str]) -> dict[str, dict[str, Any]]:
     if not ids:
@@ -35,13 +47,32 @@ def rank_results(
     quality_rows = _quality_rows(
         db, [str(row["id"]) for row in results if row.get("id") and not row.get("pending")]
     )
-    raw_max = max((abs(float(row.get("score") or 0.0)) for row in results), default=1.0)
-    raw_max = raw_max or 1.0
+    # Search lanes have different score domains (BM25, cosine, graph and RRF).
+    # Normalize within each lane before combining evidence quality; one raw
+    # score must never be compared directly with another lane's score.
+    lane_values: dict[str, list[float]] = {}
+    for row in results:
+        lane = str(row.get("_score_lane") or "unknown")
+        value = float(row.get("score") or 0.0)
+        lane_values.setdefault(lane, []).append(value)
+
+    def _relevance(row: dict[str, Any]) -> tuple[float, float, str]:
+        lane = str(row.get("_score_lane") or "unknown")
+        native = float(row.get("score") or 0.0)
+        values = lane_values.get(lane) or [native]
+        low, high = min(values), max(values)
+        if high <= low:
+            normalized = 1.0 if native > 0 else 0.01
+        else:
+            normalized = (native - low) / (high - low)
+            normalized = 0.05 + 0.95 * max(0.0, min(1.0, normalized))
+        return normalized, native, lane
+
     seen_content: set[str] = set()
     ranked: list[dict[str, Any]] = []
     for row in results:
         item = dict(row)
-        relevance = max(0.01, abs(float(item.get("score") or 0.0)) / raw_max)
+        relevance, native_score, score_lane = _relevance(item)
         claim = item.get("claim") or {}
         lifecycle = str(item.get("claim_status") or claim.get("status") or "active")
         applicability = 1.0
@@ -64,7 +95,14 @@ def rank_results(
         confidence = float(claim.get("confidence") or evidence.get("confidence") or 0.5)
         verified = 1.0 if evidence.get("verified") else 0.0
         corroboration = min(1.0, max(0.0, float(evidence.get("seen_count") or 1) - 1) / 4)
-        signal = 0.40 * trust + 0.35 * confidence + 0.15 * verified + 0.10 * corroboration
+        source_authority = _SOURCE_AUTHORITY.get(str(evidence.get("source") or ""), 0.65)
+        signal = (
+            0.35 * trust
+            + 0.30 * confidence
+            + 0.15 * verified
+            + 0.10 * corroboration
+            + 0.10 * source_authority
+        )
         bounded_quality = 0.80 + 0.40 * min(1.0, max(0.0, signal))
 
         content_key = re.sub(r"\s+", " ", str(item.get("content") or "").casefold()).strip()
@@ -74,6 +112,8 @@ def rank_results(
         item["score"] = final
         item["ranking"] = {
             "profile": profile,
+            "score_lane": score_lane,
+            "native_score": native_score,
             "relevance": relevance,
             "applicability": applicability,
             "applicability_reasons": reasons or ["current-and-applicable"],
@@ -82,6 +122,7 @@ def rank_results(
                 "confidence": confidence,
                 "verified": verified,
                 "corroboration": corroboration,
+                "source_authority": source_authority,
                 "bounded": bounded_quality,
             },
             "diversity": diversity,
