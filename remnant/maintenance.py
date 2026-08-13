@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from collections import Counter
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
-from .db import RemnantDB, default_db_path, open_db
+from .db import SCHEMA_VERSION, RemnantDB, default_db_path, open_db
 
 
 def health_report(db: RemnantDB) -> dict[str, Any]:
@@ -30,16 +32,47 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         fts_rows = int(cur.fetchone()["count"])
         cur.execute("SELECT COUNT(*) AS count FROM memories")
         memory_rows = int(cur.fetchone()["count"])
+        cur.execute("SELECT COUNT(*) AS count FROM claims")
+        claim_rows = int(cur.fetchone()["count"])
+        cur.execute(
+            "SELECT resolution_status, COUNT(*) AS count FROM claims "
+            "GROUP BY resolution_status"
+        )
+        claims_by_resolution = {
+            str(row["resolution_status"] or "active"): int(row["count"])
+            for row in cur.fetchall()
+        }
+        cur.execute(
+            "SELECT MIN(created_at) AS oldest FROM turns "
+            "WHERE extraction_status IN ('pending','running','retry_wait')"
+        )
+        oldest_pending = cur.fetchone()["oldest"]
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM turns "
+            "WHERE extraction_status IN ('pending','running','retry_wait')"
+        )
+        pending_overlay_count = int(cur.fetchone()["count"])
+        pending_age_s = (
+            round(max(0.0, time.time() - float(oldest_pending)), 3)
+            if oldest_pending is not None
+            else 0.0
+        )
         cur.execute("PRAGMA integrity_check")
         integrity = str(cur.fetchone()[0])
     return {
+        "schema_version": SCHEMA_VERSION,
         "integrity": integrity,
         "memories_by_status": memories,
         "memory_rows": memory_rows,
         "fts_rows": fts_rows,
         "embedding_coverage": round(embeddings / memory_rows, 4) if memory_rows else 1.0,
         "embeddings": embeddings,
+        "claims": claim_rows,
+        "claim_coverage": round(claim_rows / memory_rows, 4) if memory_rows else 1.0,
+        "claims_by_resolution": claims_by_resolution,
         "extraction_queue": extraction,
+        "pending_overlay_count": pending_overlay_count,
+        "pending_extraction_age_s": pending_age_s,
         "prefetch_outcomes": prefetch,
     }
 
@@ -78,9 +111,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Inspect and maintain Remnant safely.")
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("health", help="Print database health as JSON.")
-    migrate = subparsers.add_parser("migrate-default-agent", help="Retag legacy default-owned memories.")
+    migrate = subparsers.add_parser(
+        "migrate-default-agent",
+        help="Retag legacy default-owned memories.",
+    )
     migrate.add_argument("--agent", required=True, help="Explicit owner to assign to legacy rows.")
-    migrate.add_argument("--dry-run", action="store_true", help="Preview only; this is the default.")
+    migrate.add_argument(
+        "--dry-run", action="store_true", help="Preview only; this is the default."
+    )
     migrate.add_argument("--yes", action="store_true", help="Apply the migration.")
     args = parser.parse_args(argv)
     db = open_db(default_db_path())

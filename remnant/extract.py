@@ -53,8 +53,8 @@ _EXTRACT_PROMPT = (
     "Rules:\n"
     "- Only extract stable, long-lived facts (preferences, identity, projects, "
     "relationships, owned things, recurring context).\n"
-    "- DO NOT extract transient state (current percentages, right-now status, "
-    '"is at", "currently", "today", timestamps).\n'
+    "- Discard pure telemetry (percentages, clock readings, short-lived status) "
+    "but preserve meaningful changes, dates, and conditions as metadata.\n"
     "- One fact per line, as a complete declarative sentence.\n"
     "- Also list the entities each fact is about, with a type drawn from: "
     "person, service, project, concept, place, tool.\n"
@@ -62,7 +62,10 @@ _EXTRACT_PROMPT = (
     "\n"
     "Return STRICT JSON only, no prose:\n"
     '{"facts": [{"entity": "<primary entity name>", "fact": "<one-sentence fact>", '
-    '"visibility": "private", "entities": [{"name": "<name>", "type": "<type>", '
+    '"visibility": "private", "confidence": 0.0, "conflict_type": null, '
+    '"observed_at": null, "event_at": null, "valid_from": null, "valid_to": null, '
+    '"scope_type": null, "scope_value": null, "conditions": [], '
+    '"modality": "asserted", "entities": [{"name": "<name>", "type": "<type>", '
     '"aliases": ["<alias>", ...]}]}]}\n'
     "\n"
     "Visibility must be one of: private, shared, fleet. Default to private.\n"
@@ -160,6 +163,33 @@ class ExtractionWorker:
         """Wake the worker loop to check for new jobs."""
         self._wake.set()
 
+    def wait_until_idle(
+        self,
+        timeout_s: float = 2.0,
+        *,
+        session_id: str | None = None,
+    ) -> bool:
+        """Wait briefly for persisted extraction work to drain.
+
+        This is intentionally bounded: lifecycle hooks must never hold up a
+        Hermes response indefinitely when the extractor or its endpoint is
+        unhealthy.
+        """
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while time.monotonic() < deadline:
+            try:
+                pending = self._db.pending_extraction_count(
+                    agent_id=self._config.agent_id,
+                    session_id=session_id,
+                )
+            except Exception:
+                return False
+            if pending <= 0:
+                return True
+            self.wake()
+            time.sleep(0.02)
+        return False
+
     def _loop(self) -> None:
         while not self._stop.is_set():
             self._wake.clear()
@@ -202,7 +232,8 @@ class ExtractionWorker:
             visibility = f.get("visibility", self._config.default_visibility)
             if not fact_text:
                 continue
-            if is_transient(fact_text):
+            structured = bool(getattr(self._config, "structured_claim_extraction_v2", False))
+            if is_transient(fact_text, allow_temporal=structured):
                 log.debug("rejected transient fact: %s", fact_text)
                 continue
             # Typed entities from the LLM parse (optional). When present these
@@ -224,6 +255,11 @@ class ExtractionWorker:
                 source_turn_id=int(job["turn_id"]),
                 entities=typed_entities,
                 source_text=fact_text,
+                metadata={
+                    "structured_claim_v2": structured,
+                    "extractor_version": "claims-v2" if structured else "legacy",
+                },
+                claim_data=f,
             )
         duration_ms = (time.perf_counter() - t0) * 1000.0
         log.info(
@@ -279,7 +315,7 @@ def _parse_facts(text: str) -> list[dict[str, Any]]:
     try:
         obj = json.loads(text)
         if isinstance(obj, dict) and "facts" in obj:
-            return obj["facts"]
+            return _normalise_facts(obj["facts"])
     except json.JSONDecodeError:
         pass
     # Fall back to the first {...} block
@@ -289,10 +325,33 @@ def _parse_facts(text: str) -> list[dict[str, Any]]:
         try:
             obj = json.loads(text[start : end + 1])
             if isinstance(obj, dict) and "facts" in obj:
-                return obj["facts"]
+                return _normalise_facts(obj["facts"])
         except json.JSONDecodeError:
             pass
     return []
+
+
+def _normalise_facts(value: Any) -> list[dict[str, Any]]:
+    """Keep the old extractor response compatible with the claims-v2 shape."""
+    if not isinstance(value, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        fact = str(item.get("fact") or "").strip()
+        if not fact:
+            continue
+        row = dict(item)
+        row["fact"] = fact
+        if not isinstance(row.get("conditions"), list):
+            row["conditions"] = []
+        try:
+            row["confidence"] = min(1.0, max(0.0, float(row.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            row["confidence"] = 0.5
+        out.append(row)
+    return out
 
 
 def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -354,4 +413,4 @@ def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]
 _MAX_TYPED_ENTITIES = 15
 
 
-__all__ = ["ExtractionWorker", "filter_typed_entities"]
+__all__ = ["ExtractionWorker", "filter_typed_entities", "_parse_facts"]

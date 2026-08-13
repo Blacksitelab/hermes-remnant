@@ -441,6 +441,35 @@ python -m remnant.maintenance migrate-default-agent --agent claire  # dry run
 python -m remnant.maintenance migrate-default-agent --agent claire --yes
 ```
 
+### Release-track claim resolution
+
+Remnant 0.2 adds an opt-in correctness track for installations that want
+temporal claims, conservative conflict handling, and provenance-aware prompt
+context. Enable these settings together in `remnant.json` during a canary:
+
+```json
+{
+  "structured_claim_extraction_v2": true,
+  "claim_reconciliation_enabled": true,
+  "claim_aware_ranking_enabled": true,
+  "resolved_context_enabled": true,
+  "recent_turn_overlay_enabled": true,
+  "runtime_identity_enabled": true
+}
+```
+
+The flags are independent so an operator can roll back one behavior without
+discarding stored evidence. Claim rows retain source-turn, validity, scope,
+modality, extractor-version, and conflict metadata. Retrieval resolves those
+rows before injection, while recent raw turns are labelled as unprocessed and
+remain private to the active agent/session. The Hermes lifecycle hooks also
+cover queued prefetch, built-in writes, context compression, delegation,
+session end, backup paths, and session switching.
+
+The release branch keeps legacy behavior as the default for existing databases;
+enable the release track only after running the evaluation and health gates in
+[`docs/remnant-leadership-implementation-plan.md`](docs/remnant-leadership-implementation-plan.md).
+
 ### Type check (optional)
 
 ```bash

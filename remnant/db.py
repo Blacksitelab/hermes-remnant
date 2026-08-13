@@ -23,7 +23,7 @@ from typing import Any
 
 from .scope import normalize_profile_scope
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -226,6 +226,15 @@ CREATE TABLE IF NOT EXISTS claims (
         CHECK(status IN ('active', 'superseded', 'contradicted')),
     valid_from TEXT,
     valid_to TEXT,
+    observed_at TEXT,
+    event_at TEXT,
+    scope_type TEXT,
+    scope_value TEXT,
+    modality TEXT DEFAULT 'asserted',
+    conflict_type TEXT,
+    resolution_status TEXT DEFAULT 'active',
+    extractor_version TEXT,
+    source_turn_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
@@ -454,6 +463,32 @@ class RemnantDB:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_queue_ready "
             "ON extraction_queue(status, next_attempt_at)"
+        )
+        # Phase 12: additive claim metadata.  Existing claim status values are
+        # intentionally retained for backwards-compatible CHECK constraints;
+        # richer lifecycle state lives in resolution_status/conflict_type.
+        cur.execute("PRAGMA table_info(claims)")
+        claim_cols = {row["name"] for row in cur.fetchall()}
+        claim_additions = {
+            "observed_at": "TEXT",
+            "event_at": "TEXT",
+            "scope_type": "TEXT",
+            "scope_value": "TEXT",
+            "modality": "TEXT DEFAULT 'asserted'",
+            "conflict_type": "TEXT",
+            "resolution_status": "TEXT DEFAULT 'active'",
+            "extractor_version": "TEXT",
+            "source_turn_id": "INTEGER",
+        }
+        for name, declaration in claim_additions.items():
+            if name not in claim_cols:
+                try:
+                    cur.execute(f"ALTER TABLE claims ADD COLUMN {name} {declaration}")
+                except sqlite3.OperationalError:
+                    pass
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_claims_resolution "
+            "ON claims(subject, predicate, resolution_status, valid_from, valid_to)"
         )
         # Phase 6 (migration): content_hash + seen_count on memories, and
         # widen the source CHECK to allow 'import' and 'hindsight'. CREATE
@@ -889,6 +924,17 @@ class RemnantDB:
         confidence: float = 0.5,
         qualifiers: dict[str, Any] | None = None,
         status: str = "active",
+        observed_at: str | None = None,
+        event_at: str | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        scope_type: str | None = None,
+        scope_value: str | None = None,
+        modality: str = "asserted",
+        conflict_type: str | None = None,
+        resolution_status: str | None = None,
+        extractor_version: str | None = None,
+        source_turn_id: int | None = None,
     ) -> str:
         """Create a versioned claim projection backed by ``memory_id``."""
         now = _now_iso()
@@ -896,11 +942,17 @@ class RemnantDB:
         with self.transaction() as cur:
             cur.execute(
                 "INSERT INTO claims(id, memory_id, subject, predicate, object, qualifiers, "
-                "confidence, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "confidence, status, valid_from, valid_to, observed_at, event_at, "
+                "scope_type, scope_value, modality, conflict_type, resolution_status, "
+                "extractor_version, source_turn_id, created_at, updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     claim_id, memory_id, subject, predicate, object,
                     json.dumps(qualifiers, default=str) if qualifiers else None,
-                    confidence, status, now, now,
+                    confidence, status, valid_from, valid_to, observed_at or now,
+                    event_at, scope_type, scope_value, modality, conflict_type,
+                    resolution_status or status, extractor_version, source_turn_id,
+                    now, now,
                 ),
             )
         return claim_id
@@ -2273,6 +2325,60 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(sql, params)
             return [dict(r) for r in cur.fetchall()]
+
+    def get_pending_turns(
+        self,
+        *,
+        agent_id: str | None = None,
+        session_id: str | None = None,
+        max_age_s: float = 900.0,
+        limit: int = 3,
+    ) -> list[dict[str, Any]]:
+        """Return recent turns whose extraction has not reached a terminal state.
+
+        This is the read-after-write overlay source.  It deliberately returns
+        only raw turns and never treats them as durable claims; callers must
+        label them as unprocessed and apply the normal authorization scope.
+        """
+        cutoff = time.time() - max(0.0, float(max_age_s))
+        sql = (
+            "SELECT id, session_id, agent_id, user_text, assistant_text, "
+            "created_at, extraction_status FROM turns "
+            "WHERE created_at >= ? AND extraction_status IN "
+            "('pending','running','retry_wait')"
+        )
+        params: list[Any] = [cutoff]
+        if agent_id is not None:
+            sql += " AND agent_id=?"
+            params.append(agent_id)
+        if session_id is not None:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        with self.read() as cur:
+            cur.execute(sql, params)
+            return [dict(row) for row in cur.fetchall()]
+
+    def pending_extraction_count(
+        self, *, agent_id: str | None = None, session_id: str | None = None
+    ) -> int:
+        """Return the number of non-terminal extraction turns."""
+        sql = (
+            "SELECT COUNT(*) AS n FROM turns "
+            "WHERE extraction_status IN ('pending','running','retry_wait')"
+        )
+        params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND agent_id=?"
+            params.append(agent_id)
+        if session_id is not None:
+            sql += " AND session_id=?"
+            params.append(session_id)
+        with self.read() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        return int(row["n"] if row else 0)
 
     def get_memories_for_agent_scope(
         self, *, agent_id: str | None = None, visibility: str | None = "shared",

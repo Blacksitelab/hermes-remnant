@@ -2,11 +2,15 @@
 
 Status: implementation handoff
 
+Release branch note: the first integrated implementation is tracked in
+`codex/remnant-release`; the feature flags remain opt-in until deployment
+evaluation gates are run against a representative Hermes corpus.
+
 Repository: `Blacksitelab/hermes-remnant` only
 
 Baseline: `85926f74dfac454cde6ac65385e359365059344f`
 
-Schema baseline: `SCHEMA_VERSION = 11`
+Schema baseline: `SCHEMA_VERSION = 12` (release branch implementation)
 
 Target: make Remnant the most correct, efficient, private, and operationally
 reliable memory provider for Hermes Agent.
