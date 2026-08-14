@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from remnant.config import RemnantConfig
 from remnant.context import compile_context_details
 from remnant.db import open_db
@@ -145,19 +147,6 @@ def test_echo_worker_persists_inferred_signal_with_retry_safe_job(tmp_path):
         assert memory_id
         draft = _draft(service, memory_id)
         receipt_id = service.activate_receipt(draft)
-        turn_id = ingest_turn(
-            db,
-            user_text="What is Sven's preference?",
-            assistant_text="Sven prefers dark mode.",
-            session_id="s1",
-            agent_id="agent",
-        )
-        service.close_receipt(
-            session_id="s1",
-            viewer_key="viewer",
-            query="What is Sven's preference?",
-            turn_id=turn_id,
-        )
         job_id = service.store.enqueue_job(
             receipt_id=receipt_id,
             job_type="single",
@@ -172,6 +161,22 @@ def test_echo_worker_persists_inferred_signal_with_retry_safe_job(tmp_path):
                 {"memory_id": memory_id, "signal_type": "counterfactual_support", "confidence": 1}
             ],
         )
+        # A sampled job must wait until the injected receipt is matched to a
+        # persisted turn; evaluating with an empty answer would be misleading.
+        assert worker.run_once() is False
+        turn_id = ingest_turn(
+            db,
+            user_text="What is Sven's preference?",
+            assistant_text="Sven prefers dark mode.",
+            session_id="s1",
+            agent_id="agent",
+        )
+        service.close_receipt(
+            session_id="s1",
+            viewer_key="viewer",
+            query="What is Sven's preference?",
+            turn_id=turn_id,
+        )
         assert worker.run_once() is True
         with db.read() as cur:
             cur.execute("SELECT status FROM echo_jobs WHERE id=?", (job_id,))
@@ -179,6 +184,28 @@ def test_echo_worker_persists_inferred_signal_with_retry_safe_job(tmp_path):
             cur.execute("SELECT COUNT(*) AS n FROM echo_signals WHERE memory_id=?", (memory_id,))
             assert cur.fetchone()["n"] == 1
         assert service.health()["echo_utility"] == 1
+    finally:
+        db.close()
+
+
+def test_expired_receipt_cancels_pending_evaluator_job(tmp_path):
+    db = open_db(tmp_path / "echo-expiry.db")
+    config = RemnantConfig(agent_id="agent", echo_initial_sample_rate=0.0)
+    service = EchoService(db, config)
+    try:
+        draft = _draft(service)
+        receipt_id = service.activate_receipt(draft)
+        job_id = service.store.enqueue_job(
+            receipt_id=receipt_id,
+            job_type="single",
+            target_ids=["m1"],
+            priority=1.0,
+            evaluator_version="echo-v1",
+        )
+        service.store.compact(now=time.time() + 301)
+        with db.read() as cur:
+            cur.execute("SELECT status FROM echo_jobs WHERE id=?", (job_id,))
+            assert cur.fetchone()["status"] == "skipped"
     finally:
         db.close()
 

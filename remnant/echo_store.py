@@ -123,7 +123,15 @@ class EchoRepository:
                 "WHERE status='open' AND created_at<?",
                 (cutoff,),
             )
-            return max(0, int(cur.rowcount))
+            expired = max(0, int(cur.rowcount))
+            cur.execute(
+                "UPDATE echo_jobs SET status='skipped', completed_at=?, "
+                "last_error='receipt expired before turn persisted' "
+                "WHERE status='pending' AND receipt_id IN "
+                "(SELECT id FROM echo_receipts WHERE status='expired')",
+                (time.time(),),
+            )
+            return expired
 
     def get_receipt(self, receipt_id: str) -> dict[str, Any] | None:
         with self.db.read() as cur:
@@ -232,9 +240,11 @@ class EchoRepository:
         now = time.time()
         with self.db.transaction() as cur:
             cur.execute(
-                """SELECT * FROM echo_jobs
-                   WHERE status='pending' AND next_attempt_at<=?
-                   ORDER BY priority DESC, id LIMIT 1""",
+                """SELECT echo_jobs.* FROM echo_jobs
+                   JOIN echo_receipts r ON r.id=echo_jobs.receipt_id
+                   WHERE echo_jobs.status='pending' AND echo_jobs.next_attempt_at<=?
+                     AND r.status='closed' AND r.turn_id IS NOT NULL
+                   ORDER BY echo_jobs.priority DESC, echo_jobs.id LIMIT 1""",
                 (now,),
             )
             row = cur.fetchone()
@@ -298,7 +308,11 @@ class EchoRepository:
                 (str(job.get("receipt_id") or ""),),
             )
             receipt = cur.fetchone()
-            if receipt is None:
+            if (
+                receipt is None
+                or receipt["status"] != "closed"
+                or receipt["turn_id"] is None
+            ):
                 return None
             placeholders = ",".join("?" for _ in target_ids)
             cur.execute(
@@ -585,6 +599,13 @@ class EchoRepository:
                 "UPDATE echo_receipts SET status='expired', outcome='unmatched' "
                 "WHERE status='open' AND created_at<?",
                 (now - 300.0,),
+            )
+            cur.execute(
+                "UPDATE echo_jobs SET status='skipped', completed_at=?, "
+                "last_error='receipt expired before turn persisted' "
+                "WHERE status='pending' AND receipt_id IN "
+                "(SELECT id FROM echo_receipts WHERE status='expired')",
+                (now,),
             )
             cur.execute(
                 "DELETE FROM echo_signals WHERE aggregated_at IS NOT NULL AND created_at<?",
