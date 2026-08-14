@@ -16,7 +16,7 @@ import time
 from typing import Any
 
 from .config import RemnantConfig
-from .context import compile_context, safe_memory_text
+from .context import compile_context, compile_context_details, safe_memory_text
 from .db import RemnantDB
 from .recall import RecallRequest, RecallService
 from .search import search as hybrid_search
@@ -434,6 +434,12 @@ def prefetch(
             token_budget=budget,
             output_mode="context",
             token_counter=getattr(provider, "_token_counter", None),
+            echo_service=getattr(provider, "_echo", None),
+            echo_viewer_key=(
+                provider._effective_identity.viewer_key
+                if getattr(provider, "_effective_identity", None) is not None
+                else agent_id
+            ),
         ),
         candidates=merged,
     )
@@ -457,7 +463,7 @@ def prefetch(
     injection_reason = None if semantic_ready else "semantic_timeout_keyword_fallback"
     _record("injected", injection_reason, t0, count=len(selected),
             tokens=_approx_tokens(context))
-    return {
+    result = {
         "context": context,
         "memories": [
             {"id": m.get("id"), "content": m.get("content", ""), "visibility": m.get("visibility")}
@@ -467,6 +473,30 @@ def prefetch(
         "hash": ctx_hash,
         "session_id": session_id,
     }
+    echo = getattr(provider, "_echo", None)
+    if echo is not None:
+        try:
+            compiled_context = response.compiled_context or compile_context_details(
+                selected,
+                token_budget=budget,
+                token_counter=getattr(provider, "_token_counter", None),
+            )
+            result["_echo_draft"] = echo.build_receipt_draft(
+                query=query,
+                session_id=session_id,
+                agent_id=agent_id,
+                viewer_key=(
+                    provider._effective_identity.viewer_key
+                    if getattr(provider, "_effective_identity", None) is not None
+                    else agent_id
+                ),
+                profile_scope=getattr(cfg, "profile_scope", None),
+                memory_generation=getattr(provider, "_memory_generation", 0),
+                context=compiled_context,
+            )
+        except Exception:
+            log.debug("Echo receipt draft failed", exc_info=True)
+    return result
 
 
 __all__ = [

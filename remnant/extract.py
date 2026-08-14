@@ -166,6 +166,16 @@ class ExtractionWorker:
         """Wake the worker loop to check for new jobs."""
         self._wake.set()
 
+    @property
+    def active_jobs(self) -> bool:
+        """Whether the extraction executor is currently draining work."""
+        if self._stop.is_set():
+            return False
+        try:
+            return self._db.pending_extraction_count(agent_id=self._config.agent_id) > 0
+        except Exception:
+            return False
+
     def wait_until_idle(
         self,
         timeout_s: float = 2.0,

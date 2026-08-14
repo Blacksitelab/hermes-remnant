@@ -32,6 +32,9 @@ from .config import (
 )
 from .db import RemnantDB, default_db_path, open_db
 from .dream import day_dream, night_dream
+from .echo import EchoService
+from .echo_evaluate import EchoEvaluator
+from .echo_worker import EchoWorker
 from .embed import Embedder
 from .extract import ExtractionWorker
 from .identity import EffectiveIdentity, effective_identity
@@ -329,6 +332,44 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
         "type": "boolean",
         "required": False,
     },
+    {
+        "key": "echo_enabled",
+        "description": "Enable local outcome-aware Echo receipts and utility learning",
+        "default": True,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "echo_shadow_mode",
+        "description": "Collect Echo evidence without changing visible ranking",
+        "default": True,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "echo_rank_influence",
+        "description": "Capped Echo ranking influence; use 0 for shadow-only behavior",
+        "default": 0.0,
+        "required": False,
+    },
+    {
+        "key": "echo_initial_sample_rate",
+        "description": "Background counterfactual sample rate for new utility records",
+        "default": 0.05,
+        "required": False,
+    },
+    {
+        "key": "echo_mature_sample_rate",
+        "description": "Background counterfactual sample rate for mature records",
+        "default": 0.005,
+        "required": False,
+    },
+    {
+        "key": "echo_max_evaluator_seconds_per_day",
+        "description": "Daily local evaluator time budget for Echo",
+        "default": 300,
+        "required": False,
+    },
 ]
 
 
@@ -340,6 +381,8 @@ class RemnantMemoryProvider(MemoryProvider):
         self._db: RemnantDB | None = None
         self._embedder: Embedder | None = None
         self._worker: ExtractionWorker | None = None
+        self._echo: EchoService | None = None
+        self._echo_worker: EchoWorker | None = None
         self._session_id: str = ""
         self._hermes_home: str = ""
         self._started: bool = False
@@ -405,6 +448,16 @@ class RemnantMemoryProvider(MemoryProvider):
         db_path = default_db_path()
         self._db = open_db(db_path)
         self._embedder = Embedder(self._db, self._config)
+        self._echo = EchoService(self._db, self._config)
+        self._echo.viewer_key = self._effective_identity.viewer_key
+        if self._config.echo_enabled:
+            self._echo_worker = EchoWorker(
+                self._echo,
+                self._config,
+                evaluator=EchoEvaluator(self._config),
+                model_busy=lambda: bool(self._worker and self._worker.active_jobs),
+            )
+            self._echo_worker.start()
         self._worker = ExtractionWorker(self._db, self._embedder, self._config)
         self._worker.start()
         self._prefetch_executor = ThreadPoolExecutor(
@@ -420,8 +473,12 @@ class RemnantMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         try:
+            if self._echo_worker is not None:
+                self._echo_worker.stop()
             if self._worker is not None:
                 self._worker.stop()
+            if self._echo is not None:
+                self._echo.compact()
         finally:
             # Phase 4: no background vault watcher process is started here.
             # Re-index is driven by an external cron/timer calling
@@ -468,6 +525,7 @@ class RemnantMemoryProvider(MemoryProvider):
             session_id=session_id,
             agent_id=agent_id,
             hermes_home=self._hermes_home,
+            echo=self._echo,
         )
         # Hermes puts tool results directly into message content; the Ollama
         # cloud proxy rejects dict content ("invalid message content type:
@@ -500,7 +558,7 @@ class RemnantMemoryProvider(MemoryProvider):
             return
         sid = session_id or self._session_id or "default"
         try:
-            ingest_turn(
+            turn_id = ingest_turn(
                 self._db,
                 user_text=user_content or "",
                 assistant_text=assistant_content or "",
@@ -510,6 +568,17 @@ class RemnantMemoryProvider(MemoryProvider):
         except Exception as e:
             log.warning("sync_turn failed: %s", e)
             return
+        if self._echo is not None:
+            self._echo.close_receipt(
+                session_id=sid,
+                viewer_key=(
+                    self._effective_identity.viewer_key
+                    if self._effective_identity is not None
+                    else self._config.agent_id
+                ),
+                query=user_content or "",
+                turn_id=turn_id,
+            )
         self._invalidate_prefetch()
         # Wake the background worker so it picks up the new job promptly.
         if self._worker is not None:
@@ -641,9 +710,17 @@ class RemnantMemoryProvider(MemoryProvider):
         key = self._prefetch_key(query, sid)
         queued = self._take_queued_prefetch(key)
         if queued is not None:
-            return str(queued.get("context") or "")
+            return self._consume_prefetch_result(queued)
         result = _run_prefetch(self, query, sid, messages=messages)
-        return str(result.get("context") or "")
+        return self._consume_prefetch_result(result)
+
+    def _consume_prefetch_result(self, result: dict[str, Any]) -> str:
+        """Activate Echo only when context is actually returned to Hermes."""
+        context = str(result.get("context") or "")
+        draft = result.get("_echo_draft")
+        if context and draft is not None and self._echo is not None:
+            self._echo.activate_receipt(draft)
+        return context
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Compute the next-turn recall off the response critical path."""

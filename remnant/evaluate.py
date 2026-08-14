@@ -30,6 +30,7 @@ def evaluate_cases(
     details: list[dict[str, Any]] = []
     reciprocal_ranks: list[float] = []
     recalls: list[float] = []
+    context_recalls: list[float] = []
     latencies: list[float] = []
     for raw in cases:
         query = str(raw.get("query") or "").strip()
@@ -48,11 +49,28 @@ def evaluate_cases(
             embedder=embedder,
         )
         rows = response.results
+        context_response = RecallService(db, config).recall(
+            RecallRequest(
+                query=query,
+                agent_id=raw.get("agent_id") or config.agent_id,
+                strategy=str(raw.get("strategy") or config.default_search_strategy),
+                limit=limit,
+                token_budget=(
+                    int(raw["context_token_budget"])
+                    if raw.get("context_token_budget") is not None
+                    else config.injection_token_budget
+                ),
+                output_mode="context",
+            ),
+            embedder=embedder,
+        )
+        context_returned = set(context_response.rendered_ids)
         elapsed_ms = (time.perf_counter() - started) * 1000.0
         returned = [str(row["id"]) for row in rows]
         matched = expected.intersection(returned)
         rank = next((i + 1 for i, mid in enumerate(returned) if mid in expected), None)
         recalls.append(len(matched) / len(expected))
+        context_recalls.append(len(expected.intersection(context_returned)) / len(expected))
         reciprocal_ranks.append(1.0 / rank if rank else 0.0)
         latencies.append(elapsed_ms)
         details.append(
@@ -62,6 +80,8 @@ def evaluate_cases(
                 "returned_ids": returned,
                 "matched_ids": sorted(matched),
                 "first_relevant_rank": rank,
+                "context_returned_ids": sorted(context_returned),
+                "context_recall_at_k": round(context_recalls[-1], 4),
                 "latency_ms": round(elapsed_ms, 3),
             }
         )
@@ -71,6 +91,7 @@ def evaluate_cases(
     return {
         "cases": count,
         "recall_at_k": round(sum(recalls) / count, 4) if count else 0.0,
+        "context_recall_at_k": round(sum(context_recalls) / count, 4) if count else 0.0,
         "mrr": round(sum(reciprocal_ranks) / count, 4) if count else 0.0,
         "latency_ms": {
             "mean": round(sum(latencies) / count, 3) if count else 0.0,

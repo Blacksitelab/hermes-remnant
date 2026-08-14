@@ -38,3 +38,11 @@ or rebuilding indexes.
 - prefetch p50/p95 latency, deadline misses, and injection rate;
 - embedding coverage, extraction-queue age, DB integrity, and FTS parity;
 - explicit useful/wrong feedback, correction rate, and contradiction rate.
+
+## Outcome-aware memory utility
+
+The next measurement-gated research track is Remnant Echo: a bounded shadow
+system for learning whether recalled evidence actually helps or harms Hermes on
+a class of task. Its schema, lifecycle integration, resource limits, tests,
+rollout gates, and ordered pull-request work packages are specified in
+[`remnant-echo-implementation-plan.md`](remnant-echo-implementation-plan.md).

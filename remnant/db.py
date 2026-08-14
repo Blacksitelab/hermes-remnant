@@ -23,7 +23,7 @@ from typing import Any
 
 from .scope import normalize_profile_scope
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents so cross-agent features (shared vault search, dream-loop dedup,
@@ -317,6 +317,152 @@ CREATE TABLE IF NOT EXISTS prefetch_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_prefetch_outcome ON prefetch_stats(outcome);
 CREATE INDEX IF NOT EXISTS idx_prefetch_created ON prefetch_stats(created_at);
+
+-- Echo: consumed-context receipts and bounded outcome-aware utility.
+CREATE TABLE IF NOT EXISTS echo_receipts (
+    id TEXT PRIMARY KEY,
+    activation_key TEXT NOT NULL UNIQUE,
+    session_id TEXT NOT NULL,
+    turn_id INTEGER,
+    agent_id TEXT NOT NULL,
+    viewer_key_hash TEXT NOT NULL,
+    profile_scope_hash TEXT NOT NULL,
+    query_fingerprint TEXT NOT NULL,
+    query_archetype TEXT NOT NULL,
+    context_hash TEXT NOT NULL,
+    memory_generation INTEGER NOT NULL,
+    rendered_count INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    policy_version TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('open','closed','expired')),
+    outcome TEXT,
+    created_at REAL NOT NULL,
+    closed_at REAL,
+    FOREIGN KEY(turn_id) REFERENCES turns(id)
+);
+CREATE INDEX IF NOT EXISTS idx_echo_receipt_match
+    ON echo_receipts(session_id, query_fingerprint, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_echo_receipt_created ON echo_receipts(created_at);
+CREATE INDEX IF NOT EXISTS idx_echo_receipt_turn ON echo_receipts(turn_id);
+
+CREATE TABLE IF NOT EXISTS echo_receipt_items (
+    receipt_id TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    item_kind TEXT NOT NULL CHECK(item_kind IN ('memory','pending')),
+    source_turn_id INTEGER,
+    evidence_class TEXT NOT NULL,
+    score_lane TEXT,
+    base_score REAL NOT NULL,
+    base_rank INTEGER NOT NULL,
+    rendered_tokens INTEGER NOT NULL,
+    rendered_hash TEXT NOT NULL,
+    claim_status TEXT,
+    PRIMARY KEY(receipt_id, memory_id),
+    FOREIGN KEY(receipt_id) REFERENCES echo_receipts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_echo_item_memory
+    ON echo_receipt_items(memory_id, receipt_id);
+
+CREATE TABLE IF NOT EXISTS echo_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id TEXT,
+    memory_id TEXT NOT NULL,
+    paired_memory_id TEXT,
+    agent_id TEXT NOT NULL,
+    viewer_key_hash TEXT NOT NULL,
+    query_archetype TEXT NOT NULL,
+    signal_type TEXT NOT NULL,
+    direction INTEGER NOT NULL CHECK(direction IN (-1, 1)),
+    weight REAL NOT NULL CHECK(weight > 0 AND weight <= 1),
+    source TEXT NOT NULL,
+    evaluator_version TEXT,
+    created_at REAL NOT NULL,
+    aggregated_at REAL,
+    FOREIGN KEY(receipt_id) REFERENCES echo_receipts(id) ON DELETE SET NULL
+);
+CREATE INDEX IF NOT EXISTS idx_echo_signal_pending
+    ON echo_signals(aggregated_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_echo_signal_memory
+    ON echo_signals(memory_id, query_archetype, created_at);
+
+CREATE TABLE IF NOT EXISTS echo_utility (
+    agent_id TEXT NOT NULL,
+    viewer_key_hash TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    query_archetype TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    explicit_positive_mass REAL NOT NULL DEFAULT 0,
+    explicit_negative_mass REAL NOT NULL DEFAULT 0,
+    inferred_positive_mass REAL NOT NULL DEFAULT 0,
+    inferred_negative_mass REAL NOT NULL DEFAULT 0,
+    explicit_positive INTEGER NOT NULL DEFAULT 0,
+    explicit_negative INTEGER NOT NULL DEFAULT 0,
+    evaluator_samples INTEGER NOT NULL DEFAULT 0,
+    effective_observations REAL NOT NULL DEFAULT 0,
+    utility_mean REAL NOT NULL DEFAULT 0.5,
+    harm_risk REAL NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0,
+    last_signal_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(agent_id, viewer_key_hash, memory_id, query_archetype, policy_version)
+);
+CREATE INDEX IF NOT EXISTS idx_echo_utility_lookup
+    ON echo_utility(agent_id, viewer_key_hash, query_archetype, memory_id);
+CREATE INDEX IF NOT EXISTS idx_echo_utility_updated ON echo_utility(updated_at);
+
+CREATE TABLE IF NOT EXISTS echo_pair_utility (
+    agent_id TEXT NOT NULL,
+    viewer_key_hash TEXT NOT NULL,
+    first_memory_id TEXT NOT NULL,
+    second_memory_id TEXT NOT NULL,
+    query_archetype TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    positive_mass REAL NOT NULL DEFAULT 0,
+    negative_mass REAL NOT NULL DEFAULT 0,
+    sample_count INTEGER NOT NULL DEFAULT 0,
+    synergy_score REAL NOT NULL DEFAULT 0,
+    confidence REAL NOT NULL DEFAULT 0,
+    last_signal_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY(agent_id, viewer_key_hash, first_memory_id, second_memory_id,
+                query_archetype, policy_version),
+    CHECK(first_memory_id < second_memory_id)
+);
+CREATE INDEX IF NOT EXISTS idx_echo_pair_first
+    ON echo_pair_utility(agent_id, viewer_key_hash, first_memory_id, query_archetype);
+CREATE INDEX IF NOT EXISTS idx_echo_pair_second
+    ON echo_pair_utility(agent_id, viewer_key_hash, second_memory_id, query_archetype);
+
+CREATE TABLE IF NOT EXISTS echo_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    receipt_id TEXT NOT NULL,
+    job_type TEXT NOT NULL CHECK(job_type IN ('single','pair')),
+    target_ids TEXT NOT NULL,
+    priority REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','running','done','failed','skipped')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at REAL NOT NULL DEFAULT 0,
+    started_at REAL,
+    last_error TEXT,
+    evaluator_version TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    completed_at REAL,
+    FOREIGN KEY(receipt_id) REFERENCES echo_receipts(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_echo_job_ready
+    ON echo_jobs(status, next_attempt_at, priority DESC, id);
+
+CREATE TABLE IF NOT EXISTS echo_daily_metrics (
+    day TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    metric TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0,
+    total REAL NOT NULL DEFAULT 0,
+    maximum REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY(day, agent_id, metric)
+);
 
 CREATE TABLE IF NOT EXISTS operation_metrics (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
