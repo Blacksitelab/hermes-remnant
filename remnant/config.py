@@ -93,6 +93,35 @@ SEMANTIC_SCAN_LIMIT = 5_000
 MIN_SEMANTIC_SCORE = 0.3
 # RRF constant for hybrid fusion.
 RRF_K = 60
+
+# Echo: outcome-aware, shadow-first memory utility. These defaults keep the
+# foreground path local and bounded; background evaluation is separately capped.
+ECHO_ENABLED = True
+ECHO_SHADOW_MODE = True
+ECHO_POLICY_VERSION = "echo-v1"
+ECHO_RANK_INFLUENCE = 0.0
+ECHO_RECEIPT_RETENTION_DAYS = 30
+ECHO_SIGNAL_RETENTION_DAYS = 30
+ECHO_INITIAL_SAMPLE_RATE = 0.05
+ECHO_MATURE_SAMPLE_RATE = 0.005
+ECHO_MATURE_OBSERVATIONS = 20
+ECHO_MAX_JOBS_PER_DAY = 20
+ECHO_MAX_EVALUATOR_SECONDS_PER_DAY = 300
+ECHO_WORKER_POLL_INTERVAL_S = 5
+ECHO_JOB_STALE_AFTER_S = 900
+ECHO_JOB_MAX_ATTEMPTS = 3
+ECHO_MIN_OBSERVATIONS = 10
+ECHO_MAX_RANK_ADJUSTMENT = 0.10
+ECHO_UTILITY_HALF_LIFE_DAYS = 90.0
+ECHO_EXPLICIT_FEEDBACK_HALF_LIFE_DAYS = 365.0
+ECHO_PAIR_ATTRIBUTION_ENABLED = True
+ECHO_MAX_PAIRS_PER_RECEIPT = 3
+ECHO_MAX_PAIRS_PER_MEMORY_ARCHETYPE = 20
+ECHO_PAIR_HALF_LIFE_DAYS = 60.0
+ECHO_HOT_PATH_BUDGET_MS = 3
+ECHO_DISABLE_ON_BUDGET_EXCEEDED = True
+ECHO_PAUSE_WHEN_MODEL_BUSY = True
+ECHO_ALLOW_REMOTE_EVALUATOR = False
 # Reflection input cap (top-N memories) and output cap.
 REFLECT_TOP_N = 20
 REFLECT_MAX_TOKENS = 512
@@ -230,6 +259,33 @@ class RemnantConfig:
     recent_turn_overlay_max_chars: int = 4000
     prefetch_cache_ttl_s: int = 60
     prefetch_cache_max_entries: int = 32
+    # Echo outcome-aware utility; shadow mode is safe by default.
+    echo_enabled: bool = ECHO_ENABLED
+    echo_shadow_mode: bool = ECHO_SHADOW_MODE
+    echo_policy_version: str = ECHO_POLICY_VERSION
+    echo_rank_influence: float = ECHO_RANK_INFLUENCE
+    echo_receipt_retention_days: int = ECHO_RECEIPT_RETENTION_DAYS
+    echo_signal_retention_days: int = ECHO_SIGNAL_RETENTION_DAYS
+    echo_initial_sample_rate: float = ECHO_INITIAL_SAMPLE_RATE
+    echo_mature_sample_rate: float = ECHO_MATURE_SAMPLE_RATE
+    echo_mature_observations: int = ECHO_MATURE_OBSERVATIONS
+    echo_max_jobs_per_day: int = ECHO_MAX_JOBS_PER_DAY
+    echo_max_evaluator_seconds_per_day: int = ECHO_MAX_EVALUATOR_SECONDS_PER_DAY
+    echo_worker_poll_interval_s: int = ECHO_WORKER_POLL_INTERVAL_S
+    echo_job_stale_after_s: int = ECHO_JOB_STALE_AFTER_S
+    echo_job_max_attempts: int = ECHO_JOB_MAX_ATTEMPTS
+    echo_min_observations: int = ECHO_MIN_OBSERVATIONS
+    echo_max_rank_adjustment: float = ECHO_MAX_RANK_ADJUSTMENT
+    echo_utility_half_life_days: float = ECHO_UTILITY_HALF_LIFE_DAYS
+    echo_explicit_feedback_half_life_days: float = ECHO_EXPLICIT_FEEDBACK_HALF_LIFE_DAYS
+    echo_pair_attribution_enabled: bool = ECHO_PAIR_ATTRIBUTION_ENABLED
+    echo_max_pairs_per_receipt: int = ECHO_MAX_PAIRS_PER_RECEIPT
+    echo_max_pairs_per_memory_archetype: int = ECHO_MAX_PAIRS_PER_MEMORY_ARCHETYPE
+    echo_pair_half_life_days: float = ECHO_PAIR_HALF_LIFE_DAYS
+    echo_hot_path_budget_ms: int = ECHO_HOT_PATH_BUDGET_MS
+    echo_disable_on_budget_exceeded: bool = ECHO_DISABLE_ON_BUDGET_EXCEEDED
+    echo_pause_when_model_busy: bool = ECHO_PAUSE_WHEN_MODEL_BUSY
+    echo_allow_remote_evaluator: bool = ECHO_ALLOW_REMOTE_EVALUATOR
     runtime_user_aliases: dict[str, str] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -238,6 +294,61 @@ class RemnantConfig:
         d.pop("extra", None)
         d.update(self.extra)
         return d
+
+    def validate(self) -> RemnantConfig:
+        """Normalize and validate Echo controls at one configuration boundary."""
+        self.echo_rank_influence = float(self.echo_rank_influence)
+        self.echo_initial_sample_rate = float(self.echo_initial_sample_rate)
+        self.echo_mature_sample_rate = float(self.echo_mature_sample_rate)
+        self.echo_max_rank_adjustment = float(self.echo_max_rank_adjustment)
+        self.echo_utility_half_life_days = float(self.echo_utility_half_life_days)
+        self.echo_explicit_feedback_half_life_days = float(
+            self.echo_explicit_feedback_half_life_days
+        )
+        self.echo_pair_half_life_days = float(self.echo_pair_half_life_days)
+        for name in (
+            "echo_receipt_retention_days",
+            "echo_signal_retention_days",
+            "echo_mature_observations",
+            "echo_max_jobs_per_day",
+            "echo_max_evaluator_seconds_per_day",
+            "echo_worker_poll_interval_s",
+            "echo_job_stale_after_s",
+            "echo_job_max_attempts",
+            "echo_min_observations",
+            "echo_max_pairs_per_receipt",
+            "echo_max_pairs_per_memory_archetype",
+            "echo_hot_path_budget_ms",
+        ):
+            value = int(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        for name in (
+            "echo_rank_influence",
+            "echo_initial_sample_rate",
+            "echo_mature_sample_rate",
+            "echo_max_rank_adjustment",
+        ):
+            value = float(getattr(self, name))
+            upper = 1.0 if name != "echo_max_rank_adjustment" else 0.25
+            if not 0.0 <= value <= upper:
+                raise ValueError(f"{name} must be between 0 and {upper}")
+            setattr(self, name, value)
+        for name in (
+            "echo_utility_half_life_days",
+            "echo_explicit_feedback_half_life_days",
+            "echo_pair_half_life_days",
+        ):
+            value = float(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        if self.echo_max_pairs_per_receipt > 5:
+            raise ValueError("echo_max_pairs_per_receipt must be <= 5")
+        if not str(self.echo_policy_version).strip():
+            raise ValueError("echo_policy_version must not be empty")
+        return self
 
     @classmethod
     def from_dict(cls, d: dict[str, Any] | None) -> RemnantConfig:
@@ -251,7 +362,7 @@ class RemnantConfig:
             else:
                 extra[k] = v
         kwargs["extra"] = extra
-        return cls(**{k: v for k, v in kwargs.items() if v is not None})
+        return cls(**{k: v for k, v in kwargs.items() if v is not None}).validate()
 
 
 def config_path(hermes_home: str | Path) -> Path:

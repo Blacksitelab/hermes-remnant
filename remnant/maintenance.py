@@ -175,6 +175,20 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         relations = int(cur.fetchone()["count"])
         cur.execute("SELECT COUNT(*) AS count FROM relation_evidence WHERE active=1")
         active_relation_evidence = int(cur.fetchone()["count"])
+        cur.execute("SELECT status, COUNT(*) AS count FROM echo_receipts GROUP BY status")
+        echo_receipts = {
+            str(row["status"]): int(row["count"]) for row in cur.fetchall()
+        }
+        cur.execute("SELECT status, COUNT(*) AS count FROM echo_jobs GROUP BY status")
+        echo_jobs = {str(row["status"]): int(row["count"]) for row in cur.fetchall()}
+        cur.execute(
+            "SELECT COUNT(*) AS count FROM echo_signals WHERE aggregated_at IS NULL"
+        )
+        echo_pending_signals = int(cur.fetchone()["count"])
+        cur.execute("SELECT COUNT(*) AS count FROM echo_utility")
+        echo_utility = int(cur.fetchone()["count"])
+        cur.execute("SELECT COUNT(*) AS count FROM echo_pair_utility")
+        echo_pair_utility = int(cur.fetchone()["count"])
         cur.execute("SELECT MAX(indexed_at) AS last_scan FROM vault_files")
         last_vault_scan = cur.fetchone()["last_scan"]
         cur.execute(
@@ -240,6 +254,13 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         "entities": entities,
         "relations": relations,
         "active_relation_evidence": active_relation_evidence,
+        "echo": {
+            "receipts_by_status": echo_receipts,
+            "jobs_by_status": echo_jobs,
+            "pending_signals": echo_pending_signals,
+            "utility_rows": echo_utility,
+            "pair_utility_rows": echo_pair_utility,
+        },
         "last_vault_scan": last_vault_scan,
         "last_dream_runs": dream_runs,
     }

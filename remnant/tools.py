@@ -359,6 +359,7 @@ def handle_tool_call(
     session_id: str,
     agent_id: str | None = None,
     hermes_home: str | None = None,
+    echo: Any | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call. Returns a tool-result dict for the agent."""
     aid = agent_id or config.agent_id
@@ -392,6 +393,8 @@ def handle_tool_call(
                 limit=limit,
                 profile_scope=profile_scope,
                 include_pending=bool(getattr(config, "recent_turn_overlay_enabled", False)),
+                echo_service=echo,
+                echo_viewer_key=(getattr(echo, "viewer_key", None) if echo else aid),
             ),
             embedder=embedder,
         )
@@ -501,7 +504,7 @@ def handle_tool_call(
         action = str(args.get("action", "")).strip()
         if not action:
             return {"error": "action is required"}
-        return memory_edit(
+        result = memory_edit(
             db,
             config,
             embedder,
@@ -515,6 +518,19 @@ def handle_tool_call(
             agent_id=aid,
             session_id=session_id,
         )
+        if echo is not None and action == "feedback" and args.get("memory_id"):
+            try:
+                echo.record_feedback(
+                    memory_id=str(args["memory_id"]),
+                    feedback=str(args.get("feedback") or ""),
+                    agent_id=aid,
+                    viewer_key=getattr(echo, "viewer_key", aid),
+                    query=str(args.get("query") or "") or None,
+                )
+                echo.aggregate(limit=20)
+            except Exception:
+                pass
+        return result
     if tool_name == "memory_import":
         source = str(args.get("source", "")).strip().lower()
         if source not in ("vault", "hindsight", "memory_store"):

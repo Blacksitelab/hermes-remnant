@@ -17,7 +17,12 @@ from datetime import datetime
 from typing import Any, Literal
 
 from .config import RemnantConfig
-from .context import compile_context, conservative_token_count, safe_memory_text
+from .context import (
+    CompiledContext,
+    compile_context_details,
+    conservative_token_count,
+    safe_memory_text,
+)
 from .db import RemnantDB
 from .embed import Embedder
 from .ranking import rank_results
@@ -47,6 +52,10 @@ class RecallRequest:
     # Hermes may supply its deployment tokenizer.  Offline callers leave this
     # unset and the conservative character fallback remains deterministic.
     token_counter: Callable[[str], int] | None = None
+    # Optional outcome-aware utility service. Keeping this injectable preserves
+    # the standalone evaluator/search callers and makes Echo failure-safe.
+    echo_service: Any | None = None
+    echo_viewer_key: str | None = None
 
 
 @dataclass
@@ -56,6 +65,14 @@ class RecallResponse:
     results: list[dict[str, Any]] = field(default_factory=list)
     context: str = ""
     diagnostics: dict[str, Any] = field(default_factory=dict)
+    compiled_context: CompiledContext | None = None
+
+    @property
+    def rendered_ids(self) -> tuple[str, ...]:
+        """IDs that actually crossed the context compiler boundary."""
+        if self.compiled_context is None:
+            return tuple(str(row.get("id")) for row in self.results if row.get("id"))
+        return tuple(item.memory_id for item in self.compiled_context.items)
 
 
 def _normalize(value: Any) -> str:
@@ -252,28 +269,67 @@ class RecallService:
             diagnostics["reason"] = "claim_resolution_failed"
             results = self._attach_claim_metadata(raw)
 
-        effective_budget = request.token_budget or self.config.injection_token_budget
+        if request.echo_service is not None:
+            try:
+                results, echo_diagnostics = request.echo_service.adjust_results(
+                    results,
+                    query=query,
+                    agent_id=request.agent_id,
+                    viewer_key=request.echo_viewer_key,
+                )
+                diagnostics["echo"] = {
+                    "archetype": echo_diagnostics.archetype,
+                    "policy_version": echo_diagnostics.policy_version,
+                    "influence": echo_diagnostics.influence,
+                    "changed_count": echo_diagnostics.changed_count,
+                    "utility_hits": echo_diagnostics.utility_hits,
+                    "budget_bypassed": echo_diagnostics.budget_bypassed,
+                    "details": echo_diagnostics.details,
+                }
+            except Exception:
+                diagnostics["echo"] = {"degraded": True}
+
+        effective_budget = (
+            request.token_budget
+            if request.token_budget is not None
+            else self.config.injection_token_budget
+        )
+        compiled_context: CompiledContext | None = None
         if request.output_mode == "context":
-            results = _budget_candidates(results[:limit], effective_budget)
+            results = results[:limit]
         else:
             results = results[:limit]
-        diagnostics["selected_count"] = len(results)
         context = ""
         if request.output_mode == "context":
             budget = effective_budget
             if getattr(self.config, "resolved_context_enabled", False):
-                context = compile_context(
+                compiled_context = compile_context_details(
                     results, token_budget=budget, token_counter=request.token_counter
                 )
+                context = compiled_context.text
+                rendered = {item.memory_id for item in compiled_context.items}
+                results = [row for row in results if str(row.get("id")) in rendered]
+                diagnostics["rendered_count"] = len(compiled_context.items)
+                diagnostics["omitted_count"] = len(compiled_context.omitted_ids)
+                diagnostics["per_class_tokens"] = dict(compiled_context.per_class_tokens)
+                diagnostics["token_estimate"] = compiled_context.token_count
             else:
+                results = _budget_candidates(results, budget)
                 context = _legacy_context(results, budget)
-            diagnostics["token_estimate"] = conservative_token_count(context)
+                diagnostics["token_estimate"] = conservative_token_count(context)
             if diagnostics["token_estimate"] > budget:
                 diagnostics["degraded"] = True
                 diagnostics["reason"] = "budget_overflow"
                 context = ""
+                compiled_context = None
+        diagnostics["selected_count"] = len(results)
         diagnostics["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
-        return RecallResponse(results=results, context=context, diagnostics=diagnostics)
+        return RecallResponse(
+            results=results,
+            context=context,
+            diagnostics=diagnostics,
+            compiled_context=compiled_context,
+        )
 
 
 __all__ = ["RecallRequest", "RecallResponse", "RecallService"]
