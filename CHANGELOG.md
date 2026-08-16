@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.2.2 - faster extraction
+
+### Changed
+
+- Bounded extraction input and model context to keep single-turn work within a
+  predictable background budget.
+- Disabled model reasoning by default for extraction and added native structured
+  JSON output controls for Ollama and its OpenAI-compatible endpoint.
+- Reduced generated claim fields and moved entity discovery to the existing
+  local GLiNER/regex pipeline while retaining legacy response compatibility.
+- Kept extracted-memory visibility provider-controlled and added defensive
+  invalid-response retry handling.
+
+### Verification
+
+- 403 automated tests pass locally.
+- Ruff, bytecode compilation, `git diff --check`, and package build pass.
+
 ## 0.2.1 - claim-aware recall
 
 ### Changed

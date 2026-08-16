@@ -56,4 +56,4 @@ jobs:
         run: >-
           python -m pip install --force-reinstall dist/*.whl &&
           cd "$(mktemp -d)" &&
-          python -c "import remnant; assert remnant.__version__ == '0.2.1'"
+          python -c "from importlib.metadata import version; import remnant; assert remnant.__version__ == version('hermes-remnant')"

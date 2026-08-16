@@ -336,6 +336,12 @@ extract_url: http://your-ollama-host.local:11434/v1/chat/completions
 extract_model: gemma4:12b
 extract_keep_alive: 2m
 extract_enabled: true
+extract_num_ctx: 8192
+extract_max_input_tokens: 5500
+extract_max_output_tokens: 1536
+extract_max_facts: 8
+extract_think: false
+extract_structured_output: true
 default_visibility: private
 vault_path: /path/to/your/obsidian-vault
 vault_exclude:

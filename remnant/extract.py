@@ -23,9 +23,16 @@ from typing import Any
 import httpx
 
 from .config import RemnantConfig
+from .context import conservative_token_count
 from .db import RemnantDB
 from .embed import Embedder
-from .entity import _COMMON_NOUNS, _FUNCTION_WORDS, _STOPLIST, _STOPWORDS
+from .entity import (
+    _COMMON_NOUNS,
+    _FUNCTION_WORDS,
+    _STOPLIST,
+    _STOPWORDS,
+    extract_high_signal_entities,
+)
 from .ingest import is_transient, store_memory
 from .llm import LLMResponseError, chat
 
@@ -47,6 +54,45 @@ _STOPWORDS_LOWER: set[str] = {
 # emits as "entities". Imported from ``entity`` (issue #22) so the typed-entity
 # filter and the regex fallback share the same deny-list.
 
+EXTRACTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "facts": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "fact": {"type": "string"},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "subject": {"type": "string"},
+                    "predicate": {"type": "string"},
+                    "object": {"type": "string"},
+                    "conflict_type": {"type": ["string", "null"]},
+                    "event_at": {"type": ["string", "null"]},
+                    "valid_from": {"type": ["string", "null"]},
+                    "valid_to": {"type": ["string", "null"]},
+                    "scope_type": {"type": ["string", "null"]},
+                    "scope_value": {"type": ["string", "null"]},
+                    "conditions": {"type": "array", "items": {"type": "string"}},
+                    "modality": {
+                        "type": "string",
+                        "enum": ["asserted", "inferred", "hypothetical", "negated"],
+                    },
+                    "durability": {
+                        "type": "string",
+                        "enum": ["durable", "temporary_but_relevant", "discard"],
+                    },
+                },
+                "required": ["fact", "confidence"],
+            },
+        }
+    },
+    "required": ["facts"],
+}
+
 _EXTRACT_PROMPT = (
     "You are a memory extraction engine. Read the conversation turn and "
     "extract durable facts worth remembering long-term.\n"
@@ -57,27 +103,14 @@ _EXTRACT_PROMPT = (
     "- Discard pure telemetry (percentages, clock readings, short-lived status) "
     "but preserve meaningful changes, dates, and conditions as metadata.\n"
     "- One fact per line, as a complete declarative sentence.\n"
-    "- Also list the entities each fact is about, with a type drawn from: "
-    "person, service, project, concept, place, tool.\n"
-    "- Include aliases (alternate names / spellings) for each entity.\n"
+    "- Include subject, predicate, and object when they are unambiguous.\n"
     "\n"
     "Return STRICT JSON only, no prose:\n"
-    '{"facts": [{"entity": "<primary entity name>", "fact": "<one-sentence fact>", '
-    '"visibility": "private", "confidence": 0.0, "conflict_type": null, '
-    '"observed_at": null, "event_at": null, "valid_from": null, "valid_to": null, '
-    '"scope_type": null, "scope_value": null, "conditions": [], '
-    '"modality": "asserted", "durability": "durable", '
-    '"subject": "<subject>", "predicate": "<predicate>", "object": "<object>", '
-    '"entities": [{"name": "<name>", "type": "<type>", '
-    '"aliases": ["<alias>", ...]}]}]}\n'
+    '{"facts": [{"fact": "<one-sentence fact>", "confidence": 0.0, '
+    '"subject": "<subject>", "predicate": "<predicate>", "object": "<object>"}]}\n'
     "\n"
-    "Visibility must be one of: private, shared, fleet. Default to private.\n"
-    "\n"
-    "Entity names must be proper nouns, specific system names, or named "
-    "concepts — NOT common English words. Do NOT extract function words "
-    "(articles, prepositions, conjunctions, pronouns, generic verbs), "
-    "stopwords, or short noise tokens. If you are unsure whether a word is a "
-    "real entity, omit it."
+    "Do not emit entities, aliases, visibility, timestamps, or null/default "
+    "fields unless they carry information."
 )
 
 _STOP_RE = re.compile(
@@ -242,7 +275,8 @@ class ExtractionWorker:
         for f in facts:
             fact_text = f.get("fact", "").strip()
             entity = str(f.get("subject") or f.get("entity") or "").strip() or "general"
-            visibility = f.get("visibility", self._config.default_visibility)
+            # Visibility is a provider policy, never a model-controlled field.
+            visibility = self._config.default_visibility
             if not fact_text:
                 continue
             structured = bool(getattr(self._config, "structured_claim_extraction_v2", False))
@@ -259,6 +293,14 @@ class ExtractionWorker:
             # drive entity-graph linking + relation seeding. We keep the
             # legacy single `entity` subject as the tag/metadata subject.
             typed_entities = f.get("entities") or []
+            if not typed_entities:
+                typed_entities = extract_high_signal_entities(
+                    fact_text,
+                    max_entities=getattr(self._config, "entity_max_entities", 15),
+                    use_gliner=True,
+                )
+            if entity == "general" and typed_entities:
+                entity = str(typed_entities[0].get("name") or "general").strip() or "general"
             if not typed_entities and entity and entity != "general":
                 typed_entities = [{"name": entity, "type": None, "aliases": []}]
             typed_entities = filter_typed_entities(typed_entities)
@@ -295,7 +337,11 @@ class ExtractionWorker:
     def _extract(self, user_text: str, assistant_text: str) -> list[dict[str, Any]]:
         if not self._config.extract_enabled:
             return []
-        content = f"USER: {user_text}\nASSISTANT: {assistant_text}"
+        content = prepare_extraction_input(
+            user_text,
+            assistant_text,
+            token_budget=getattr(self._config, "extract_max_input_tokens", 5_500),
+        )
         t0 = time.perf_counter()
         try:
             text = chat(
@@ -305,12 +351,20 @@ class ExtractionWorker:
                 user=content,
                 timeout=self._config.extract_timeout,
                 protocol=getattr(self._config, "llm_protocol", None),
-                temperature=0.1,
-                max_tokens=4096,
+                temperature=0.0,
+                max_tokens=getattr(self._config, "extract_max_output_tokens", 1_536),
                 client=self._client,
                 keep_alive=self._keep_alive,
+                num_ctx=getattr(self._config, "extract_num_ctx", 8_192),
+                think=getattr(self._config, "extract_think", False),
+                response_schema=(
+                    EXTRACTION_SCHEMA
+                    if getattr(self._config, "extract_structured_output", True)
+                    else None
+                ),
             )
             facts = _parse_facts(text)
+            facts = facts[: max(1, int(getattr(self._config, "extract_max_facts", 8)))]
             duration_ms = (time.perf_counter() - t0) * 1000.0
             log.debug(
                 "extraction LLM call succeeded duration_ms=%.1f facts=%s",
@@ -367,7 +421,45 @@ def _parse_facts(text: str) -> list[dict[str, Any]]:
                 return _normalise_facts(obj["facts"])
         except json.JSONDecodeError:
             pass
-    return []
+    raise LLMResponseError("extraction response did not contain a valid facts object")
+
+
+def prepare_extraction_input(
+    user_text: str,
+    assistant_text: str,
+    *,
+    token_budget: int,
+) -> str:
+    """Build a bounded extraction prompt while preserving both turn ends."""
+    user = str(user_text or "")
+    assistant = str(assistant_text or "")
+    prefix = "USER: "
+    suffix = "\nASSISTANT: "
+
+    def fit(text: str, budget: int) -> str:
+        if budget <= 0:
+            return ""
+        if conservative_token_count(text) <= budget:
+            return text
+        marker = "\n[…truncated…]\n"
+        if budget <= conservative_token_count(marker):
+            return text[: max(1, budget * 3)]
+        remaining = budget - conservative_token_count(marker)
+        head_budget = max(1, int(remaining * 0.6))
+        tail_budget = max(1, remaining - head_budget)
+        head_chars = max(1, head_budget * 3)
+        tail_chars = max(1, tail_budget * 3)
+        return text[:head_chars].rstrip() + marker + text[-tail_chars:].lstrip()
+
+    total = max(1, int(token_budget))
+    framing_tokens = conservative_token_count(prefix + suffix)
+    content_budget = max(1, total - framing_tokens)
+    # Give the user message priority because it is the authoritative source of
+    # preferences and identity; retain a bounded assistant tail for confirmed
+    # tool/results context.
+    user_budget = max(1, int(content_budget * 0.64))
+    assistant_budget = max(1, content_budget - user_budget)
+    return prefix + fit(user, user_budget) + suffix + fit(assistant, assistant_budget)
 
 
 def _normalise_facts(value: Any) -> list[dict[str, Any]]:
@@ -478,4 +570,10 @@ def filter_typed_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]
 _MAX_TYPED_ENTITIES = 15
 
 
-__all__ = ["ExtractionWorker", "filter_typed_entities", "_parse_facts"]
+__all__ = [
+    "EXTRACTION_SCHEMA",
+    "ExtractionWorker",
+    "filter_typed_entities",
+    "prepare_extraction_input",
+    "_parse_facts",
+]

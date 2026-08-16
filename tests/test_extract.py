@@ -10,9 +10,16 @@ from pathlib import Path
 import pytest
 
 from remnant.config import RemnantConfig
+from remnant.context import conservative_token_count
 from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder
-from remnant.extract import ExtractionWorker
+from remnant.extract import (
+    EXTRACTION_SCHEMA,
+    ExtractionWorker,
+    _parse_facts,
+    prepare_extraction_input,
+)
+from remnant.llm import LLMResponseError
 
 
 def _hash(text: str) -> str:
@@ -69,6 +76,32 @@ def _insert_turn(db, *, agent_id="default", session_id="s", user="u", assistant=
         user_text=user,
         assistant_text=assistant,
     )
+
+
+def test_prepare_extraction_input_is_bounded_and_preserves_turn_ends():
+    user = "USER-HEAD " + ("x " * 20_000) + " USER-TAIL"
+    assistant = "ASSISTANT-HEAD " + ("y " * 10_000) + " ASSISTANT-TAIL"
+    content = prepare_extraction_input(user, assistant, token_budget=5500)
+
+    assert conservative_token_count(content) <= 5500
+    assert "USER-HEAD" in content
+    assert "USER-TAIL" in content
+    assert "ASSISTANT-TAIL" in content
+    assert "[…truncated…]" in content
+
+
+def test_parse_facts_rejects_invalid_structured_output():
+    with pytest.raises(LLMResponseError):
+        _parse_facts("not json")
+
+
+def test_extraction_schema_is_compact_and_bounded():
+    facts = EXTRACTION_SCHEMA["properties"]["facts"]
+    item = facts["items"]
+    assert facts["maxItems"] == 8
+    assert "entities" not in item["properties"]
+    assert "visibility" not in item["properties"]
+    assert item["required"] == ["fact", "confidence"]
 
 
 # ===========================================================================
