@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import httpx
@@ -202,3 +203,63 @@ def test_llm_adapter_normalizes_native_and_openai_responses():
     finally:
         client.close()
     assert len(requests) == 2
+
+
+def test_llm_adapter_adds_extraction_controls_per_protocol():
+    payloads = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payloads.append((str(request.url), json.loads(request.read())))
+        if "/api/chat" in str(request.url):
+            return httpx.Response(200, json={"message": {"content": '{"facts": []}'}})
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"facts": []}'}}]})
+
+    schema = {
+        "type": "object",
+        "properties": {"facts": {"type": "array"}},
+        "required": ["facts"],
+    }
+    client = httpx.Client(transport=httpx.MockTransport(handler))
+    try:
+        chat(
+            url="http://llm/api/chat",
+            model="model",
+            system="system",
+            user="user",
+            timeout=1,
+            temperature=0,
+            max_tokens=1536,
+            num_ctx=8192,
+            think=False,
+            response_schema=schema,
+            client=client,
+        )
+        chat(
+            url="http://llm/v1/chat/completions",
+            model="model",
+            system="system",
+            user="user",
+            timeout=1,
+            temperature=0,
+            max_tokens=1536,
+            num_ctx=8192,
+            think=False,
+            response_schema=schema,
+            client=client,
+        )
+    finally:
+        client.close()
+
+    native = payloads[0][1]
+    assert native["think"] is False
+    assert native["format"] == schema
+    assert native["options"]["num_ctx"] == 8192
+    assert native["options"]["num_predict"] == 1536
+
+    openai = payloads[1][1]
+    assert openai["response_format"]["type"] == "json_schema"
+    assert openai["response_format"]["json_schema"]["schema"] == schema
+    assert openai["reasoning_effort"] == "none"
+    assert "options" not in openai
+    assert "format" not in openai
+    assert "num_ctx" not in openai

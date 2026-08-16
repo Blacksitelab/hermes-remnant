@@ -21,6 +21,12 @@ DEFAULT_EMBED_KEEP_ALIVE = "10m"
 DEFAULT_EXTRACT_URL = "http://your-ollama-host.local:11434/api/chat"
 DEFAULT_EXTRACT_MODEL = "gemma4:12b"
 DEFAULT_EXTRACT_KEEP_ALIVE = "2m"
+DEFAULT_EXTRACT_NUM_CTX = 8_192
+DEFAULT_EXTRACT_MAX_INPUT_TOKENS = 5_500
+DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS = 1_536
+DEFAULT_EXTRACT_MAX_FACTS = 8
+DEFAULT_EXTRACT_THINK = False
+DEFAULT_EXTRACT_STRUCTURED_OUTPUT = True
 
 # Phase 4: Obsidian vault indexing. The vault is the single source of truth for
 # notes; we index it as type='document' memories. Excluded folders hold agent
@@ -186,6 +192,14 @@ class RemnantConfig:
     extract_timeout: float = 120.0
     extract_enabled: bool = True
     extract_workers: int = 1
+    # Extraction is a bounded background task: a single turn does not need
+    # the model's full deployment context window or a long completion.
+    extract_num_ctx: int = DEFAULT_EXTRACT_NUM_CTX
+    extract_max_input_tokens: int = DEFAULT_EXTRACT_MAX_INPUT_TOKENS
+    extract_max_output_tokens: int = DEFAULT_EXTRACT_MAX_OUTPUT_TOKENS
+    extract_max_facts: int = DEFAULT_EXTRACT_MAX_FACTS
+    extract_think: bool = DEFAULT_EXTRACT_THINK
+    extract_structured_output: bool = DEFAULT_EXTRACT_STRUCTURED_OUTPUT
     # ``auto`` infers Ollama-native vs OpenAI-compatible chat behavior from the
     # endpoint path. Deployments can pin the protocol during migration.
     llm_protocol: str = "auto"
@@ -297,6 +311,24 @@ class RemnantConfig:
 
     def validate(self) -> RemnantConfig:
         """Normalize and validate Echo controls at one configuration boundary."""
+        for name in (
+            "extract_num_ctx",
+            "extract_max_input_tokens",
+            "extract_max_output_tokens",
+            "extract_max_facts",
+        ):
+            value = int(getattr(self, name))
+            if value <= 0:
+                raise ValueError(f"{name} must be positive")
+            setattr(self, name, value)
+        if (
+            self.extract_max_input_tokens + self.extract_max_output_tokens
+            >= self.extract_num_ctx
+        ):
+            raise ValueError(
+                "extract_max_input_tokens + extract_max_output_tokens must be "
+                "less than extract_num_ctx"
+            )
         self.echo_rank_influence = float(self.echo_rank_influence)
         self.echo_initial_sample_rate = float(self.echo_initial_sample_rate)
         self.echo_mature_sample_rate = float(self.echo_mature_sample_rate)

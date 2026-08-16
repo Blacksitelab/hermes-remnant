@@ -47,6 +47,9 @@ def chat(
     temperature: float = 0.1,
     max_tokens: int = 4096,
     keep_alive: str | int | float = "2m",
+    num_ctx: int | None = None,
+    think: bool | None = None,
+    response_schema: dict[str, Any] | None = None,
     client: httpx.Client | None = None,
 ) -> str:
     """Call a configured chat endpoint and return normalized text.
@@ -67,6 +70,14 @@ def chat(
             "options": {"temperature": temperature, "num_predict": max_tokens},
             "keep_alive": keep_alive,
         }
+        if num_ctx is not None or think is not None:
+            options = payload["options"]
+            if num_ctx is not None:
+                options["num_ctx"] = int(num_ctx)
+            if think is not None:
+                payload["think"] = bool(think)
+        if response_schema is not None:
+            payload["format"] = response_schema
     else:
         payload = {
             "model": model,
@@ -75,6 +86,19 @@ def chat(
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        if response_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "remnant_extraction",
+                    "strict": True,
+                    "schema": response_schema,
+                },
+            }
+        if think is False:
+            # Ollama's OpenAI-compatible endpoint exposes reasoning control
+            # under the standard OpenAI name rather than ``think``.
+            payload["reasoning_effort"] = "none"
     owned_client = client is None
     active_client = client or httpx.Client(timeout=timeout)
     try:
