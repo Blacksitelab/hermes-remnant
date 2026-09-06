@@ -1,0 +1,33 @@
+{
+  "baseline_commit": "47fd3fa96794329f0569e054560682508626e56c",
+  "candidate_version": "0.3.2",
+  "benchmark": "evaluation/benchmarks/retrieval_hardening.py",
+  "runtime": "CPython 3.12.3",
+  "platform": "Linux-7.0.0-31-generic-x86_64-with-glibc2.39",
+  "top100_ids_identical": true,
+  "top100_scores_identical": true,
+  "before": {
+    "rows": 5000,
+    "dimensions": 768,
+    "embedding": "instant deterministic stub",
+    "semantic_ms": 239.543,
+    "provider_prefetch_ms": 255.519,
+    "provider_delivered": 7,
+    "probes": 7,
+    "python_scoring_peak_mib": 0.54,
+    "top100_sha256": "3db716ba71a2e72ef0471f620bbca19dc1c67243c6fcd0bdf50371b6cbfb12a3",
+    "scores_sha256": "22a6acb6e408e2a1f911f4eb68c88eb4461cea70d932ad775e70680fd5a63f0d"
+  },
+  "after": {
+    "rows": 5000,
+    "dimensions": 768,
+    "embedding": "instant deterministic stub",
+    "semantic_ms": 197.855,
+    "provider_prefetch_ms": 215.123,
+    "provider_delivered": 7,
+    "probes": 7,
+    "python_scoring_peak_mib": 0.54,
+    "top100_sha256": "3db716ba71a2e72ef0471f620bbca19dc1c67243c6fcd0bdf50371b6cbfb12a3",
+    "scores_sha256": "22a6acb6e408e2a1f911f4eb68c88eb4461cea70d932ad775e70680fd5a63f0d"
+  }
+}

@@ -134,7 +134,7 @@ def search(
     """Run a memory search with the given strategy and scope filtering.
 
     - ``keyword``: BM25 only.
-    - ``semantic``: cosine over embeddings, BM25-pre-filtered candidates.
+    - ``semantic``: cosine over all eligible profile-owned embeddings.
     - ``auto`` (default): RRF fusion of keyword + semantic.
 
     ``profile_scope`` (Phase 4) restricts ``document``/``vault`` memories to
@@ -180,90 +180,47 @@ def search(
         from .graph import graph_search
 
         results = graph_search(
-            db,
-            lexical_query,
-            agent_id=agent_id,
-            limit=limit,
-            profile_scope=scope,
+            db, lexical_query, agent_id=agent_id, limit=limit, profile_scope=scope,
             evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
         )
-        results = _attach_source(db, results)
-        results = _profile_scope_filter(results, scope)
-        results = _scope_filter(results, visibility)
-        results = _mask_locked(results, viewer_agent=viewer)
-        for result in results:
-            result["_score_lane"] = "graph"
-        results = results[:limit]
-        return results
-
-    if strategy == "keyword":
+        lane = "graph"
+    elif strategy == "keyword":
         results = db.search_bm25(
-            lexical_query,
-            agent_id=agent_id,
-            profile_scope=scope,
+            lexical_query, agent_id=agent_id, profile_scope=scope,
             include_historical=history_intent and config.claim_aware_ranking_enabled,
             limit=limit * 3 if (visibility or scope) else limit,
         )
-        results = _attach_source(db, results)
-        results = _profile_scope_filter(results, scope)
-        results = _scope_filter(results, visibility)
-        results = _mask_locked(results, viewer_agent=viewer)
-        for result in results:
-            result["_score_lane"] = "keyword"
-        results = results[:limit]
-        return results
-
-    if strategy == "semantic":
-        ranked = _semantic_rank(
+        lane = "keyword"
+    elif strategy == "semantic":
+        results = _semantic_rank(
             db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope,
             limit=max(100, limit * 3), visibility=visibility,
         )
-        # Drop noise: if the top semantic cosine score is below the configured
-        # minimum, there are no strong matches.
-        if ranked and ranked[0].get("score", 0.0) < config.min_semantic_score:
-            return []
-        ranked = _attach_source(db, ranked)
-        ranked = _profile_scope_filter(ranked, scope)
-        ranked = _scope_filter(ranked, visibility)
-        ranked = _mask_locked(ranked, viewer_agent=viewer)
-        for result in ranked:
-            result["_score_lane"] = "semantic"
-        ranked = ranked[:limit]
-        return ranked
+        lane = "semantic"
+    else:
+        kw = db.search_bm25(
+            lexical_query, agent_id=agent_id, profile_scope=scope,
+            include_historical=history_intent and config.claim_aware_ranking_enabled,
+            limit=max(limit * 3, 100),
+        )
+        sem = _semantic_rank(
+            db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope,
+            limit=max(100, limit * 3), visibility=visibility,
+        )
+        # Semantic ranking already rejects weak/nonfinite scores. An empty
+        # semantic lane leaves lexical candidates available through RRF.
+        results = _rrf_fuse(kw, sem)
+        lane = "hybrid"
 
-    # auto: RRF fusion. If the top semantic score is below threshold, the
-    # semantic signal is too weak for fusion, so we fall back to BM25-only
-    # results instead of returning an empty list.
-    kw = db.search_bm25(
-        lexical_query,
-        agent_id=agent_id,
-        profile_scope=scope,
-        include_historical=history_intent and config.claim_aware_ranking_enabled,
-        limit=max(limit * 3, 100),
-    )
-    sem = _semantic_rank(
-        db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope,
-        limit=max(100, limit * 3), visibility=visibility,
-    )
-    if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
-        results = _attach_source(db, kw)
-        results = _profile_scope_filter(results, scope)
-        results = _scope_filter(results, visibility)
-        results = _mask_locked(results, viewer_agent=viewer)
-        for result in results:
-            result["_score_lane"] = "keyword"
-        results = results[:limit]
-        return results
-    fused = _rrf_fuse(kw, sem)
-    fused = _attach_source(db, fused)
-    fused = _apply_source_weights(fused)
-    fused = _profile_scope_filter(fused, scope)
-    fused = _scope_filter(fused, visibility)
-    fused = _mask_locked(fused, viewer_agent=viewer)
-    for result in fused:
-        result["_score_lane"] = "hybrid"
-    fused = fused[:limit]
-    return fused
+    results = _attach_source(db, results)
+    if lane == "hybrid":
+        results = _apply_source_weights(results)
+    results = _profile_scope_filter(results, scope)
+    results = _scope_filter(results, visibility)
+    results = _mask_locked(results, viewer_agent=viewer)
+    for result in results:
+        result["_score_lane"] = lane
+    return results[:limit]
 
 
 def _apply_decay(
@@ -417,6 +374,9 @@ def _semantic_rank(
         # comparison entirely; treat as no match rather than scoring against a
         # zero vector.
         return []
+    squared_norm = 0.0
+    for value in qvec:
+        squared_norm += value * value
 
     rows = db.iter_embeddings(
         agent_id=agent_id,
@@ -436,7 +396,7 @@ def _semantic_rank(
             vec.frombytes(blob)
             if sys.byteorder != "little":
                 vec.byteswap()
-            sim = cosine(qvec, vec)
+            sim = cosine(qvec, vec, squared_norm_a=squared_norm)
             if math.isfinite(sim) and sim >= config.min_semantic_score:
                 row["score"] = sim
                 yield row
@@ -465,17 +425,12 @@ def _rrf_fuse(
             "updated_at": r.get("updated_at"),
         }
 
-    for rank, r in enumerate(kw):
-        mid = r["id"]
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (RRF_K + rank + 1)
-        if mid not in meta:
-            meta[mid] = _rrf_meta(r)
-
-    for rank, r in enumerate(sem):
-        mid = r["id"]
-        scores[mid] = scores.get(mid, 0.0) + 1.0 / (RRF_K + rank + 1)
-        if mid not in meta:
-            meta[mid] = _rrf_meta(r)
+    for results in (kw, sem):
+        for rank, r in enumerate(results):
+            mid = r["id"]
+            scores[mid] = scores.get(mid, 0.0) + 1.0 / (RRF_K + rank + 1)
+            if mid not in meta:
+                meta[mid] = _rrf_meta(r)
 
     fused: list[dict[str, Any]] = []
     for mid, score in scores.items():
