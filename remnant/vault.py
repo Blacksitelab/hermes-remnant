@@ -29,6 +29,7 @@ from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
 from .entity import extract_and_link_entities
+from .scope import path_in_profile_scope
 
 log = logging.getLogger("remnant.vault")
 
@@ -251,7 +252,9 @@ def index_file(
     vault_root = Path(config.vault_path)
     abs_path = Path(path)
     rel = _relative_path(abs_path, vault_root)
-    if not _should_index(rel, config.vault_exclude):
+    if not _should_index(rel, config.vault_exclude) or not path_in_profile_scope(
+        rel, config.profile_scope,
+    ):
         return None
     if abs_path.suffix.lower() not in _MARKDOWN_SUFFIXES:
         return None
@@ -264,10 +267,17 @@ def index_file(
         log.warning("vault: cannot hash %s: %s", rel, e)
         return None
 
-    existing_hash = db.get_vault_hash(rel)
-    existing_mid = db.get_vault_memory(rel)
+    existing_hash = db.get_vault_hash(rel, agent_id=config.agent_id)
+    existing_mid = db.get_vault_memory(rel, agent_id=config.agent_id)
     if existing_hash == hash_hex and existing_mid:
-        # Unchanged file — keep the existing memory, nothing to do.
+        # A prior embedding outage must not become permanent just because
+        # the file hash is unchanged.
+        from .maintenance import repair_embeddings
+
+        ids = [row["memory_id"] for row in db.get_vault_passages(
+            rel, agent_id=config.agent_id,
+        )] or [existing_mid]
+        repair_embeddings(db, config, embedder, memory_ids=ids, limit=len(ids))
         return existing_mid
 
     try:
@@ -295,7 +305,9 @@ def index_file(
         metadata["locked"] = True
 
     embed_model = getattr(embedder, "_model", None) if embedder else None
-    existing_passages = {p["ordinal"]: p["memory_id"] for p in db.get_vault_passages(rel)}
+    existing_passages = {p["ordinal"]: p["memory_id"] for p in db.get_vault_passages(
+        rel, agent_id=config.agent_id,
+    )}
     # Migrate a legacy one-memory note in place: it becomes the first passage.
     if not existing_passages and existing_mid:
         existing_passages[0] = existing_mid
@@ -340,7 +352,8 @@ def index_file(
                 embed_model=embed_model,
             )
         db.set_vault_passage(
-            rel, ordinal, mid, passage["heading_path"], passage["start"], passage["end"]
+            rel, ordinal, mid, passage["heading_path"], passage["start"], passage["end"],
+            agent_id=config.agent_id,
         )
         extract_and_link_entities(
             db, memory_id=mid, text=content,
@@ -349,8 +362,8 @@ def index_file(
         )
         memory_ids.append(mid)
 
-    db.forget_vault_passages_after(rel, len(passages) - 1)
-    db.set_vault_hash(rel, hash_hex, memory_id=memory_ids[0])
+    db.forget_vault_passages_after(rel, len(passages) - 1, agent_id=config.agent_id)
+    db.set_vault_hash(rel, hash_hex, memory_id=memory_ids[0], agent_id=config.agent_id)
     return memory_ids[0]
 
 
@@ -389,21 +402,25 @@ def index_vault(
         return {"indexed": indexed, "skipped": skipped, "forgotten": 0, "failed": 1}
     for abs_path in markdown_paths:
         rel = _relative_path(abs_path, vault_root)
+        if not path_in_profile_scope(rel, config.profile_scope):
+            continue
         seen_paths.add(rel)
         if not force:
             try:
                 hash_hex = _file_hash(abs_path)
             except OSError:
                 continue
-            existing = db.get_vault_hash(rel)
-            if existing == hash_hex and db.get_vault_memory(rel):
+            existing = db.get_vault_hash(rel, agent_id=config.agent_id)
+            if existing == hash_hex and db.get_vault_memory(rel, agent_id=config.agent_id):
+                # An unchanged file may still have missing derived embeddings.
+                index_file(db, config, embedder, abs_path)
                 skipped += 1
                 continue
         mid = index_file(db, config, embedder, abs_path)
         if mid:
             indexed += 1
 
-    forgotten = db.mark_vault_forgotten_for_missing(seen_paths)
+    forgotten = db.mark_vault_forgotten_for_missing(seen_paths, agent_id=config.agent_id)
     return {"indexed": indexed, "skipped": skipped, "forgotten": len(forgotten)}
 
 

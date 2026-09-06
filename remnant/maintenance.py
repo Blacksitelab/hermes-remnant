@@ -85,8 +85,38 @@ def availability_report(
     }
 
 
-def health_report(db: RemnantDB) -> dict[str, Any]:
+def repair_embeddings(
+    db: RemnantDB, config: RemnantConfig, embedder: Any, *,
+    memory_ids: list[str] | None = None, limit: int = 8,
+) -> dict[str, int]:
+    """Retry derived vectors independently of vault hashes; source evidence is unchanged."""
+    if embedder is None:
+        return {"candidates": 0, "repaired": 0}
+    model = getattr(embedder, "_model", config.embed_model)
+    rows = db.repair_embedding_candidates(
+        agent_id=config.agent_id, model=model,
+        dimensions=getattr(embedder, "_dim", config.embed_dim),
+        profile_scope=config.profile_scope or None, memory_ids=memory_ids, limit=limit,
+    )
+    repaired = 0
+    for row in rows:
+        try:
+            try:
+                vector = embedder.embed(row["content"], timeout=min(5.0, config.embed_timeout))
+            except TypeError:
+                vector = embedder.embed(row["content"])
+            if vector:
+                repaired += db.put_memory_embedding(
+                    row["id"], expected_content=row["content"], embedding=vector, model=model,
+                )
+        except (ValueError, OSError):
+            continue
+    return {"candidates": len(rows), "repaired": repaired}
+
+
+def health_report(db: RemnantDB, config: RemnantConfig | None = None) -> dict[str, Any]:
     """Return bounded health signals needed to operate the memory service."""
+    db.flush_diagnostics()
     with db.read() as cur:
         cur.execute("SELECT status, COUNT(*) AS count FROM memories GROUP BY status")
         memories = {row["status"]: int(row["count"]) for row in cur.fetchall()}
@@ -208,7 +238,7 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
         unresolved_age_s = 0.0
     availability = availability_report(db_path=Path(db.path))
     total_prefetch = sum(prefetch.values())
-    scan_limit = RemnantConfig().semantic_scan_limit
+    scan_limit = (config or RemnantConfig()).semantic_scan_limit
     return {
         "availability": availability,
         "schema_version": SCHEMA_VERSION,
@@ -225,7 +255,8 @@ def health_report(db: RemnantDB) -> dict[str, Any]:
             )
             if scan_limit
             else 0.0,
-            "ann_recommended": embeddings > scan_limit,
+            "complete_corpus": scan_limit == 0,
+            "ann_recommended": bool(scan_limit and embeddings > scan_limit),
         },
         "embeddings": embeddings,
         "embeddings_by_model_dimension": embeddings_by_model,

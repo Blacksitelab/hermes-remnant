@@ -58,6 +58,8 @@ def test_default_recall_groups_ambiguous_claims_before_limit(tmp_path):
 def test_recall_context_skips_oversized_candidate_and_keeps_later_fact(tmp_path):
     db = open_db(tmp_path / "budget.db")
     config = RemnantConfig(injection_token_budget=80)
+    long_id = db.insert_memory(content="x" * 2000, agent="default")
+    short_id = db.insert_memory(content="Sven likes tea", agent="default")
     try:
         response = RecallService(db, config).recall(
             RecallRequest(
@@ -67,8 +69,8 @@ def test_recall_context_skips_oversized_candidate_and_keeps_later_fact(tmp_path)
                 output_mode="context",
             ),
             candidates=[
-                {"id": "long", "content": "x" * 2_000, "visibility": "private"},
-                {"id": "short", "content": "Sven likes tea", "visibility": "private"},
+                {"id": long_id, "content": "x" * 2_000, "visibility": "private"},
+                {"id": short_id, "content": "Sven likes tea", "visibility": "private"},
             ],
         )
         assert "Sven likes tea" in response.context

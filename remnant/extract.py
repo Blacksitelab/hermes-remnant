@@ -237,6 +237,7 @@ class ExtractionWorker:
         return False
 
     def _loop(self) -> None:
+        next_maintenance = time.monotonic() + 30.0
         while not self._stop.is_set():
             self._wake.clear()
             try:
@@ -244,6 +245,16 @@ class ExtractionWorker:
                     self._enqueue_startup()
                     self._startup_done.set()
                 self._drain()
+                self._db.flush_diagnostics()
+                if time.monotonic() >= next_maintenance and not self._stop.is_set():
+                    next_maintenance = time.monotonic() + 300.0
+                    self._db.compact_caches(
+                        max_entries=self._config.embedding_cache_max_entries,
+                        max_age_days=self._config.embedding_cache_max_age_days,
+                    )
+                    from .maintenance import repair_embeddings
+
+                    repair_embeddings(self._db, self._config, self._embedder, limit=1)
             except Exception as e:
                 log.warning("extraction loop error: %s", e)
             # Wait for wake or poll interval
@@ -305,6 +316,8 @@ class ExtractionWorker:
                 typed_entities = [{"name": entity, "type": None, "aliases": []}]
             typed_entities = filter_typed_entities(typed_entities)
             claim_data = dict(f)
+            claim_data["source_user_text"] = job["user_text"]
+            claim_data["source_single_fact"] = len(facts) == 1
             if not claim_data.get("observed_at"):
                 claim_data["observed_at"] = datetime.fromtimestamp(
                     float(job.get("enqueued_at") or time.time()), timezone.utc

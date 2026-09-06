@@ -14,7 +14,11 @@ Strategies:
 
 from __future__ import annotations
 
+import heapq
+import math
 import re
+import sys
+from array import array
 from datetime import datetime
 from typing import Any
 
@@ -144,6 +148,8 @@ def search(
     In ``semantic`` mode this means no results; in ``auto`` mode we fall back to
     the BM25 keyword results rather than returning nothing.
     """
+    if agent_id is None:
+        agent_id = config.agent_id
     if limit is None:
         limit = config.search_limit
     if strategy is None:
@@ -209,7 +215,8 @@ def search(
 
     if strategy == "semantic":
         ranked = _semantic_rank(
-            db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope
+            db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope,
+            limit=max(100, limit * 3), visibility=visibility,
         )
         # Drop noise: if the top semantic cosine score is below the configured
         # minimum, there are no strong matches.
@@ -235,7 +242,8 @@ def search(
         limit=max(limit * 3, 100),
     )
     sem = _semantic_rank(
-        db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope
+        db, config, query, agent_id=agent_id, embedder=embedder, profile_scope=scope,
+        limit=max(100, limit * 3), visibility=visibility,
     )
     if sem and sem[0].get("score", 0.0) < config.min_semantic_score:
         results = _attach_source(db, kw)
@@ -311,7 +319,7 @@ def decay_trust_scores(
 
     Returns a summary dict: ``{"updated": int, "skipped": int, "dry_run": bool}``.
     """
-    rows = db.list_active_memories_for_decay()
+    rows = db.list_active_memories_for_decay(agent_id=config.agent_id)
     now = _utc_now()
     updated = 0
     skipped = 0
@@ -397,40 +405,46 @@ def _semantic_rank(
     agent_id: str | None = None,
     embedder: Embedder | None = None,
     profile_scope: list[str] | None = None,
+    limit: int = 100,
+    visibility: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Cosine-rank the bounded, authorization-scoped vector corpus."""
+    """Score compact vectors, retaining only the best authorized candidates."""
     if embedder is None:
         return []
-    qvec = embedder.embed(query)
+    qvec = getattr(embedder, "embed_query", embedder.embed)(query)
     if not qvec:
         # No query embedding available (remote failure / None). Skip semantic
         # comparison entirely; treat as no match rather than scoring against a
         # zero vector.
         return []
 
-    rows = db.search_all_embeddings(
+    rows = db.iter_embeddings(
         agent_id=agent_id,
         profile_scope=profile_scope,
+        visibility=visibility,
+        model=getattr(embedder, "_model", None),
+        dimensions=len(qvec),
         limit=config.semantic_scan_limit,
     )
-    scored: list[dict[str, Any]] = []
-    for r in rows:
-        vec = r.get("embedding") or []
-        if not vec:
-            continue
-        sim = cosine(qvec, vec)
-        d = {
-            "id": r["id"],
-            "content": r["content"],
-            "visibility": r["visibility"],
-            "agent_id": r["agent_id"],
-            "created_at": r.get("created_at"),
-            "updated_at": r.get("updated_at"),
-            "score": sim,
-        }
-        scored.append(d)
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored
+
+    def scored():
+        for row in rows:
+            blob = row.pop("embedding")
+            if not blob or len(blob) != len(qvec) * 4:
+                continue
+            vec = array("f")
+            vec.frombytes(blob)
+            if sys.byteorder != "little":
+                vec.byteswap()
+            sim = cosine(qvec, vec)
+            if math.isfinite(sim) and sim >= config.min_semantic_score:
+                row["score"] = sim
+                yield row
+
+    try:
+        return heapq.nlargest(limit, scored(), key=lambda row: row["score"])
+    finally:
+        rows.close()
 
 
 def _rrf_fuse(

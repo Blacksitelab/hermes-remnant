@@ -168,7 +168,7 @@ def _run_dream(
         search_decay_trust_scores(db, config, dry_run=False)
 
     since_ts = _window_start(db, mode, now)
-    recent = db.get_recent_memories(since_ts=since_ts, limit=200)
+    recent = db.get_recent_memories(since_ts=since_ts, agent_id=config.agent_id, limit=200)
     # Cloud judgment is only allowed to see explicitly shareable memories.
     # Private memories may still be retrieved by normal agent search, but they
     # must never enter a cross-agent or cloud-assisted dream prompt.
@@ -248,7 +248,7 @@ def _run_dream(
                         topic=title[:120],
                         importance=0.6,
                         source="dream",
-                        added_by=actor,
+                        added_by=config.agent_id,
                     )
                 except Exception as e:
                     log.warning("thread creation failed: %s", e)
@@ -311,7 +311,8 @@ def _select_candidate_pairs(
     # Keep the corpus bounded locally, then apply the same rule to both day and
     # night so a private recent memory cannot leak through a shared candidate.
     corpus = db.get_memories_for_agent_scope(agent_id=None, visibility=None, limit=500)
-    corpus = [m for m in corpus if m.get("visibility") in SHAREABLE_VISIBILITIES]
+    corpus = [m for m in corpus if m.get("visibility") in SHAREABLE_VISIBILITIES
+              and m.get("agent") in {row.get("agent") for row in recent}]
     corpus_by_id = {m["id"]: m for m in corpus}
     corpus_ids = list(corpus_by_id.keys())
     if not corpus_ids:
@@ -328,7 +329,7 @@ def _select_candidate_pairs(
         # Score against the whole active corpus, keep top-K by cosine.
         scored: list[tuple[float, dict[str, Any]]] = []
         for cid in corpus_ids:
-            if cid == rm["id"]:
+            if cid == rm["id"] or corpus_by_id[cid].get("agent") != rm.get("agent"):
                 continue  # don't pair a memory with itself
             cvec = corpus_vecs.get(cid)
             if not cvec:
@@ -349,25 +350,7 @@ def _select_candidate_pairs(
             if len(pairs) >= DREAM_MAX_CANDIDATE_PAIRS:
                 return pairs
 
-    # Also look for cross-agent duplicates among the recent memories
-    # themselves (two agents recently stored the same fact).
-    for i in range(len(recent)):
-        for j in range(i + 1, len(recent)):
-            a, b = recent[i], recent[j]
-            if a.get("agent") == b.get("agent"):
-                continue
-            av, bv = recent_vecs.get(a["id"]), recent_vecs.get(b["id"])
-            if not av or not bv:
-                continue
-            sim = cosine(av, bv)
-            if sim >= DREAM_DEDUP_THRESHOLD:
-                key = tuple(sorted((a["id"], b["id"])))
-                if key in seen_pairs:
-                    continue
-                seen_pairs.add(key)
-                pairs.append(_pair(a, b, sim, "cross_agent"))
-                if len(pairs) >= DREAM_MAX_CANDIDATE_PAIRS:
-                    return pairs
+    return pairs
 
     return pairs
 
@@ -574,7 +557,7 @@ def _merge_same_fact(
     + entity-graph carry-over still runs. Returns 1 on success, 0 on failure.
     """
     memories = [db.get_memory(mid) for mid in pair_ids]
-    if any(m is None for m in memories):
+    if any(m is None or m.get("agent") != config.agent_id for m in memories):
         return 0
     if any(not is_shareable_visibility(m.get("visibility")) for m in memories if m):
         log.warning("refusing dream merge containing a private memory")

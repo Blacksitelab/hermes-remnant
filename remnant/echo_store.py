@@ -243,9 +243,9 @@ class EchoRepository:
                 """SELECT echo_jobs.* FROM echo_jobs
                    JOIN echo_receipts r ON r.id=echo_jobs.receipt_id
                    WHERE echo_jobs.status='pending' AND echo_jobs.next_attempt_at<=?
-                     AND r.status='closed' AND r.turn_id IS NOT NULL
+                     AND r.status='closed' AND r.turn_id IS NOT NULL AND r.agent_id=?
                    ORDER BY echo_jobs.priority DESC, echo_jobs.id LIMIT 1""",
-                (now,),
+                (now, self.config.agent_id),
             )
             row = cur.fetchone()
             if row is None:
@@ -304,8 +304,8 @@ class EchoRepository:
             cur.execute(
                 """SELECT r.*, t.user_text, t.assistant_text
                    FROM echo_receipts r LEFT JOIN turns t ON t.id=r.turn_id
-                   WHERE r.id=?""",
-                (str(job.get("receipt_id") or ""),),
+                   WHERE r.id=? AND r.agent_id=? AND t.agent_id=r.agent_id""",
+                (str(job.get("receipt_id") or ""), self.config.agent_id),
             )
             receipt = cur.fetchone()
             if (
@@ -317,8 +317,8 @@ class EchoRepository:
             placeholders = ",".join("?" for _ in target_ids)
             cur.execute(
                 f"SELECT id, content, type, status, confidence, trust_score "
-                f"FROM memories WHERE id IN ({placeholders})",
-                target_ids,
+                f"FROM memories WHERE id IN ({placeholders}) AND agent=?",
+                [*target_ids, self.config.agent_id],
             )
             memories = {str(row["id"]): dict(row) for row in cur.fetchall()}
         if any(

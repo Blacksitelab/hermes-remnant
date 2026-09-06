@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .. import RemnantMemoryProvider
 from ..config import RemnantConfig
 from ..db import _pack_embedding, open_db
 from ..recall import RecallRequest, RecallService
@@ -34,7 +35,7 @@ class ScaleBenchmarkConfig:
     """Inputs that make a scale run reproducible."""
 
     sizes: tuple[int, ...] = (5_000, 25_000, 100_000, 1_000_000)
-    dimensions: int = 64
+    dimensions: int = 768
     probes: int = 5
     seed: int = 0
     embedding_gap_every: int = 10
@@ -174,6 +175,11 @@ def _measure_store(path: Path, size: int, config: ScaleBenchmarkConfig) -> dict[
             seed=config.seed,
             gap_every=config.embedding_gap_every,
         )
+        with db.read() as cur:
+            eligible = cur.execute(
+                "SELECT count(*) FROM embeddings e JOIN memories m ON m.id=e.memory_id "
+                "WHERE m.agent='agent-0' AND m.status='active'",
+            ).fetchone()[0]
         embedder = SyntheticEmbedder(config.dimensions)
         remnant_config = RemnantConfig(
             agent_id="agent-0",
@@ -185,10 +191,16 @@ def _measure_store(path: Path, size: int, config: ScaleBenchmarkConfig) -> dict[
         )
         indices = _probe_indices(size, config.probes, config.embedding_gap_every)
         exact_times: list[float] = []
+        recall_times: list[float] = []
         prefetch_times: list[float] = []
+        provider = RemnantMemoryProvider()
+        provider._db, provider._config, provider._embedder = db, remnant_config, embedder
         relevant = 0
         ranks: list[int] = []
-        tracemalloc.start()
+        # Prime SQLite pages; time without allocation tracing overhead.
+        if indices:
+            search(db, remnant_config, f"target-{indices[0]:07d}", agent_id="agent-0",
+                   strategy="semantic", embedder=embedder)
         for index in indices:
             query = f"target-{index:07d}"
             started = time.perf_counter()
@@ -212,11 +224,17 @@ def _measure_store(path: Path, size: int, config: ScaleBenchmarkConfig) -> dict[
                 ),
                 embedder=embedder,
             )
+            recall_times.append((time.perf_counter() - started) * 1000.0)
+            started = time.perf_counter()
+            provider.prefetch(query, session_id=f"scale-{index}")
             prefetch_times.append((time.perf_counter() - started) * 1000.0)
+        # A separate untimed pass reports Python allocation peak, not total RSS.
+        tracemalloc.start()
+        search(db, remnant_config, f"target-{indices[0] if indices else 0:07d}",
+               agent_id="agent-0", strategy="semantic", embedder=embedder)
         _, peak = tracemalloc.get_traced_memory()
         tracemalloc.stop()
-        # Reopen once to expose cold-cache behavior without mixing it into the
-        # warm p50/p95 measurements.
+        # Reopening resets the connection, not the operating system page cache.
         db.close()
         cold_db = open_db(path)
         try:
@@ -231,6 +249,7 @@ def _measure_store(path: Path, size: int, config: ScaleBenchmarkConfig) -> dict[
             cold_db.close()
         return {
             "size": size,
+            "eligible_embedding_rows": eligible,
             **seed_report,
             "database_bytes": _path_size(path),
             "exact_vector_ms": {
@@ -238,13 +257,17 @@ def _measure_store(path: Path, size: int, config: ScaleBenchmarkConfig) -> dict[
                 "p95": _percentile(exact_times, 0.95),
                 "cache_state": "warm",
             },
+            "recall_service_ms": {
+                "p50": _percentile(recall_times, 0.50),
+                "p95": _percentile(recall_times, 0.95),
+            },
             "full_prefetch_ms": {
                 "p50": _percentile(prefetch_times, 0.50),
                 "p95": _percentile(prefetch_times, 0.95),
                 "cache_state": "warm",
             },
-            "cold_exact_vector_ms": round(cold_ms, 3),
-            "peak_memory_mb": round(peak / (1024 * 1024), 3),
+            "reopened_connection_exact_vector_ms": round(cold_ms, 3),
+            "peak_python_allocations_mb": round(peak / (1024 * 1024), 3),
             "recall_at_5": round(relevant / len(indices), 4) if indices else 0.0,
             "relevant_rank_p50": _percentile([float(rank) for rank in ranks], 0.50),
             "probes": len(indices),
@@ -262,7 +285,7 @@ def benchmark_scale(
     *,
     sizes: Sequence[int] | None = None,
     work_dir: str | Path | None = None,
-    dimensions: int = 64,
+    dimensions: int = 768,
     probes: int = 5,
     seed: int = 0,
     embedding_gap_every: int = 10,
@@ -292,8 +315,8 @@ def benchmark_scale(
                 raise FileExistsError(f"refusing to overwrite benchmark store: {path}")
             stores.append(_measure_store(path, size, config))
         return {
-            "schema_version": 1,
-            "benchmark": "remnant-scale-envelope-v1",
+            "schema_version": 2,
+            "benchmark": "remnant-scale-envelope-v2",
             "configuration": {
                 "sizes": list(config.sizes),
                 "embedding_dimensions": config.dimensions,
@@ -301,7 +324,7 @@ def benchmark_scale(
                 "embedding_gap_every": config.embedding_gap_every,
                 "probes": config.probes,
                 "seed": config.seed,
-                "cache_states": ["warm", "cold_probe"],
+                "cache_states": ["warm", "reopened_connection"],
                 "python": platform.python_version(),
                 "platform": platform.platform(),
                 "sqlite": sqlite3.sqlite_version,
@@ -320,7 +343,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--sizes", default="5000,25000,100000,1000000")
     parser.add_argument("--work-dir", type=Path, default=None)
-    parser.add_argument("--dimensions", type=int, default=64)
+    parser.add_argument("--dimensions", type=int, default=768)
     parser.add_argument("--probes", type=int, default=5)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--embedding-gap-every", type=int, default=10)

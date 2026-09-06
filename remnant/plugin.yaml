@@ -1,5 +1,5 @@
 name: remnant
-version: 0.2.2
+version: 0.3.0
 description: "Durable memory engine for Hermes Agent: SQLite-backed fact storage, async LLM extraction, BM25 keyword search, and dedup with cosine similarity."
 provides_hooks:
   - system_prompt_block

@@ -334,14 +334,14 @@ def test_import_memory_store_dedups_by_content_hash(hermes_home: Path):
     try:
         stats = import_memory_store(db, cfg, emb, hermes_home)
         assert stats["imported"] == 1
-        assert stats["duplicates"] == 1
+        assert stats["duplicates"] == 0
         # Only one memory row exists for that content.
         rows = db.list_memories(agent_id="alpha", limit=20)
         assert len(rows) == 1
         # The duplicate bumped seen_count to 2.
         assert rows[0]  # sanity
         mem = db.get_memory(rows[0]["id"])
-        assert mem["seen_count"] == 2
+        assert mem["seen_count"] == 1
     finally:
         db.close()
 
@@ -514,7 +514,7 @@ def patch_hindsight(monkeypatch):
     """
     from remnant import import_sources as isrc
 
-    def fake_recall(query: str, *, limit: int):
+    def fake_recall(query: str, *, limit: int, bank_id: str):
         if query == "project":
             return [
                 {"content": "Project Alpha build is green."},
@@ -622,7 +622,7 @@ def test_import_hindsight_handles_varied_row_shapes(hermes_home: Path, monkeypat
     try:
         from remnant import import_sources as isrc
 
-        def varied_recall(query: str, *, limit: int):
+        def varied_recall(query: str, *, limit: int, bank_id: str):
             return [
                 {"text": "via text key"},
                 {"memory": "via memory key"},
@@ -644,7 +644,7 @@ def test_import_hindsight_total_cap_stops_early(hermes_home: Path, monkeypatch):
     # Generate enough unique rows to hit the hard cap.
     from remnant import import_sources as isrc
 
-    def big_recall(query: str, *, limit: int):
+    def big_recall(query: str, *, limit: int, bank_id: str):
         return [{"content": f"unique fact number {i}"} for i in range(250)]
 
     monkeypatch.setattr(isrc, "_hindsight_recall", big_recall)
@@ -668,7 +668,7 @@ def test_import_hindsight_total_cap_stops_early(hermes_home: Path, monkeypatch):
 
 
 def test_memory_import_tool_memory_store(provider: RemnantMemoryProvider, hermes_home: Path):
-    _seed_profile(hermes_home, "alpha", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "default", "- My name is Sven.\n")
     res = provider.handle_tool_call(
         "memory_import", {"source": "memory_store"}, session_id="imp",
     )
@@ -698,7 +698,7 @@ def test_memory_import_tool_hindsight_dry_run(
 ):
     from remnant import import_sources as isrc
 
-    def fake_recall(query: str, *, limit: int):
+    def fake_recall(query: str, *, limit: int, bank_id: str):
         return [{"content": "hindsight fact"}]
 
     monkeypatch.setattr(isrc, "_hindsight_recall", fake_recall)
@@ -725,7 +725,7 @@ def test_memory_import_tool_schema_has_new_params(provider: RemnantMemoryProvide
 def test_provider_import_memory_helper_memory_store(
     provider: RemnantMemoryProvider, hermes_home: Path
 ):
-    _seed_profile(hermes_home, "alpha", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "default", "- My name is Sven.\n")
     stats = provider.import_memory("memory_store")
     assert stats["source"] == "memory_store"
     assert stats["imported"] == 1
@@ -752,14 +752,7 @@ def test_provider_system_prompt_mentions_memory_store_and_hindsight(
 
 
 def test_import_memory_store_semantic_dedup_role_label(hermes_home: Path):
-    """Two import lines differing only by a trailing role label are deduped
-    into a single memory with seen_count=2 (not two separate rows).
-
-    The exact content-hash differs (the trailing role word changes the hash),
-    so this exercises the new semantic-similarity path, not the exact-hash
-    path. With the deterministic word-bag fake embedder, the two sentences
-    share all but one of ~10 words -> cosine ~= 0.917 >= 0.85.
-    """
+    """Similar sentences naming different roles must preserve both facts."""
     body = (
         "- Kris manages the BlacksiteLab vault and serves as the Research commissioner.\n"
         "- Kris manages the BlacksiteLab vault and serves as the Vault owner.\n"
@@ -771,15 +764,12 @@ def test_import_memory_store_semantic_dedup_role_label(hermes_home: Path):
     try:
         stats = import_memory_store(db, cfg, emb, hermes_home)
         assert stats["discovered"] == 2
-        # One imported, one semantic duplicate.
-        assert stats["imported"] == 1
-        assert stats["duplicates"] == 1
-        # Exactly one memory row exists.
+        assert stats["imported"] == 2
+        assert stats["duplicates"] == 0
         rows = db.list_memories(agent_id="alpha", limit=20)
-        assert len(rows) == 1
+        assert len(rows) == 2
         mem = db.get_memory(rows[0]["id"])
-        # The duplicate observation bumped seen_count to 2.
-        assert mem["seen_count"] == 2
+        assert mem["seen_count"] == 1
         assert mem["source"] == "import"
         assert mem["content_hash"]
     finally:
@@ -826,7 +816,7 @@ def test_import_hindsight_skips_transient_rows(hermes_home: Path, monkeypatch):
     """
     from remnant import import_sources as isrc
 
-    def recall(query: str, *, limit: int):
+    def recall(query: str, *, limit: int, bank_id: str):
         return [
             {"content": "Printer is at 27% completion."},
             {"content": "Project Alpha build is green."},
@@ -852,13 +842,10 @@ def test_import_hindsight_skips_transient_rows(hermes_home: Path, monkeypatch):
 def test_import_hindsight_semantic_dedup_role_label(
     hermes_home: Path, monkeypatch
 ):
-    """Two hindsight rows differing only by a trailing role label are
-    deduped into one memory with seen_count=2 (semantic path, distinct
-    content hashes).
-    """
+    """Similar sentences naming different roles must preserve both facts."""
     from remnant import import_sources as isrc
 
-    def recall(query: str, *, limit: int):
+    def recall(query: str, *, limit: int, bank_id: str):
         return [
             {"content": "Kris manages the BlacksiteLab vault and serves as the curator."},
             {"content": "Kris manages the BlacksiteLab vault and serves as the archivist."},
@@ -870,11 +857,11 @@ def test_import_hindsight_semantic_dedup_role_label(
     emb = _fake_embed(db, cfg)
     try:
         stats = import_hindsight(db, cfg, emb, queries=["x"], dry_run=False)
-        assert stats["imported"] == 1
-        assert stats["duplicates"] == 1
+        assert stats["imported"] == 2
+        assert stats["duplicates"] == 0
         rows = db.list_memories(agent_id="alpha", limit=20)
-        assert len(rows) == 1
-        assert db.get_memory(rows[0]["id"])["seen_count"] == 2
+        assert len(rows) == 2
+        assert db.get_memory(rows[0]["id"])["seen_count"] == 1
     finally:
         db.close()
 
@@ -894,7 +881,7 @@ def test_find_semantic_duplicate_returns_none_when_no_existing(hermes_home: Path
         db.close()
 
 
-def test_find_semantic_duplicate_respects_threshold(hermes_home: Path):
+def test_find_semantic_duplicate_preserves_uncertain_paraphrases(hermes_home: Path):
     """A fact that is similar but below the threshold is not a duplicate."""
     db = _open_db(hermes_home)
     cfg = RemnantConfig(agent_id="alpha")
@@ -912,14 +899,13 @@ def test_find_semantic_duplicate_respects_threshold(hermes_home: Path):
             agent_id="alpha", visibility="private",
         )
         assert res is None
-        # Raising the threshold-to-zero would match anything; lowering it
-        # below the cosine forces a match, proving the threshold is honored.
+        # Even a zero legacy threshold cannot discard different evidence.
         res_low = find_semantic_duplicate(
             db, emb, "Sven prefers concise answers.",
             agent_id="alpha", visibility="private",
             threshold=0.0,
         )
-        assert res_low is not None
+        assert res_low is None
         assert IMPORT_DEDUP_COSINE_THRESHOLD == 0.85
     finally:
         db.close()
@@ -937,9 +923,9 @@ def test_import_memory_store_exact_hash_dedup_unchanged(hermes_home: Path):
     try:
         stats = import_memory_store(db, cfg, emb, hermes_home)
         assert stats["imported"] == 1
-        assert stats["duplicates"] == 1
+        assert stats["duplicates"] == 0
         rows = db.list_memories(agent_id="alpha", limit=20)
         assert len(rows) == 1
-        assert db.get_memory(rows[0]["id"])["seen_count"] == 2
+        assert db.get_memory(rows[0]["id"])["seen_count"] == 1
     finally:
         db.close()

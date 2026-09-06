@@ -18,7 +18,7 @@ The held-out adversarial corpus at
 scenarios (ten per category). It intentionally avoids the synthetic
 `signal-*` identifiers used by the leadership regression corpus and exercises
 question wording, inflection, possessives, conditions, pending turns, and
-shared-vault/private-agent boundaries. It is a release gate, not a claim of
+profile ownership boundaries. It is a release gate, not a claim of
 cross-provider superiority.
 
 Reports include recall@1/3/5, MRR, nDCG@5, context precision, wrong-answer rate,
@@ -44,3 +44,15 @@ No behavior flag becomes a default solely because this synthetic suite passes.
 Before deployment-wide enablement, run shadow extraction/reconciliation against
 a representative private corpus and apply the thresholds in the leadership
 implementation plan. Keep raw private cases and model prompts out of Git.
+
+The scenario runner seeds prepared memories and claim projections; its scores
+measure retrieval/resolution, not extraction-model quality. The regression suites
+`test_retrieval_hardening.py` and `test_profile_isolation.py` additionally exercise
+extraction JSON through storage and provider context, high-similarity corrections,
+failed embedding repair, database contention, and profile-boundary attacks.
+
+Scale report v2 defaults to 768 dimensions. `full_prefetch_ms` measures the actual
+provider hook; `recall_service_ms` reports the separate recall service. Timings run
+without tracemalloc. `peak_python_allocations_mb` comes from a separate untimed
+semantic scan and excludes SQLite/native allocations. Reopening a connection is
+labelled explicitly because it does not clear the operating-system page cache.

@@ -122,7 +122,7 @@ def test_health_report_exposes_schema_and_claim_lifecycle():
     db = open_db(default_db_path())
     try:
         report = health_report(db)
-        assert report["schema_version"] == 15
+        assert report["schema_version"] == 16
         assert "claims_by_resolution" in report
         assert "pending_extraction_age_s" in report
     finally:
@@ -152,7 +152,7 @@ def test_runtime_identity_scopes_provider_and_non_primary_skips_writes(
         platform="cli",
     )
     try:
-        assert provider._config.agent_id.startswith("identity:v1:")  # type: ignore[union-attr]
+        assert provider._config.agent_id.startswith("identity:v2:")  # type: ignore[union-attr]
         provider.sync_turn("should not persist", "", session_id="s1")
         assert provider._db.pending_extraction_count(agent_id="hermes:coder") == 0  # type: ignore[union-attr]
     finally:

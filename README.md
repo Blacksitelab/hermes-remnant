@@ -107,7 +107,20 @@ memory:
 
 Run `hermes memory setup` to configure endpoints and agent id.
 
-Remnant stores its SQLite database at a **shared** location — `~/.hermes/remnant/remnant.db` — used by every Hermes profile and agent, so cross-agent features (shared vault search, dream-loop cross-agent dedup, entity-graph traversal across agents) work without merging per-profile databases. The location can be overridden with the `REMNANT_DB_HOME` env var. Per-profile **config** stays under each profile's `hermes_home` at `hermes_home/remnant.json`; only the DB is shared.
+Remnant uses one SQLite file at `~/.hermes/remnant/remnant.db` (override with
+`REMNANT_DB_HOME`), with strict ownership enforced by the memory provider. Each
+profile can retrieve and modify only its own memories, including vault notes.
+`shared` and `fleet` remain legacy labels; they do not grant another profile
+access. Named profiles use their directory name as their storage identity;
+configurations under `hermes_home/remnant.json` remain independent.
+
+Version 0.3.0 migrates vault tracking to `(profile, path)` keys without changing
+existing memory ownership. Runtime identity v2 also includes the profile. Older
+runtime identity v1 records remain preserved but require an explicit operator
+mapping before reuse. Configured-owner mode retains its existing keys.
+Keep a SQLite backup before updating: rolling back across schema 16 requires
+restoring that database backup along with the earlier code. Direct database
+access and operator maintenance commands remain administrative capabilities.
 
 ---
 
@@ -323,7 +336,7 @@ python -m remnant.calibrate_trust  # recalibrate all trust scores
 
 Per-profile config lives at `hermes_home/remnant.json` (where `hermes_home` is the active Hermes profile directory, e.g. `~/.hermes/profiles/<profile>`). Edit it directly or set values through `hermes memory setup`. Each profile keeps its own config — `agent_id`, endpoints, vault path, visibility defaults — so multiple agents can share the single DB while remaining independently configured.
 
-The SQLite database is **shared** across all profiles at `~/.hermes/remnant/remnant.db` (override with the `REMNANT_DB_HOME` env var). Config is profile-scoped; storage is shared.
+The SQLite database is **shared** across all profiles at `~/.hermes/remnant/remnant.db` (override with the `REMNANT_DB_HOME` env var). Config and memory access are profile-scoped; only the database file is shared.
 
 The default vault path can be overridden with the `REMNANT_VAULT_PATH` env var before constructing a `RemnantConfig`.
 
@@ -411,6 +424,27 @@ claim coverage and unresolved age, embedding model/dimension coverage,
 prefetch outcomes and latency, entity/relation evidence counts, and bounded
 operation counters. See [the provider comparison](docs/provider-comparison.md)
 for the current evidence-based positioning against Hermes' popular providers.
+
+### Model-backed historical claim backfill
+
+The legacy `reextract_claims` command is a deterministic projection from stored
+entity/tag metadata. It does not call a language model. For historical fact
+memories that need structured subject, predicate, object, temporal, scope, and
+modality fields, use the model-backed pass instead:
+
+```bash
+# Shadow mode, no database writes
+python -m remnant.model_backfill --home ~/.hermes/profiles/claire --home ~/.hermes --limit 20
+
+# Apply validated projections, preserving memories and writing audit entries
+python -m remnant.model_backfill --home ~/.hermes/profiles/claire --home ~/.hermes --batch-size 8 --yes
+```
+
+The model pass updates the unique claim projection in place, preserves claim
+status and reconciliation state, and records before/after claim rows under the
+`claim_model_backfill` audit action. It defaults to the configured extraction
+endpoint and model, so it can use the local Gemma deployment without changing
+Hermes configuration.
 
 **GLiNER entity extraction** is enabled by default when the `gliner` package is installed. No configuration needed — the model (`urchade/gliner_small_v2`) is downloaded automatically on first use from HuggingFace (no token required). If `gliner` is not installed, the regex extractor runs automatically.
 
@@ -507,11 +541,29 @@ python -m remnant.maintenance migrate-default-agent --agent claire --yes
 ```
 
 Run the scale-envelope harness separately from unit CI before changing the
-exact-vector ceiling:
+retrieval implementation:
 
 ```bash
 python -m remnant.evaluation.scale --sizes 5000 --probes 5 --output scale-report.json
 ```
+
+### Retrieval budgets and cache retention
+
+Semantic retrieval streams compact float32 vectors and keeps only the best
+candidates. `semantic_scan_limit: 0` searches every eligible memory, including
+old facts; a positive value explicitly caps the scan. Each semantic result must
+meet `min_semantic_score` and match the configured embedding model/dimensions.
+Foreground prefetch includes SQLite lock waits and scans in its time budget,
+reserving time for a keyword fallback. Query vectors use a bounded RAM cache;
+queued context is marked delivered only when Hermes consumes it.
+
+Extraction maintenance retries missing or incompatible vectors independently of
+vault file hashes. A changed note immediately loses its old vector if its new
+embedding fails. Maintenance retains at most `embedding_cache_max_entries`
+(default 10,000) document-cache entries for `embedding_cache_max_age_days`
+(default 30), flushes bounded telemetry in batches, and prunes old diagnostics.
+Echo retention also runs periodically. Raw turns and source memories are retained.
+SQLite reuses freed pages; these limits do not promise an immediate file shrink.
 
 ### Release-track claim resolution
 

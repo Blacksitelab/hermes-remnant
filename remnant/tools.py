@@ -11,7 +11,7 @@ Tools exposed to the agent:
   Every edit is audit-logged; nothing is ever deleted.
 - `memory_import`: bulk-import a memory source. Phase 4 supports
   ``source='vault'`` (Obsidian vault re-index). Phase 6 adds
-  ``source='memory_store'`` (MEMORY.md / USER.md across all Hermes profiles) and
+  ``source='memory_store'`` (the current profile's MEMORY.md / USER.md) and
   ``source='hindsight'`` (bounded broad-query recall from the Hindsight store).
   Both new sources support ``dry_run`` and ``shadow`` modes.
 """
@@ -33,9 +33,7 @@ from .recall import RecallRequest, RecallService
 from .reflect import memory_reflect
 from .threads import (
     create_thread,
-    list_threads,
     resolve_thread,
-    sweep_stale_threads,
     update_thread,
 )
 from .vault import index_vault
@@ -115,7 +113,9 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "visibility": {
                         "type": "string",
                         "enum": ["private", "shared", "fleet"],
-                        "description": "Who can see this memory.",
+                        "description": (
+                            "Legacy label within this profile; never grants cross-profile access."
+                        ),
                         "default": "private",
                     },
                 },
@@ -228,8 +228,8 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "Import memories from an existing store into Remnant. "
                 "source='vault' re-indexes the Obsidian vault (new/changed "
                 "notes become document memories; deleted notes are forgotten). "
-                "source='memory_store' parses MEMORY.md / USER.md across all "
-                "Hermes profiles (~/.hermes/profiles/*) into facts with "
+                "source='memory_store' parses the current profile's MEMORY.md / USER.md "
+                "into facts with "
                 "visibility heuristics (fleet/shared/private). "
                 "source='hindsight' issues a bounded set of broad recall "
                 "queries to the Hindsight store and dedups by content hash. "
@@ -362,7 +362,7 @@ def handle_tool_call(
     echo: Any | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call. Returns a tool-result dict for the agent."""
-    aid = agent_id or config.agent_id
+    aid = config.agent_id
     if tool_name == "memory_search":
         query = str(args.get("query", "")).strip()
         try:
@@ -518,7 +518,8 @@ def handle_tool_call(
             agent_id=aid,
             session_id=session_id,
         )
-        if echo is not None and action == "feedback" and args.get("memory_id"):
+        if (not result.get("error") and echo is not None
+            and action == "feedback" and args.get("memory_id")):
             try:
                 echo.record_feedback(
                     memory_id=str(args["memory_id"]),
@@ -540,6 +541,9 @@ def handle_tool_call(
         profile = args.get("profile")
         if profile is not None:
             profile = str(profile).strip() or None
+        if profile is not None and profile != aid:
+            return {"error": "imports are restricted to the current profile"}
+        profile = aid
         if source == "vault":
             force = bool(args.get("force", False))
             stats = index_vault(db, config, embedder, force=force)
@@ -568,6 +572,10 @@ def handle_tool_call(
         action = str(args.get("action", "")).strip().lower()
         if not action:
             return {"error": "action is required"}
+        if action in {"update", "resolve"}:
+            thread = db.get_thread(str(args.get("thread_id") or ""))
+            if thread is None or thread.get("added_by") != aid:
+                return {"error": "thread not found"}
         if action == "create":
             title = str(args.get("title", "")).strip()
             topic = str(args.get("topic", "")).strip()
@@ -633,10 +641,10 @@ def handle_tool_call(
                 limit = int(args.get("limit", 50))
             except (TypeError, ValueError):
                 limit = 50
-            threads = list_threads(db, status=status_filter, limit=limit)
+            threads = db.list_threads(status=status_filter, limit=limit, agent_id=aid)
             return {"threads": threads, "count": len(threads)}
         if action == "stale":
-            marked = sweep_stale_threads(db)
+            marked = db.sweep_stale_threads(agent_id=aid)
             return {"marked_stale": marked, "count": len(marked)}
         return {"error": f"unknown thread action: {action}"}
     return {"error": f"unknown tool: {tool_name}"}

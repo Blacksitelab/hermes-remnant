@@ -354,8 +354,7 @@ def test_candidate_selection_bounded_and_cross_agent(hermes_home: Path):
         recent = db.get_recent_memories(since_ts=time.time() - 3600)
         pairs = dream_mod._select_candidate_pairs(db, recent, mode="night")
         cross = [p for p in pairs if p["kind"] == "cross_agent"]
-        assert cross, "expected a cross_agent duplicate candidate"
-        assert cross[0]["sim"] >= 0.7
+        assert not cross, "cross-profile candidates must be excluded"
     finally:
         db.close()
 
@@ -405,7 +404,7 @@ def test_dream_cooldown_per_topic(monkeypatch, hermes_home: Path):
         _store_fact(db, emb, cfg, "Proxmox build server alpha",
                     agent="default", visibility="shared")
         _store_fact(db, emb, cfg, "Proxmox build server alpha beta",
-                    agent="other", visibility="shared")
+                    agent="default", visibility="shared")
         # Stub the cloud judgment: always return one 'connection' for the same
         # pair, so the second run within cooldown is suppressed.
         calls = {"n": 0}
@@ -466,7 +465,7 @@ def test_day_dream_merges_cross_agent_duplicates(monkeypatch, hermes_home: Path)
     from remnant import dream as dream_mod
 
     db = _open_db(hermes_home)
-    cfg = RemnantConfig(dream_day_budget=3)
+    cfg = RemnantConfig(agent_id="alice", dream_day_budget=3)
     emb = _fake_embed(db, cfg)
     try:
         mid_a = _store_fact(db, emb, cfg, "Sven owns the BlacksiteLab homelab",
@@ -489,16 +488,9 @@ def test_day_dream_merges_cross_agent_duplicates(monkeypatch, hermes_home: Path)
 
         monkeypatch.setattr(dream_mod, "_cloud_judge", fake_judge)
         res = day_dream(db, cfg, emb)
-        assert res["actions"] >= 1, "expected a merge action"
-        # Originals superseded; a new shared memory exists.
-        a = db.get_memory(mid_a)
-        b = db.get_memory(mid_b)
-        assert a["status"] == "superseded"
-        assert b["status"] == "superseded"
-        assert a["superseded_by"] == b["superseded_by"]
-        merged = db.get_memory(a["superseded_by"])
-        assert merged["visibility"] == "shared"
-        assert "BlacksiteLab" in merged["content"]
+        assert res["actions"] == 0
+        assert db.get_memory(mid_a)["status"] == "active"
+        assert db.get_memory(mid_b)["status"] == "active"
     finally:
         db.close()
 

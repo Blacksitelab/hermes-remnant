@@ -36,9 +36,10 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
+from .claims import claim_identity
 from .config import RemnantConfig
 from .db import RemnantDB
-from .embed import Embedder, cosine
+from .embed import Embedder
 from .entity import extract_and_link_entities
 from .ingest import is_transient
 
@@ -69,12 +70,7 @@ _DEFAULT_HINDSIGHT_QUERIES = (
 HINDSIGHT_QUERY_LIMIT = 25  # per-query result cap
 HINDSIGHT_TOTAL_CAP = 200   # hard cap on total imported rows
 
-# Cosine similarity at or above this between a candidate import/hindsight fact
-# and an existing active memory (in the same agent/visibility scope) is treated
-# as a semantic near-duplicate: the existing memory's seen_count is bumped and
-# no new row is inserted. Lower than the live-turn dedup_cosine_threshold
-# (0.92) because import/hindsight lines often differ by a trailing role label
-# or minor wording that still denotes the same durable fact.
+# Retained for API compatibility; similarity alone cannot establish equivalence.
 IMPORT_DEDUP_COSINE_THRESHOLD = 0.85
 # Cap on how many existing active memories we compare a candidate against, to
 # keep the import path bounded. Ordered by recency.
@@ -102,10 +98,15 @@ def discover_memory_store_entries(
     text line) stripped of surrounding whitespace. Headers, fenced code, and
     blank lines are skipped. Profiles without these files are skipped silently.
     """
-    profiles_root = Path(hermes_home) / "profiles"
-    if not profiles_root.is_dir():
+    home = Path(hermes_home)
+    profiles_root = home / "profiles"
+    if home.parent.name == "profiles":
+        directories = [home]
+    elif profiles_root.is_dir():
+        directories = sorted(profiles_root.iterdir(), key=lambda p: p.name)
+    else:
         return
-    for profile_dir in sorted(profiles_root.iterdir(), key=lambda p: p.name):
+    for profile_dir in directories:
         if not profile_dir.is_dir():
             continue
         profile = profile_dir.name
@@ -255,48 +256,18 @@ def find_semantic_duplicate(
     visibility: str | None,
     threshold: float = IMPORT_DEDUP_COSINE_THRESHOLD,
 ) -> dict[str, Any] | None:
-    """Return an existing active memory that is a semantic near-duplicate of
-    ``text``, or ``None`` when no match is found (or embedding is unavailable).
+    """Match normalized evidence only, preserving uncertain imported paraphrases.
 
-    The candidate's text is embedded via ``Embedder.embed()`` (cached, returns
-    ``None`` on failure — in which case we skip semantic comparison entirely).
-    We then load the most recent active memories in the same agent/visibility
-    scope (bounded by ``IMPORT_DEDUP_CANDIDATE_LIMIT``), fetch their stored
-    embeddings, and keep the one with the highest cosine similarity. If that
-    maximum is at least ``threshold`` (default 0.85), it is treated as a
-    duplicate: the caller bumps the existing memory's ``seen_count`` instead of
-    inserting a new row, mirroring the exact content-hash duplicate path.
+    The legacy name and threshold argument remain compatible with integrations;
+    the threshold no longer authorizes discarding a different fact or role.
     """
-    if embedder is None:
-        return None
-    new_vec = embedder.embed(text)
-    if not new_vec:
-        return None
-    recent = db.search_all_active(
-        agent_id=agent_id,
-        visibility=visibility,
-        limit=IMPORT_DEDUP_CANDIDATE_LIMIT,
-    )
-    if not recent:
-        return None
-    ids = [r["id"] for r in recent]
-    rows = db.search_by_embedding(ids, agent_id=agent_id, visibility=visibility)
-    best: dict[str, Any] | None = None
-    best_sim = 0.0
-    for r in rows:
-        vec = r.get("embedding") or []
-        if not vec:
-            continue
-        sim = cosine(new_vec, vec)
-        if sim > best_sim:
-            best_sim = sim
-            best = r
-    if best is not None and best_sim >= threshold:
-        log.debug(
-            "import semantic dedup (cos=%.3f): %s ~= %s",
-            best_sim, text, best.get("content"),
-        )
-        return best
+    identity = claim_identity("", text)
+    for row in db.search_all_active(
+        agent_id=agent_id, visibility=visibility, limit=IMPORT_DEDUP_CANDIDATE_LIMIT,
+    ):
+        if (row.get("agent_id") == agent_id and row.get("visibility") == visibility
+            and claim_identity("", row["content"]) == identity):
+            return row
     return None
 
 
@@ -342,8 +313,10 @@ def import_memory_store(
     }
     actor = config.agent_id
 
+    home = Path(hermes_home)
+    source_profile = home.name if home.parent.name == "profiles" else config.agent_id
     for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
-        if profile is not None and prof != profile:
+        if prof != (profile or source_profile):
             continue
         # Re-parse the single line through parse_memory_file so bullet markers
         # and inline markdown are stripped consistently with a full file.
@@ -359,7 +332,7 @@ def import_memory_store(
             vis = classify_visibility(entry, agent=prof)
             stats["visibility"][vis] += 1
             chash = _content_hash(entry)
-            existing = db.get_memory_by_content_hash(chash)
+            existing = db.get_memory_by_content_hash(chash, agent_id=actor)
             duplicate = existing is not None
             if not duplicate and not dry_run and not shadow:
                 # No exact-hash match: try a semantic near-duplicate check
@@ -446,19 +419,17 @@ def import_memory_store(
 # -- import: hindsight ------------------------------------------------------
 
 _HINDSIGHT_BASE_URL = os.environ.get("HINDSIGHT_BASE_URL", "http://localhost:9514")
-_HINDSIGHT_BANK_ID = os.environ.get("HINDSIGHT_BANK_ID", "hermes-claire")
 
 
-def _hindsight_recall(query: str, *, limit: int) -> list[dict[str, Any]]:
+def _hindsight_recall(query: str, *, limit: int, bank_id: str) -> list[dict[str, Any]]:
     """Call the Hindsight recall API via the Python client.
 
     Uses ``HindsightClient`` (the installed ``hindsight`` package's client class)
     to query the local Hindsight server. Returns a list of
     ``{"content": str, "type": str, "id": str}`` dicts.
 
-    The server URL and bank ID are configurable via ``HINDSIGHT_BASE_URL`` and
-    ``HINDSIGHT_BANK_ID`` env vars (defaults: ``http://localhost:9514`` and
-    ``hermes-claire``).
+    HINDSIGHT_BASE_URL configures the endpoint. The bank is supplied by the
+    provider as hermes-<profile>; a global environment override cannot join profiles.
     """
     try:
         from hindsight import HindsightClient  # type: ignore[import]
@@ -468,7 +439,7 @@ def _hindsight_recall(query: str, *, limit: int) -> list[dict[str, Any]]:
     try:
         client = HindsightClient(base_url=_HINDSIGHT_BASE_URL)
         resp = client.recall(
-            bank_id=_HINDSIGHT_BANK_ID,
+            bank_id=bank_id,
             query=query,
             max_tokens=4096,
         )
@@ -538,7 +509,9 @@ def import_hindsight(
 
     for q in qs:
         stats["queries"] += 1
-        rows = _hindsight_recall(q, limit=HINDSIGHT_QUERY_LIMIT)
+        rows = _hindsight_recall(
+            q, limit=HINDSIGHT_QUERY_LIMIT, bank_id=f"hermes-{actor}",
+        )
         for row in rows:
             stats["recalled"] += 1
             content = _extract_content(row)
@@ -557,7 +530,7 @@ def import_hindsight(
             seen_hashes.add(chash)
             stats["discovered"] += 1
 
-            existing = db.get_memory_by_content_hash(chash)
+            existing = db.get_memory_by_content_hash(chash, agent_id=actor)
             duplicate = existing is not None
             if not duplicate and not dry_run and not shadow:
                 # No exact-hash match: try a semantic near-duplicate check

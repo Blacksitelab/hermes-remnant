@@ -189,7 +189,7 @@ def resolve_results(
                 for item in items
             ]
             statuses = {str(item.get("claim_status") or "") for item in items}
-            if "unresolved" in statuses or "contradiction" in {
+            if statuses & {"unresolved", "contradicted"} or {"contradiction", "unresolved"} & {
                 str(item.get("conflict_type") or "") for item in items
             }:
                 winner["claim_status"] = "unresolved"

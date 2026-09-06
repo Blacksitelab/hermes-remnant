@@ -4,8 +4,7 @@ Implements the Hermes ``MemoryProvider`` ABC. Configuration stays profile-scoped
 under ``hermes_home`` (loaded from ``hermes_home/remnant.json``), but the SQLite
 database is **shared** across all profiles/agents at
 ``~/.hermes/remnant/remnant.db`` (overridable via ``REMNANT_DB_HOME``) so that
-cross-agent features — shared vault search, dream-loop dedup, entity-graph
-traversal — work without merging per-profile DBs. ``sync_turn`` is non-blocking:
+storage can be backed up centrally while provider access remains profile-owned. ``sync_turn`` is non-blocking:
 it persists the raw turn and enqueues extraction in a single SQLite
 transaction, then wakes the background worker.
 """
@@ -16,6 +15,7 @@ import hashlib
 import json
 import logging
 import re
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
@@ -51,7 +51,7 @@ from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
-__version__ = "0.2.2"
+__version__ = "0.3.0"
 
 
 class _SessionEmbedder:
@@ -71,6 +71,7 @@ class _SessionEmbedder:
         query_attempted: bool = False,
     ):
         self._embedder = embedder
+        self._model = getattr(embedder, "_model", None)
         self._query = query
         self._qvec: list[float] | None = qvec
         self._query_attempted = query_attempted
@@ -145,6 +146,8 @@ except Exception:  # pragma: no cover - fallback for standalone/test envs
 _SYSTEM_PROMPT_BLOCK = (
     "## Remnant Memory Provider\n"
     "You have durable long-term memory via the Remnant provider.\n"
+    "Memory access is restricted to this profile; shared/fleet labels do not grant "
+    "cross-profile access.\n"
     "Use the `memory_search` tool to recall facts (keyword, semantic, auto hybrid, "
     "or graph entity-traversal strategies). Pass `profile_scope` to restrict "
     "vault documents to a set of allowed path prefixes.\n"
@@ -159,7 +162,7 @@ _SYSTEM_PROMPT_BLOCK = (
     "forgotten. Excluded vault folders (90_*-95_*, 99_ARCHIVE) are skipped. Locked "
     "notes are indexed but their content is hidden from other agents in search.\n"
     "Use `memory_import` with `source='memory_store'` to import MEMORY.md / "
-    "USER.md bullets across all Hermes profiles (~/.hermes/profiles/*) as facts "
+    "USER.md bullets for the current Hermes profile as facts "
     "(confidence=0.9, trust_score=0.9) with fleet/shared/private visibility "
     "heuristics. Use `source='hindsight'` to issue a bounded set of broad recall "
     "queries to the Hindsight store and import unique results (trust_score=0.5). "
@@ -174,7 +177,7 @@ _SYSTEM_PROMPT_BLOCK = (
     "never deleted.\n"
     "A bounded dream loop (day_dream / night_dream, invokable from a cron timer) "
     "finds non-obvious connections across memories and writes reflections to a "
-    "private DREAMS.md diary; cross-agent duplicates are merged into shared "
+    "private DREAMS.md diary; same-profile duplicates may be consolidated into "
     "memory. The loop pre-filters candidates locally and only ever sends a small "
     "bounded list to the cloud model.\n"
 )
@@ -433,7 +436,8 @@ class RemnantMemoryProvider(MemoryProvider):
         # Phase 2: per-session injection + query-embedding caches.
         self._last_injected_hash: dict[str, str] = {}
         self._session_query_vec: dict[str, list[float]] = {}
-        self._session_query: dict[str, str] = {}
+        self._session_query: dict[str, tuple[str | None, str]] = {}
+        self._prefetch_pending: set[tuple] = set()
         self._queued_prefetch: OrderedDict[
             tuple[str, str, str, str, str, int], tuple[float, dict[str, Any]]
         ] = OrderedDict()
@@ -513,7 +517,8 @@ class RemnantMemoryProvider(MemoryProvider):
         self._worker.queue_startup_sweep()
         self._worker.wake()
         self._started = True
-        log.info("remnant initialized (home=%s, session=%s)", self._hermes_home, self._session_id)
+        log.info("remnant %s initialized (profile=%s, home=%s, session=%s)",
+                 __version__, self._config.agent_id, self._hermes_home, self._session_id)
 
     def shutdown(self) -> None:
         try:
@@ -559,7 +564,7 @@ class RemnantMemoryProvider(MemoryProvider):
         if self._db is None or self._config is None or self._embedder is None:
             return json.dumps({"error": "provider not initialized"})
         session_id = kwargs.get("session_id", self._session_id)
-        agent_id = kwargs.get("agent_id", self._config.agent_id)
+        agent_id = self._config.agent_id
         result = handle_tool_call(
             tool_name,
             args,
@@ -649,7 +654,7 @@ class RemnantMemoryProvider(MemoryProvider):
             query_hash,
             profile_hash,
             cfg.embed_model if cfg is not None else "",
-            self._memory_generation,
+            self._memory_generation + (self._db.memory_generation if self._db else 0),
         )
 
     def _invalidate_prefetch(self) -> None:
@@ -691,99 +696,141 @@ class RemnantMemoryProvider(MemoryProvider):
     # -- prefetch (Phase 2) ---------------------------------------------------
 
     def _session_embedder(
-        self,
-        session_id: str,
-        query: str,
-        *,
-        timeout_s: float | None = None,
+        self, session_id: str, query: str, *, timeout_s: float | None = None,
     ) -> _SessionEmbedder | None:
-        """Return an embedder wrapper that caches the query vector per session.
-
-        Computes the single Ollama query embedding once (the only network call
-        in prefetch) and reuses it for every expanded query term in this
-        session. Returns None if the provider isn't initialized.
-        """
         if self._embedder is None or self._config is None:
             return None
-        cached = self._session_query_vec.get(session_id)
+        key = (getattr(self._embedder, "_model", None), query)
+        with self._prefetch_lock:
+            if self._session_query.get(session_id) != key:
+                self._session_query_vec.pop(session_id, None)
+                self._session_query[session_id] = key
+            cached = self._session_query_vec.get(session_id)
         if cached is None:
             try:
+                embed = getattr(self._embedder, "embed_query", self._embedder.embed)
                 try:
-                    cached = self._embedder.embed(query, timeout=timeout_s)
+                    cached = embed(query, timeout=timeout_s)
                 except TypeError:
-                    # Keep compatibility with lightweight test/custom
-                    # embedders that expose only embed(text).
-                    cached = self._embedder.embed(query)
+                    cached = embed(query)
             except Exception:
                 cached = None
-            if cached:
-                self._session_query_vec[session_id] = cached
-        # When embed() returned None (remote failure), pass None as the cached
-        # qvec so _SessionEmbedder.embed propagates None and semantic search is
-        # skipped instead of scoring against a zero vector.
-        return _SessionEmbedder(
-            self._embedder,
-            query,
-            qvec=cached,
-            query_attempted=True,
-        )
+            with self._prefetch_lock:
+                # A concurrent foreground/background query cannot overwrite its successor.
+                if cached and self._session_query.get(session_id) == key:
+                    self._session_query_vec[session_id] = cached
+                while len(self._session_query) > max(1, self._config.prefetch_cache_max_entries):
+                    oldest = next(iter(self._session_query))
+                    self._session_query.pop(oldest, None)
+                    self._session_query_vec.pop(oldest, None)
+        return _SessionEmbedder(self._embedder, query, qvec=cached, query_attempted=True)
 
     def prefetch(
         self, query: str, *, session_id: str = "",
         messages: list[dict[str, Any]] | None = None,
     ) -> str:
-        """Proactive memory injection before an LLM call.
-
-        Hermes' ``MemoryProvider`` contract requires formatted text, not a
-        structured payload. Internal diagnostics remain in ``prefetch.py``;
-        only the safe context string crosses the provider boundary.
-        """
+        """Return safe context within the foreground database/retrieval budget."""
         if self._db is None or self._config is None or self._embedder is None:
             return ""
+        started = time.monotonic()
         sid = session_id or self._session_id or "default"
-        # Reset the per-session query-vector cache when the query changes so a
-        # new query re-embeds; an identical query reuses the cached vector.
-        if self._session_query.get(sid) != query:
-            old_query = self._session_query.get(sid)
-            self._session_query.pop(sid, None)
-            self._session_query_vec.pop(sid, None)
-            self._session_query[sid] = query
-            if old_query is not None:
-                with self._prefetch_lock:
-                    self._queued_prefetch.pop(self._prefetch_key(old_query, sid), None)
-        key = self._prefetch_key(query, sid)
-        queued = self._take_queued_prefetch(key)
-        if queued is not None:
-            return self._consume_prefetch_result(queued)
-        result = _run_prefetch(self, query, sid, messages=messages)
-        return self._consume_prefetch_result(result)
+        diagnostics: dict[str, Any] = {}
+        result: dict[str, Any] = {}
+        context = ""
+        try:
+            until = started + self._config.injection_prefetch_deadline_ms / 1000.0
+            with self._db.deadline(until):
+                key = self._prefetch_key(query, sid)
+                queued = self._take_queued_prefetch(key)
+                if queued and messages:
+                    from .recall import _dedup_against_messages
+
+                    items = queued.get("memories", [])
+                    if len(_dedup_against_messages(items, messages)) != len(items):
+                        queued = None
+                if queued is not None:
+                    result = queued
+                    diagnostics.update(result.get("_diagnostics", {}))
+                else:
+                    result = _run_prefetch(self, query, sid, messages=messages,
+                                           diagnostics=diagnostics)
+                if key == self._prefetch_key(query, sid):
+                    context = self._consume_prefetch_result(result)
+                else:
+                    diagnostics["reason"] = "evidence_changed"
+        except (TimeoutError, sqlite3.Error):
+            diagnostics["reason"] = "deadline"
+        self._db.record_prefetch(
+            sid, "injected" if context else "empty",
+            reason=(diagnostics.get("reason") if context
+                    else diagnostics.get("reason") or "suppressed"),
+            elapsed_ms=(time.monotonic() - started) * 1000.0,
+            result_count=len(result.get("memories", [])) if context else 0,
+            token_estimate=int(result.get("token_estimate", 0)) if context else 0,
+            query=query, agent_id=self._config.agent_id,
+        )
+        return context
 
     def _consume_prefetch_result(self, result: dict[str, Any]) -> str:
-        """Activate Echo only when context is actually returned to Hermes."""
+        """Suppress repeats and activate Echo only at actual context delivery."""
         context = str(result.get("context") or "")
+        if not context:
+            return ""
+        sid = str(result.get("session_id") or self._session_id or "default")
+        digest = hashlib.sha256(context.encode("utf-8")).hexdigest()
+        with self._prefetch_lock:
+            if self._last_injected_hash.get(sid) == digest:
+                return ""
+            self._last_injected_hash[sid] = digest
+            while len(self._last_injected_hash) > 32:
+                self._last_injected_hash.pop(next(iter(self._last_injected_hash)))
         draft = result.get("_echo_draft")
-        if context and draft is not None and self._echo is not None:
-            self._echo.activate_receipt(draft)
+        if draft is not None and self._echo is not None:
+            try:
+                self._echo.activate_receipt(draft)
+            except (TimeoutError, sqlite3.Error):
+                # Optional attribution cannot discard already-compiled evidence.
+                pass
         return context
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Compute the next-turn recall off the response critical path."""
+        """Coalesce bounded background work; never mark context delivered here."""
         if self._db is None or self._config is None or self._embedder is None:
             return
         sid = session_id or self._session_id or "default"
-        key = self._prefetch_key(query, sid)
+        try:
+            with self._db.deadline(time.monotonic() + 0.01):
+                key = self._prefetch_key(query, sid)
+        except (TimeoutError, sqlite3.Error):
+            return
+        with self._prefetch_lock:
+            if (key in self._queued_prefetch
+                or any(pending[1] == sid for pending in self._prefetch_pending)
+                or len(self._prefetch_pending) >= max(1, self._config.prefetch_cache_max_entries)):
+                return
+            self._prefetch_pending.add(key)
 
         def run() -> None:
+            diagnostics: dict[str, Any] = {}
             try:
-                result = _run_prefetch(self, query, sid)
+                until = time.monotonic() + self._config.injection_prefetch_deadline_ms / 1000.0
+                with self._db.deadline(until):
+                    result = _run_prefetch(self, query, sid, diagnostics=diagnostics)
+                    if self._prefetch_key(query, sid) == key:
+                        result["_diagnostics"] = diagnostics
+                        self._store_queued_prefetch(key, result)
             except Exception:
-                log.warning("queued prefetch failed", exc_info=True)
-                result = {}
-            if self._prefetch_key(query, sid) == key:
-                self._store_queued_prefetch(key, result)
+                log.debug("queued prefetch skipped", exc_info=True)
+            finally:
+                with self._prefetch_lock:
+                    self._prefetch_pending.discard(key)
 
         if self._prefetch_executor is not None:
-            self._prefetch_executor.submit(run)
+            try:
+                self._prefetch_executor.submit(run)
+            except RuntimeError:
+                with self._prefetch_lock:
+                    self._prefetch_pending.discard(key)
         else:
             run()
 
@@ -932,13 +979,14 @@ class RemnantMemoryProvider(MemoryProvider):
     ) -> dict[str, Any]:
         """Import memories from an existing store.
 
-        ``source`` is ``"memory_store"`` (MEMORY.md / USER.md across all Hermes
-        profiles), ``"hindsight"`` (bounded broad-query recall), or ``"vault"``
+        ``source`` is ``"memory_store"`` (the current profile's MEMORY.md / USER.md), ``"hindsight"`` (bounded broad-query recall), or ``"vault"``
         (delegates to ``reindex_vault``). Returns a stats dict. Safe to call
         from an external cron/timer.
         """
         if self._db is None or self._config is None or self._embedder is None:
             return {"error": "provider not initialized"}
+        if profile is not None and profile != self._config.agent_id:
+            return {"error": "imports are restricted to the current profile"}
         if source == "vault":
             return self.reindex_vault()
         if source not in ("memory_store", "hindsight"):

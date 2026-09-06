@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - profile isolation and retrieval efficiency
+
+- Enforce profile ownership across search, context, graph, imports, threads,
+  feedback, vault indexing, dreams, and model-backed claim backfill. Legacy
+  visibility labels no longer grant cross-profile access.
+- Migrate vault mappings to schema 16 with profile/path keys; preserve source
+  rows and existing owners. Include the profile in runtime identity v2.
+- Preserve high-similarity corrections and uncertain paraphrases; retain
+  duplicate observation provenance and reject unsupported duplicate labels.
+- Stream float32 vectors over the full eligible corpus, filter incompatible
+  vectors and low-scoring results, and bound prefetch database work by time.
+- Bound query caches and queued work, invalidate on committed evidence changes,
+  and suppress repeated context only after delivery.
+- Clear stale embeddings on content changes and retry missing derived vectors;
+  periodically compact disposable caches, diagnostics, and Echo data.
+- Preserve and test the existing model-backfill utility from BSL-AI.
+- Isolate test diaries and correct scale benchmark dimensions and measurements.
+
 ## 0.2.2 - faster extraction
 
 ### Changed

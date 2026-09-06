@@ -75,7 +75,8 @@ def graph_traverse(
         profile_scope=profile_scope,
         evidence_only=evidence_only,
     )
-    seed = db.get_entity(eid)
+    seed_row = db.get_entity(eid) if result["entities"] else None
+    seed = {key: seed_row.get(key) for key in ("id", "name", "type")} if seed_row else None
     return {
         "entity": seed,
         "entities": result["entities"],

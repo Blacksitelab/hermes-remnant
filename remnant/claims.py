@@ -8,6 +8,7 @@ discarded or aggressively parsed.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import datetime, timezone
 from typing import Any
@@ -44,6 +45,36 @@ def _normalise_value(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "").casefold().strip(" .!?"))
 
 
+def claim_identity(subject: str, fact: str, data: dict[str, Any] | None = None) -> tuple:
+    """Conservative equivalence: similarity alone never proves identical evidence."""
+    data = data or {}
+    predicate, object_value = _claim_parts(subject, fact)
+    qualifiers = data.get("qualifiers") or {}
+    if isinstance(qualifiers, str):
+        qualifiers = json.loads(qualifiers)
+    qualifiers = dict(qualifiers)
+    if data.get("conditions"):
+        qualifiers["conditions"] = data["conditions"]
+    return (
+        _normalise_value(subject),
+        _normalise_value(data.get("predicate") or predicate),
+        _normalise_value(data.get("object") or object_value),
+        json.dumps(qualifiers, sort_keys=True, default=str).casefold(),
+        *(str(data.get(key) or "").casefold() for key in (
+            "scope_type", "scope_value", "valid_from", "valid_to", "event_at",
+        )),
+        str(data.get("modality") or "asserted").casefold(),
+    )
+
+
+def _explicit_correction(fact: str, data: dict[str, Any]) -> bool:
+    pattern = r"\b(switched|changed|updated|now prefers?|no longer|instead of|correction)\b"
+    return bool(re.search(pattern, fact, re.I) or (
+        data.get("source_single_fact")
+        and re.search(pattern, str(data.get("source_user_text") or ""), re.I)
+    ))
+
+
 def classify_claim_conflict(
     *,
     fact: str,
@@ -58,6 +89,17 @@ def classify_claim_conflict(
     silently superseded.
     """
     supplied = str((claim_data or {}).get("conflict_type") or "").lower().strip()
+    data = claim_data or {}
+    if (existing is not None and not data.get("conditions") and not data.get("scope_type")
+        and _explicit_correction(fact, data)):
+        _, inferred = _claim_parts(existing["subject"], fact)
+        if _normalise_value(data.get("object") or inferred) != _normalise_value(existing["object"]):
+            return "update"
+    if supplied == "duplicate" and existing is not None:
+        if claim_identity(existing["subject"], fact, claim_data) != claim_identity(
+            existing["subject"], "", existing,
+        ):
+            return "unresolved"
     if supplied in {
         "update", "contradiction", "conditional", "compatible", "duplicate", "unresolved"
     }:
@@ -68,7 +110,11 @@ def classify_claim_conflict(
     _, new_object = _claim_parts(str(existing.get("subject") or ""), fact)
     new = _normalise_value(new_object)
     if old == new:
-        return "duplicate"
+        if claim_identity(existing["subject"], fact, claim_data) == claim_identity(
+            existing["subject"], "", existing,
+        ):
+            return "duplicate"
+        return "conditional" if (claim_data or {}).get("conditions") else "unresolved"
     if re.search(
         r"\b(switched|changed|updated|now prefer|no longer|instead of|from .+ to)\b",
         fact,
@@ -127,13 +173,7 @@ def record_claim_from_memory(
         "verified": bool(data.get("verified")),
         "trust_score": data.get("trust_score"),
         "seen_count": data.get("seen_count", 1),
-        "explicit_correction": bool(
-            re.search(
-                r"\b(switched|changed|updated|now prefer|no longer|instead of|from .+ to)\b",
-                fact,
-                re.I,
-            )
-        ),
+        "explicit_correction": _explicit_correction(fact, data),
     }
     decision = decide_reconciliation(
         conflict_type=conflict_type,
@@ -155,7 +195,9 @@ def record_claim_from_memory(
     conditions = data.get("conditions")
     if conditions:
         qualifiers["conditions"] = conditions
-    status = "contradicted" if contradicted or conflict_type == "contradiction" else "active"
+    status = "contradicted" if (
+        (contradicted and conflict_type != "update") or conflict_type == "contradiction"
+    ) else "active"
     resolution_status = "contradicted" if status == "contradicted" else conflict_type
     claim_id = db.create_claim(
         memory_id=memory_id,
