@@ -40,11 +40,12 @@ def test_context_budget_prefers_complete_evidence_across_classes():
 
 def test_scale_benchmark_is_reproducible_and_isolated(tmp_path: Path):
     report = benchmark_scale(sizes=(20,), work_dir=tmp_path, probes=2, seed=7)
-    assert report["benchmark"] == "remnant-scale-envelope-v1"
+    assert report["benchmark"] == "remnant-scale-envelope-v2"
     assert report["configuration"]["seed"] == 7
     store = report["stores"][0]
     assert store["size"] == 20
     assert store["embedding_rows"] == 18
+    assert store["eligible_embedding_rows"] == 2
     assert store["recall_at_5"] == 1.0
     assert store["exact_vector_ms"]["p95"] >= store["exact_vector_ms"]["p50"]
     assert (tmp_path / "scale-20.db").is_file()

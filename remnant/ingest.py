@@ -15,10 +15,10 @@ import logging
 import re
 from typing import Any
 
-from .claims import record_claim_from_memory
+from .claims import claim_identity, record_claim_from_memory
 from .config import RemnantConfig
 from .db import RemnantDB
-from .embed import Embedder, cosine
+from .embed import Embedder
 from .entity import link_memory_entities
 
 log = logging.getLogger("remnant.ingest")
@@ -189,25 +189,25 @@ def store_memory(
     if not fact or is_transient(fact, allow_temporal=allow_temporal):
         return None
 
-    # Dedup: BM25 candidates, then text-normalization + cosine similarity.
+    # Preserve uncertain paraphrases and competing values. Embedding similarity
+    # is not evidence that polarity, conditions, or claim objects are identical.
     candidates = db.candidate_facts(fact, agent_id=agent_id, limit=config.dedup_candidates)
-    if candidates:
-        norm = _normalize(fact)
-        for c in candidates:
-            # Cheap text near-dup first (no embedding work needed).
-            if norm == _normalize(c.get("content", "")):
-                log.debug("dedup (text): %s ~= %s", fact, c["content"])
-                return None
-        # Then cosine on embeddings for semantic near-dup.
-        new_vec = embedder.embed(fact) if embedder else None
-        if new_vec:
-            for c in candidates:
-                existing_vec = c.get("embedding", []) or []
-                if existing_vec:
-                    sim = cosine(new_vec, existing_vec)
-                    if sim >= config.dedup_cosine_threshold:
-                        log.debug("dedup (cos=%.3f): %s ~= %s", sim, fact, c["content"])
-                        return None
+    claims = db.get_claims_for_memories([c["id"] for c in candidates])
+    identity = claim_identity(entity, fact, claim_data)
+    for candidate in candidates:
+        if candidate["visibility"] != visibility:
+            continue
+        previous = claims.get(candidate["id"])
+        same = identity == claim_identity(
+            (previous or {}).get("subject") or entity, candidate["content"], previous,
+        )
+        explicit_change = (claim_data or {}).get("conflict_type") in {
+            "update", "contradiction", "unresolved",
+        }
+        if same and not explicit_change and not detect_contradiction(fact, candidate["content"]):
+            db.record_duplicate(candidate["id"], source_turn_id=source_turn_id,
+                                session_id=session_id, agent_id=agent_id)
+            return None
 
     # Contradiction detection: compare against existing active memories
     # that share an entity with this fact. Flag both via metadata, do not

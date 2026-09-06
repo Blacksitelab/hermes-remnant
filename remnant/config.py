@@ -68,7 +68,7 @@ DREAM_TOP_K = 5
 DREAM_CONNECT_THRESHOLD = 0.6
 DREAM_DEDUP_THRESHOLD = 0.7
 
-# Cosine similarity above this => duplicate memory
+# Retained for config compatibility; similarity alone no longer discards facts.
 DEDUP_COSINE_THRESHOLD = 0.85
 # BM25 candidate count when checking duplicates
 DEDUP_CANDIDATES = 8
@@ -90,10 +90,9 @@ DEFAULT_PREFETCH_ENABLED = True
 # prefetch().  The remainder of the 500ms prefetch budget is kept for local
 # search, formatting, and SQLite diagnostics.
 DEFAULT_PREFETCH_EMBEDDING_TIMEOUT_MS = 250
-# Upper bound for the local exact-vector scan. The default covers a personal
-# or small fleet store while keeping retrieval predictable; use an ANN index
-# once the corpus grows beyond this operational ceiling.
-SEMANTIC_SCAN_LIMIT = 5_000
+# Optional vector count cap. Zero scans all eligible evidence with compact
+# streaming; foreground prefetch uses an elapsed-time deadline.
+SEMANTIC_SCAN_LIMIT = 0  # Complete corpus; prefetch is bounded by elapsed time instead.
 # Minimum cosine similarity for semantic/auto results. Top semantic score below
 # this => no strong matches; for ``auto`` strategy we still fall back to BM25.
 MIN_SEMANTIC_SCORE = 0.3
@@ -184,6 +183,8 @@ class RemnantConfig:
     embed_model: str = DEFAULT_EMBED_MODEL
     embed_dim: int = EMBED_DIM
     embed_timeout: float = 30.0
+    embedding_cache_max_entries: int = 10_000
+    embedding_cache_max_age_days: int = 30
     # Ollama model residency must be finite: extraction and embedding share a
     # host and an indefinitely pinned model can starve the other workload.
     embed_keep_alive: str | int | float = DEFAULT_EMBED_KEEP_ALIVE
@@ -402,17 +403,20 @@ def config_path(hermes_home: str | Path) -> Path:
 
 
 def load_config(hermes_home: str | Path) -> RemnantConfig:
-    """Load config from `<hermes_home>/remnant.json`, falling back to defaults."""
-    p = config_path(hermes_home)
-    if p.is_file():
-        try:
-            with open(p, encoding="utf-8") as fh:
-                data = json.load(fh)
-            if isinstance(data, dict):
-                return RemnantConfig.from_dict(data)
-        except (OSError, json.JSONDecodeError):
-            pass
-    return RemnantConfig()
+    """Load config, binding named Hermes profiles to their own storage identity."""
+    home = Path(hermes_home).expanduser()
+    config = RemnantConfig()
+    try:
+        data = json.loads(config_path(home).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            config = RemnantConfig.from_dict(data)
+    except (OSError, json.JSONDecodeError):
+        pass
+    if home.parent.name == "profiles":
+        config.agent_id = home.name
+    if config.diary_path == DEFAULT_DREAM_DIARY_PATH:
+        config.diary_path = str(home / "remnant" / "DREAMS.md")
+    return config
 
 
 def save_config(values: dict[str, Any], hermes_home: str | Path) -> Path:

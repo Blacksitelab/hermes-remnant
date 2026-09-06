@@ -1,0 +1,68 @@
+{
+  "release": "0.3.0",
+  "baseline_commit": "142aff3d7893e0771debfe63d8fbb75d6d7ad0b5",
+  "benchmark": {
+    "rows": 5000,
+    "dimensions": 768,
+    "probes": 7,
+    "embedding": "instant deterministic stub",
+    "timings_without_tracemalloc": true,
+    "top100_ids_and_scores_identical": true,
+    "before": {
+      "semantic_ms": 386.686,
+      "provider_prefetch_ms": 423.726,
+      "python_scoring_peak_mib": 135.851
+    },
+    "after": {
+      "semantic_ms": 235.035,
+      "provider_prefetch_ms": 248.452,
+      "python_scoring_peak_mib": 0.54
+    }
+  },
+  "tests": {
+    "passed": 443
+  },
+  "evaluation": {
+    "leadership-retrieval": {
+      "cases": 240,
+      "recall_at_5": 1.0,
+      "context_precision": 1.0,
+      "stale_claim_exposure": 0
+    },
+    "leadership-context": {
+      "cases": 240,
+      "recall_at_5": 1.0,
+      "context_precision": 1.0,
+      "stale_claim_exposure": 0
+    },
+    "heldout-retrieval": {
+      "cases": 120,
+      "recall_at_5": 1.0,
+      "context_precision": 1.0,
+      "stale_claim_exposure": 0
+    },
+    "heldout-context": {
+      "cases": 120,
+      "recall_at_5": 1.0,
+      "context_precision": 1.0,
+      "stale_claim_exposure": 0
+    }
+  },
+  "staged_live_validation": {
+    "python": "3.11.15",
+    "schema": 16,
+    "memories_preserved": 6223,
+    "source_fingerprint_unchanged": true,
+    "claire_context_nonempty": true,
+    "other_profiles_context_empty": [
+      "margaret",
+      "sasha",
+      "yuki",
+      "default"
+    ],
+    "real_model_correction_visible": true,
+    "low_confidence_correction": "retained as explicitly unresolved competing evidence",
+    "missing_embeddings_repaired_on_copy": 8,
+    "production_database_modified": false
+  }
+}

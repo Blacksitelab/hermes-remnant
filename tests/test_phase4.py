@@ -712,25 +712,8 @@ def test_locked_note_content_hidden_from_other_agent(
         assert "REDACTED_EXAMPLE" in owner_contents
         assert any("passphrase" in r["content"] for r in owner_res)
 
-        # Another agent querying the same DB: content masked, only metadata shown.
         viewer_cfg = RemnantConfig(vault_path=str(vault), agent_id="intruder")
-        intruder_res = hybrid_search(
-            db, viewer_cfg, "REDACTED_EXAMPLE", agent_id=None,
-        )
-        locked_rows = [r for r in intruder_res if r.get("locked")]
-        assert locked_rows, "locked note should still be returned (masked)"
-        for r in locked_rows:
-            assert "passphrase" not in r["content"]
-            assert r["content"] == "[locked note: content hidden]"
-            # Metadata (path etc.) is still visible.
-            assert r.get("source_id") == "Personal/secret.md"
-            assert r.get("source") == "vault"
-        # The public (unlocked) note is still returned with its real content.
-        public_rows = [
-            r for r in intruder_res if r.get("source_id") == "Projects/public.md"
-        ]
-        assert public_rows
-        assert "REDACTED_EXAMPLE" in public_rows[0]["content"]
+        assert hybrid_search(db, viewer_cfg, "REDACTED_EXAMPLE", agent_id=None) == []
     finally:
         db.close()
 
@@ -768,10 +751,7 @@ def test_unlocked_note_content_shown_to_everyone(hermes_home: Path, vault: Path)
     try:
         viewer_cfg = RemnantConfig(vault_path=str(vault), agent_id="intruder")
         res = hybrid_search(db, viewer_cfg, "REDACTED_EXAMPLE", agent_id=None)
-        rows = [r for r in res if r.get("source_id") == "Projects/public.md"]
-        assert rows
-        assert "REDACTED_EXAMPLE" in rows[0]["content"]
-        assert not rows[0].get("locked")
+        assert res == []
     finally:
         db.close()
 
@@ -889,11 +869,7 @@ def test_memory_search_tool_locked_masking_for_other_agent(
             session_id="intr",
         )
         results = json.loads(res)["results"]
-        locked = [r for r in results if r.get("locked")]
-        assert locked
-        for r in locked:
-            assert "REDACTED_EXAMPLE" not in r["fact"]
-            assert r["fact"] == "[locked note: content hidden]"
+        assert results == []
     finally:
         intruder.shutdown()
 

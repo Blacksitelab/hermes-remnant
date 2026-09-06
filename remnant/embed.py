@@ -13,7 +13,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import threading
 import time
+from collections import OrderedDict
 
 import httpx
 
@@ -50,6 +52,9 @@ class Embedder:
         self._model = config.embed_model
         self._url = config.embed_url
         self._timeout = config.embed_timeout
+        self._dim = config.embed_dim
+        self._query_cache: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+        self._cache_lock = threading.Lock()
         self._keep_alive = getattr(config, "embed_keep_alive", "10m")
         self._client = httpx.Client(timeout=self._timeout)
 
@@ -68,14 +73,14 @@ class Embedder:
             text = text[:2500]
         text_hash = _hash(text)
         cached = self._db.get_cached_embedding(self._model, text_hash)
-        if cached is not None:
+        if cached is not None and self._valid(cached):
             self._db.record_operation(
                 "embedding", "cache_hit", input_units=len(text), output_units=len(cached)
             )
             return cached
         started = time.perf_counter()
         vec = self._embed_remote(text, timeout=timeout)
-        if vec is None:
+        if not self._valid(vec):
             self._db.record_operation(
                 "embedding",
                 "failure",
@@ -91,6 +96,33 @@ class Embedder:
             output_units=len(vec),
         )
         self._db.put_cached_embedding(self._model, text_hash, vec)
+        return vec
+
+    def _valid(self, vec: list[float] | None) -> bool:
+        return bool(vec) and (
+            len(vec) == getattr(self, "_dim", len(vec))
+            and all(math.isfinite(value) for value in vec)
+            and any(value != 0 for value in vec)
+        )
+
+    def embed_query(self, text: str, *, timeout: float | None = None) -> list[float] | None:
+        """Bound query reuse in RAM; one-off questions never enter the persistent cache."""
+        if not hasattr(self, "_query_cache"):
+            # Custom embedders used by integrations may override only embed().
+            return self.embed(text)
+        key = (self._model, text[:2500])
+        with self._cache_lock:
+            if key in self._query_cache:
+                self._query_cache.move_to_end(key)
+                return self._query_cache[key]
+        vec = self._embed_remote(key[1], timeout=timeout)
+        if not self._valid(vec):
+            return None
+        with self._cache_lock:
+            self._query_cache[key] = vec
+            self._query_cache.move_to_end(key)
+            while len(self._query_cache) > 128:
+                self._query_cache.popitem(last=False)
         return vec
 
     def _embed_remote(self, text: str, *, timeout: float | None = None) -> list[float] | None:
@@ -111,8 +143,9 @@ class Embedder:
             )
             resp.raise_for_status()
             data = resp.json()
-            return [float(x) for x in data["embedding"]]
-        except (httpx.HTTPError, KeyError, ValueError) as e:
+            vector = [float(x) for x in data["embedding"]]
+            return vector if self._valid(vector) else None
+        except (httpx.HTTPError, KeyError, ValueError, TypeError, OverflowError) as e:
             log.warning("embedding request failed: %s", e)
             return None
 

@@ -10,25 +10,27 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import struct
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from .scope import normalize_profile_scope
+from .scope import VISIBILITY_ORDER, normalize_profile_scope
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
-# agents so cross-agent features (shared vault search, dream-loop dedup,
-# graph traversal) work without merging per-profile DBs. The location can be
-# overridden via the REMNANT_DB_HOME env var (used by tests for isolation).
+# agents. Provider APIs enforce ownership; only operator APIs allow unscoped
+# reads. REMNANT_DB_HOME overrides the file location (also used by tests).
 DEFAULT_DB_HOME = Path("~/.hermes/remnant").expanduser()
 DB_FILENAME = "remnant.db"
 
@@ -210,22 +212,25 @@ CREATE INDEX IF NOT EXISTS idx_audit_memory ON audit_log(memory_id);
 CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
 
 CREATE TABLE IF NOT EXISTS vault_files (
-    path TEXT PRIMARY KEY,
+    agent TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL,
     hash TEXT NOT NULL,
     memory_id TEXT,
-    indexed_at TEXT NOT NULL
+    indexed_at TEXT NOT NULL,
+    PRIMARY KEY(agent, path)
 );
 CREATE INDEX IF NOT EXISTS idx_vault_hash ON vault_files(hash);
 CREATE INDEX IF NOT EXISTS idx_vault_memory ON vault_files(memory_id);
 
 CREATE TABLE IF NOT EXISTS vault_passages (
+    agent TEXT NOT NULL DEFAULT '',
     path TEXT NOT NULL,
     ordinal INTEGER NOT NULL,
     memory_id TEXT NOT NULL,
     heading_path TEXT,
     start_offset INTEGER,
     end_offset INTEGER,
-    PRIMARY KEY(path, ordinal),
+    PRIMARY KEY(agent, path, ordinal),
     FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_vault_passages_memory ON vault_passages(memory_id);
@@ -500,6 +505,8 @@ END;
 
 
 def _pack_embedding(vec: list[float]) -> bytes:
+    if not vec or not all(math.isfinite(value) for value in vec):
+        raise ValueError("embedding must contain finite values")
     return struct.pack(f"<{len(vec)}f", *vec)
 
 
@@ -527,6 +534,9 @@ class RemnantDB:
         # with check_same_thread=False. WAL helps *separate connections*;
         # this lock protects the provider's single shared connection.
         self._lock = threading.RLock()
+        self._deadline: ContextVar[float | None] = ContextVar("remnant_deadline", default=None)
+        self._diagnostics: deque[tuple[str, tuple[Any, ...]]] = deque(maxlen=2048)
+        self._diagnostics_lock = threading.Lock()
         self._conn = self._open()
         self._migrate()
 
@@ -551,6 +561,55 @@ class RemnantDB:
             cur.executescript(_SCHEMA)
             cur.executescript(_FTS_TRIGGERS)
             self._apply_migrations(cur)
+            vault_columns = {row["name"] for row in cur.execute("PRAGMA table_info(vault_files)")}
+            if "agent" not in vault_columns:
+                # Preserve every legacy mapping under its backing memory's owner.
+                cur.executescript("""
+                    BEGIN IMMEDIATE;
+                    CREATE TABLE vault_files_v16 (
+                        agent TEXT NOT NULL DEFAULT '', path TEXT NOT NULL, hash TEXT NOT NULL,
+                        memory_id TEXT, indexed_at TEXT NOT NULL, PRIMARY KEY(agent,path));
+                    INSERT INTO vault_files_v16
+                        SELECT COALESCE(m.agent,''),v.path,v.hash,v.memory_id,v.indexed_at
+                        FROM vault_files v LEFT JOIN memories m ON m.id=v.memory_id;
+                    CREATE TABLE vault_passages_v16 (
+                        agent TEXT NOT NULL DEFAULT '', path TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        memory_id TEXT NOT NULL, heading_path TEXT, start_offset INTEGER,
+                        end_offset INTEGER, PRIMARY KEY(agent,path,ordinal),
+                        FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE);
+                    INSERT INTO vault_passages_v16
+                        SELECT COALESCE(m.agent,''),v.path,v.ordinal,v.memory_id,
+                               v.heading_path,v.start_offset,v.end_offset
+                        FROM vault_passages v LEFT JOIN memories m ON m.id=v.memory_id;
+                    DROP TABLE vault_files;
+                    DROP TABLE vault_passages;
+                    ALTER TABLE vault_files_v16 RENAME TO vault_files;
+                    ALTER TABLE vault_passages_v16 RENAME TO vault_passages;
+                    CREATE INDEX idx_vault_hash ON vault_files(hash);
+                    CREATE INDEX idx_vault_memory ON vault_files(memory_id);
+                    CREATE INDEX idx_vault_passages_memory ON vault_passages(memory_id);
+                    COMMIT;
+                """)
+            cur.execute(
+                "INSERT OR IGNORE INTO schema_meta(key,value) VALUES('memory_generation','0')"
+            )
+            # Cache invalidation follows committed evidence changes across processes.
+            for table in ("memories", "claims", "relation_evidence", "embeddings"):
+                for event in ("INSERT", "UPDATE", "DELETE"):
+                    cur.execute(
+                        f"CREATE TRIGGER IF NOT EXISTS generation_{table}_{event} "
+                        f"AFTER {event} ON {table} BEGIN UPDATE schema_meta "
+                        "SET value=CAST(value AS INTEGER)+1 WHERE key='memory_generation'; END"
+                    )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embedding_cache_created "
+                "ON embedding_cache(created_at)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_embeddings_model_dimensions "
+                "ON embeddings(model, dimensions)"
+            )
             cur.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?,?)",
                 ("version", str(SCHEMA_VERSION)),
@@ -767,14 +826,15 @@ class RemnantDB:
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Cursor]:
         """Context manager yielding a cursor inside BEGIN/COMMIT (write txn)."""
-        with self._lock:
-            cur = self._conn.cursor()
+        with self.read() as cur:
             cur.execute("BEGIN IMMEDIATE;")
             try:
                 yield cur
                 cur.execute("COMMIT;")
             except Exception:
-                cur.execute("ROLLBACK;")
+                self._conn.set_progress_handler(None, 0)
+                if self._conn.in_transaction:
+                    cur.execute("ROLLBACK;")
                 raise
 
     @contextmanager
@@ -786,12 +846,101 @@ class RemnantDB:
         prefetch, and tool calls. Serialize cursor use to avoid interleaved
         statements and transaction state corruption.
         """
-        with self._lock:
+        deadline = self._deadline.get()
+        remaining = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+        acquired = (self._lock.acquire() if remaining is None
+                    else self._lock.acquire(timeout=remaining))
+        if not acquired:
+            raise TimeoutError("memory database deadline exceeded")
+        try:
+            if deadline is not None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("memory database deadline exceeded")
+                self._conn.execute(
+                    f"PRAGMA busy_timeout={max(0, int((deadline - time.monotonic()) * 1000))}"
+                )
+                self._conn.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
             cur = self._conn.cursor()
             try:
                 yield cur
             finally:
                 cur.close()
+        finally:
+            if deadline is not None:
+                self._conn.set_progress_handler(None, 0)
+                self._conn.execute("PRAGMA busy_timeout=5000")
+            self._lock.release()
+
+    @contextmanager
+    def deadline(self, until: float) -> Iterator[None]:
+        previous = self._deadline.get()
+        token = self._deadline.set(min(until, previous) if previous is not None else until)
+        try:
+            yield
+        finally:
+            self._deadline.reset(token)
+
+    @property
+    def memory_generation(self) -> int:
+        with self.read() as cur:
+            return int(cur.execute(
+                "SELECT value FROM schema_meta WHERE key='memory_generation'"
+            ).fetchone()[0])
+
+    def iter_embeddings(
+        self, *, agent_id: str | None, profile_scope: list[str] | None,
+        model: str | None, dimensions: int, visibility: str | None = None,
+        limit: int = 0,
+    ) -> Iterator[dict[str, Any]]:
+        """Stream committed vectors on an independent read-only WAL connection.
+
+        Scoring never holds the shared writer lock, and no recency truncation
+        applies by default. A caller's deadline interrupts SQLite and scoring.
+        """
+        sql = (
+            "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
+            "m.timestamp AS created_at, m.updated_at, e.embedding "
+            "FROM memories m JOIN embeddings e ON e.memory_id=m.id "
+            "WHERE m.status='active' AND e.dimensions=?"
+        )
+        params: list[Any] = [dimensions]
+        if model is not None:
+            base = model.removesuffix(":latest")
+            alias = base + ":latest" if ":" not in base.rsplit("/", 1)[-1] else base
+            sql += " AND e.model IN (?,?)"
+            params.extend((base, alias))
+        if agent_id is not None:
+            sql += " AND m.agent=?"
+            params.append(agent_id)
+        if visibility in VISIBILITY_ORDER:
+            allowed = [key for key, value in VISIBILITY_ORDER.items()
+                       if value <= VISIBILITY_ORDER[visibility]]
+            sql += " AND m.visibility IN (" + ",".join("?" for _ in allowed) + ")"
+            params.extend(allowed)
+        sql, params = _append_profile_scope_sql(sql, params, profile_scope)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params.append(limit)
+        deadline = self._deadline.get()
+        connection = sqlite3.connect(Path(self.path).resolve().as_uri() + "?mode=ro", uri=True,
+                                     timeout=0.0)
+        connection.row_factory = sqlite3.Row
+        if deadline is not None:
+            connection.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+        try:
+            cursor = connection.execute(sql, params)
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("semantic scan deadline exceeded")
+                rows = cursor.fetchmany(64)
+                if not rows:
+                    break
+                for row in rows:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("semantic scan deadline exceeded")
+                    yield dict(row)
+        finally:
+            connection.close()
 
     # -- prefetch stats --------------------------------------------------------
 
@@ -816,51 +965,72 @@ class RemnantDB:
         ts = datetime.now(timezone.utc).isoformat()
         # Truncate query for storage safety.
         q = (query or "")[:500]
-        try:
-            with self._lock:
-                cur = self._conn.cursor()
-                cur.execute(
-                    """INSERT INTO prefetch_stats
-                       (session_id, outcome, reason, elapsed_ms, result_count,
-                        token_estimate, query, agent_id, created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (session_id, outcome, reason, elapsed_ms,
-                     result_count, token_estimate, q, agent_id, ts),
-                )
-                self._conn.commit()
-        except Exception:
-            # Stats are best-effort — never break prefetch over logging.
-            pass
+        with self._diagnostics_lock:
+            self._diagnostics.append((
+                "prefetch", (session_id, outcome, reason, elapsed_ms, result_count,
+                             token_estimate, q, agent_id, ts),
+            ))
 
     def record_operation(
-        self,
-        operation: str,
-        outcome: str,
-        *,
-        elapsed_ms: float = 0.0,
-        input_units: int = 0,
-        output_units: int = 0,
-        agent_id: str | None = None,
+        self, operation: str, outcome: str, *, elapsed_ms: float = 0.0,
+        input_units: int = 0, output_units: int = 0, agent_id: str | None = None,
     ) -> None:
-        """Persist bounded counters only; never prompts, responses, or secrets."""
+        """Buffer bounded telemetry; foreground callers never acquire a DB write lock."""
+        with self._diagnostics_lock:
+            self._diagnostics.append((
+                "operation", (str(operation)[:64], str(outcome)[:32],
+                              max(0.0, float(elapsed_ms)), max(0, int(input_units)),
+                              max(0, int(output_units)), agent_id, _now_iso()),
+            ))
+
+    def flush_diagnostics(self) -> None:
+        """Best-effort background batch. Retain bounded records if a writer is busy."""
+        if not self._lock.acquire(blocking=False):
+            return
+        batch: list[tuple[str, tuple[Any, ...]]] = []
         try:
-            with self._lock:
-                self._conn.execute(
-                    "INSERT INTO operation_metrics(operation, outcome, elapsed_ms, "
-                    "input_units, output_units, agent_id, created_at) VALUES(?,?,?,?,?,?,?)",
-                    (
-                        str(operation)[:64], str(outcome)[:32], max(0.0, float(elapsed_ms)),
-                        max(0, int(input_units)), max(0, int(output_units)), agent_id,
-                        _now_iso(),
-                    ),
-                )
-                self._conn.execute(
-                    "DELETE FROM operation_metrics WHERE id <= "
-                    "COALESCE((SELECT MAX(id) - 10000 FROM operation_metrics), 0)"
-                )
-                self._conn.commit()
-        except Exception:
-            pass
+            if self._conn.in_transaction:
+                return
+            with self._diagnostics_lock:
+                for _ in range(min(256, len(self._diagnostics))):
+                    batch.append(self._diagnostics.popleft())
+            if not batch:
+                return
+            self._conn.execute("PRAGMA busy_timeout=0")
+            self._conn.execute("BEGIN IMMEDIATE")
+            self._conn.executemany(
+                "INSERT INTO prefetch_stats(session_id,outcome,reason,elapsed_ms,result_count,"
+                "token_estimate,query,agent_id,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                [row for kind, row in batch if kind == "prefetch"],
+            )
+            self._conn.executemany(
+                "INSERT INTO operation_metrics(operation,outcome,elapsed_ms,input_units,"
+                "output_units,agent_id,created_at) VALUES(?,?,?,?,?,?,?)",
+                [row for kind, row in batch if kind == "operation"],
+            )
+            self._conn.commit()
+        except sqlite3.Error:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+            with self._diagnostics_lock:
+                self._diagnostics.extendleft(reversed(batch))
+        finally:
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            self._lock.release()
+
+    def compact_caches(self, *, max_entries: int = 10000, max_age_days: int = 30) -> None:
+        """Expire reproducible caches and telemetry, never memories or raw evidence."""
+        self.flush_diagnostics()
+        with self.transaction() as cur:
+            cur.execute("DELETE FROM embedding_cache WHERE created_at < ?",
+                        (time.time() - max(0, max_age_days) * 86400,))
+            cur.execute(
+                "DELETE FROM embedding_cache WHERE rowid IN (SELECT rowid FROM embedding_cache "
+                "ORDER BY created_at DESC LIMIT -1 OFFSET ?)", (max(0, max_entries),),
+            )
+            for table in ("operation_metrics", "prefetch_stats"):
+                cur.execute(f"DELETE FROM {table} WHERE id <= "
+                            f"COALESCE((SELECT MAX(id)-10000 FROM {table}),0)")
 
     # -- turns -----------------------------------------------------------------
 
@@ -1391,6 +1561,116 @@ class RemnantDB:
             )
         return claim_id
 
+    def replace_claim_projection(
+        self,
+        *,
+        memory_id: str,
+        subject: str,
+        predicate: str,
+        object: str,
+        confidence: float,
+        qualifiers: dict[str, Any] | None = None,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        observed_at: str | None = None,
+        event_at: str | None = None,
+        scope_type: str | None = None,
+        scope_value: str | None = None,
+        modality: str = "asserted",
+        extractor_version: str,
+        source_turn_id: int | None = None,
+        actor: str = "system",
+    ) -> dict[str, Any]:
+        """Replace one memory's claim projection without changing its memory.
+
+        ``claims.memory_id`` is unique, so a model-backed migration must update
+        the existing projection in place.  The before/after rows are retained
+        in the audit log; the immutable backing memory remains untouched.
+        """
+        now = _now_iso()
+        with self.transaction() as cur:
+            cur.execute("SELECT * FROM claims WHERE memory_id=?", (memory_id,))
+            before_row = cur.fetchone()
+            before = dict(before_row) if before_row else None
+            if before is None:
+                claim_id = _uuid()
+                cur.execute(
+                    "INSERT INTO claims(id, memory_id, subject, predicate, object, qualifiers, "
+                    "confidence, status, valid_from, valid_to, observed_at, event_at, "
+                    "scope_type, scope_value, modality, conflict_type, resolution_status, "
+                    "extractor_version, source_turn_id, created_at, updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,'active',?,?,?,?,?,?,?,NULL,'active',?,?,?,?)",
+                    (
+                        claim_id,
+                        memory_id,
+                        subject,
+                        predicate,
+                        object,
+                        json.dumps(qualifiers, default=str) if qualifiers else None,
+                        float(confidence),
+                        valid_from,
+                        valid_to,
+                        observed_at or now,
+                        event_at,
+                        scope_type,
+                        scope_value,
+                        modality,
+                        extractor_version,
+                        source_turn_id,
+                        now,
+                        now,
+                    ),
+                )
+                operation = "created"
+            else:
+                claim_id = str(before["id"])
+                cur.execute(
+                    "UPDATE claims SET subject=?, predicate=?, object=?, qualifiers=?, "
+                    "confidence=?, valid_from=?, valid_to=?, observed_at=?, event_at=?, "
+                    "scope_type=?, scope_value=?, modality=?, extractor_version=?, "
+                    "source_turn_id=COALESCE(?, source_turn_id), updated_at=? "
+                    "WHERE memory_id=?",
+                    (
+                        subject,
+                        predicate,
+                        object,
+                        json.dumps(qualifiers, default=str) if qualifiers else None,
+                        float(confidence),
+                        valid_from if valid_from is not None else before.get("valid_from"),
+                        valid_to if valid_to is not None else before.get("valid_to"),
+                        observed_at if observed_at is not None else before.get("observed_at"),
+                        event_at if event_at is not None else before.get("event_at"),
+                        scope_type if scope_type is not None else before.get("scope_type"),
+                        scope_value if scope_value is not None else before.get("scope_value"),
+                        modality or before.get("modality") or "asserted",
+                        extractor_version,
+                        source_turn_id,
+                        now,
+                        memory_id,
+                    ),
+                )
+                operation = "updated"
+            cur.execute("SELECT * FROM claims WHERE memory_id=?", (memory_id,))
+            after = dict(cur.fetchone())
+            audit_id = self._write_audit(
+                cur,
+                actor,
+                "claim_model_backfill",
+                memory_id,
+                {
+                    "operation": operation,
+                    "claim_id": claim_id,
+                    "before": before,
+                    "after": after,
+                },
+            )
+        return {
+            "claim_id": claim_id,
+            "updated": operation == "updated",
+            "created": operation == "created",
+            "audit_id": audit_id,
+        }
+
     def supersede_claims(
         self,
         *,
@@ -1494,11 +1774,7 @@ class RemnantDB:
     ) -> list[dict[str, Any]]:
         """BM25 keyword search over active memories, optionally filtered.
 
-        Vault-source documents are a shared corpus: when ``agent_id`` is set,
-        vault documents authored by *other* agents are still visible (subject
-        to locked-note masking downstream in ``search``), so a user/agent can
-        search the shared vault. Agent-scoped facts remain private to their
-        owner.
+        A scoped read includes only that owner, regardless of source or visibility.
         """
         fts_query = _to_fts_query(query)
         if not fts_query:
@@ -1513,7 +1789,7 @@ class RemnantDB:
         )
         params: list[Any] = [fts_query]
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
+            sql += " AND m.agent=?"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -1534,15 +1810,14 @@ class RemnantDB:
     def candidate_facts(
         self, query: str, *, agent_id: str, limit: int = 8
     ) -> list[dict[str, Any]]:
-        """Fetch candidate memories (with embeddings) for cosine dedup."""
+        """Fetch fact text for conservative equivalence checks."""
         fts_query = _to_fts_query(query)
         if not fts_query:
             return []
         sql = (
-            "SELECT m.id, m.content, m.visibility, e.embedding "
+            "SELECT m.id, m.content, m.visibility "
             "FROM memories_fts JOIN memories m ON m.rowid = memories_fts.rowid "
-            "LEFT JOIN embeddings e ON e.memory_id = m.id "
-            "WHERE memories_fts MATCH ? AND m.status='active' AND m.agent=?"
+            "WHERE memories_fts MATCH ? AND m.status='active' AND m.agent=? AND m.type='fact'"
         )
         params: list[Any] = [fts_query, agent_id]
         sql += " ORDER BY bm25(memories_fts) ASC LIMIT ?"
@@ -1550,18 +1825,69 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["embedding"] = _unpack_embedding(d["embedding"]) if d["embedding"] else []
-            out.append(d)
-        return out
+        return [dict(row) for row in rows]
 
     def get_memory_embedding(self, memory_id: str) -> list[float]:
         with self.read() as cur:
             cur.execute("SELECT embedding FROM embeddings WHERE memory_id=?", (memory_id,))
             row = cur.fetchone()
         return _unpack_embedding(row["embedding"]) if row and row["embedding"] else []
+
+    def repair_embedding_candidates(
+        self, *, agent_id: str, model: str, dimensions: int,
+        profile_scope: list[str] | None = None, memory_ids: list[str] | None = None,
+        limit: int = 8,
+    ) -> list[dict[str, Any]]:
+        base = model.removesuffix(":latest")
+        alias = base + ":latest" if ":" not in base.rsplit("/", 1)[-1] else base
+        sql = (
+            "SELECT m.id,m.content FROM memories m LEFT JOIN embeddings e ON e.memory_id=m.id "
+            "WHERE m.status='active' AND m.agent=? "
+            "AND (e.memory_id IS NULL OR e.model IS NULL OR e.model NOT IN (?,?) "
+            "OR e.dimensions!=? OR length(e.embedding)!=?)"
+        )
+        params: list[Any] = [agent_id, base, alias, dimensions, dimensions * 4]
+        sql, params = _append_profile_scope_sql(sql, params, profile_scope)
+        if memory_ids is not None:
+            if not memory_ids:
+                return []
+            sql += " AND m.id IN (" + ",".join("?" for _ in memory_ids) + ")"
+            params.extend(memory_ids)
+        sql += " LIMIT ?"
+        params.append(max(1, limit))
+        with self.read() as cur:
+            return [dict(row) for row in cur.execute(sql, params).fetchall()]
+
+    def put_memory_embedding(
+        self, memory_id: str, *, expected_content: str, embedding: list[float], model: str,
+    ) -> bool:
+        """Do not attach a repaired vector if its source changed during the network call."""
+        blob = _pack_embedding(embedding)
+        with self.transaction() as cur:
+            cur.execute(
+                "INSERT OR REPLACE INTO embeddings"
+                "(memory_id,model,embedding,dimensions,created_at) "
+                "SELECT id,?,?,?,? FROM memories WHERE id=? AND content=? AND status='active'",
+                (model, blob, len(embedding), _now_iso(), memory_id, expected_content),
+            )
+            return cur.rowcount == 1
+
+    def record_duplicate(
+        self, memory_id: str, *, source_turn_id: int | None, session_id: str, agent_id: str,
+    ) -> None:
+        """Retain corroboration provenance without counting extraction retries twice."""
+        with self.transaction() as cur:
+            if source_turn_id is not None:
+                if cur.execute(
+                    "SELECT 1 FROM memories WHERE id=? AND source_id=? "
+                    "UNION ALL SELECT 1 FROM audit_log WHERE memory_id=? "
+                    "AND action='memory_duplicate' AND json_extract(details,'$.source_turn_id')=?",
+                    (memory_id, str(source_turn_id), memory_id, source_turn_id),
+                ).fetchone():
+                    return
+            cur.execute("UPDATE memories SET seen_count=seen_count+1 WHERE id=?", (memory_id,))
+            self._write_audit(cur, agent_id, "memory_duplicate", memory_id,
+                              {"source_turn_id": source_turn_id, "session_id": session_id})
 
     def search_by_embedding(
         self,
@@ -1577,9 +1903,7 @@ class RemnantDB:
         candidate set, never the whole table. `memory_ids` should already be
         bounded by the caller (e.g. SEMANTIC_CANDIDATE_LIMIT).
 
-        Vault-source documents are a shared corpus (see ``search_bm25``): when
-        ``agent_id`` is set, vault documents authored by other agents remain
-        visible so the shared vault can be semantically searched.
+        A scoped read includes only that owner, including vault documents.
         """
         if not memory_ids:
             return []
@@ -1592,7 +1916,7 @@ class RemnantDB:
         )
         params: list[Any] = list(memory_ids)
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
+            sql += " AND m.agent=?"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -1631,7 +1955,7 @@ class RemnantDB:
         )
         params: list[Any] = []
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared', 'fleet'))"
+            sql += " AND m.agent=?"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -1663,9 +1987,7 @@ class RemnantDB:
         candidate set. This keeps the pre-filter cheap and avoids scanning the
         embeddings table blindly.
 
-        Vault-source documents are a shared corpus (see ``search_bm25``): when
-        ``agent_id`` is set, vault documents authored by other agents remain
-        visible.
+        A scoped read includes only that owner, including vault documents.
         """
         sql = (
             "SELECT m.id, m.content, m.visibility, m.agent AS agent_id, "
@@ -1674,7 +1996,7 @@ class RemnantDB:
         )
         params: list[Any] = []
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault')"
+            sql += " AND m.agent=?"
             params.append(agent_id)
         if visibility is not None:
             sql += " AND m.visibility=?"
@@ -1738,7 +2060,7 @@ class RemnantDB:
             # (Phase 1) remain global and are matched by name only.
             match_sql = (
                 "SELECT id FROM entities WHERE LOWER(name) = ? "
-                "AND (agent IS NULL OR agent = ?) "
+                "AND agent IS ? "
                 "ORDER BY agent IS NULL LIMIT 1"
             )
             cur.execute(match_sql, (key, agent_id))
@@ -1757,7 +2079,7 @@ class RemnantDB:
                     cur.execute(
                         "SELECT e.id FROM entities e JOIN entity_aliases ea "
                         "ON ea.entity_id = e.id "
-                        "WHERE ea.alias = ? AND (ea.agent IS NULL OR ea.agent = ?) "
+                        "WHERE ea.alias = ? AND ea.agent IS ? "
                         "ORDER BY ea.agent IS NULL LIMIT 1",
                         (alias, agent_id),
                     )
@@ -1877,8 +2199,10 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(
                 "SELECT id FROM entities WHERE LOWER(name)=? "
-                "AND (agent IS NULL OR agent=?) ORDER BY agent IS NULL LIMIT 1",
-                (key, agent_id),
+                "AND (agent IS ? OR (agent IS NULL AND EXISTS(SELECT 1 FROM memory_entities me "
+                "JOIN memories m ON m.id=me.memory_id WHERE me.entity_id=entities.id "
+                "AND m.agent=?))) ORDER BY agent IS NULL LIMIT 1",
+                (key, agent_id, agent_id),
             )
             row = cur.fetchone()
             if row is not None:
@@ -1886,7 +2210,7 @@ class RemnantDB:
             cur.execute(
                 "SELECT e.id FROM entities e JOIN entity_aliases ea "
                 "ON ea.entity_id = e.id "
-                "WHERE ea.alias=? AND (ea.agent IS NULL OR ea.agent=?) "
+                "WHERE ea.alias=? AND ea.agent IS ? "
                 "ORDER BY ea.agent IS NULL LIMIT 1",
                 (key, agent_id),
             )
@@ -2016,7 +2340,7 @@ class RemnantDB:
         )
         params: list[Any] = [entity_id]
         if agent_id is not None:
-            sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
+            sql += " AND m.agent=?"
             params.append(agent_id)
         with self.read() as cur:
             cur.execute(sql, params)
@@ -2039,6 +2363,8 @@ class RemnantDB:
         dicts ``{id, name, type, depth}`` (the seed at depth 0) and memories
         are deduped active memories linked to any visited entity.
         """
+        if agent_id is not None and not self.get_memories_for_entity(entity_id, agent_id=agent_id):
+            return {"entities": [], "memories": []}
         visited: dict[str, int] = {entity_id: 0}
         order: list[str] = [entity_id]
         frontier: list[str] = [entity_id]
@@ -2046,18 +2372,20 @@ class RemnantDB:
             if not frontier:
                 break
             placeholders = ",".join("?" for _ in frontier)
+            table = "relation_evidence" if evidence_only else "relations"
+            memory_column = "memory_id" if evidence_only else "source_memory_id"
             relation_source = (
-                "(SELECT entity_a, entity_b FROM relation_evidence WHERE active=1 "
-                "GROUP BY entity_a, entity_b)"
-                if evidence_only
-                else "relations"
+                f"(SELECT r.entity_a,r.entity_b FROM {table} r "
+                f"JOIN memories m ON m.id=r.{memory_column} "
+                "WHERE m.status='active' AND (? IS NULL OR m.agent=?)"
+                + (" AND r.active=1" if evidence_only else "") + ")"
             )
             sql = (
                 f"SELECT entity_a AS other FROM {relation_source} "
                 f"WHERE entity_b IN ({placeholders}) UNION SELECT entity_b AS other "
                 f"FROM {relation_source} WHERE entity_a IN ({placeholders})"
             )
-            params = list(frontier) + list(frontier)
+            params = [agent_id, agent_id, *frontier, agent_id, agent_id, *frontier]
             with self.read() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
@@ -2098,7 +2426,7 @@ class RemnantDB:
             )
             params = list(order)
             if agent_id is not None:
-                sql += " AND (m.agent=? OR m.source='vault' OR m.visibility IN ('shared','fleet'))"
+                sql += " AND m.agent=?"
                 params.append(agent_id)
             sql, params = _append_profile_scope_sql(sql, params, profile_scope)
             with self.read() as cur:
@@ -2209,6 +2537,8 @@ class RemnantDB:
                     "dimensions, created_at) VALUES(?,?,?,?,?)",
                     (memory_id, embed_model, blob, len(embedding), now),
                 )
+            elif content != before["content"]:
+                cur.execute("DELETE FROM embeddings WHERE memory_id=?", (memory_id,))
             # Rebuild the FTS5 row. The triggers fire on UPDATE already, but we
             # also do an explicit delete+insert so the index is consistent even
             # when the trigger path is bypassed by external-content quirks.
@@ -2383,83 +2713,82 @@ class RemnantDB:
 
     # -- vault files (Phase 4) -------------------------------------------------
 
-    def get_vault_hash(self, path: str) -> str | None:
-        """Return the stored content hash for a vault path, or None if absent."""
+    def get_vault_hash(self, path: str, *, agent_id: str | None = None) -> str | None:
         with self.read() as cur:
-            cur.execute("SELECT hash FROM vault_files WHERE path=?", (path,))
-            row = cur.fetchone()
+            row = cur.execute(
+                "SELECT hash FROM vault_files WHERE path=? AND (? IS NULL OR agent=?)",
+                (path, agent_id, agent_id),
+            ).fetchone()
         return row["hash"] if row else None
 
-    def get_vault_memory(self, path: str) -> str | None:
-        """Return the memory_id linked to a vault path, or None."""
+    def get_vault_memory(self, path: str, *, agent_id: str | None = None) -> str | None:
         with self.read() as cur:
-            cur.execute("SELECT memory_id FROM vault_files WHERE path=?", (path,))
-            row = cur.fetchone()
-        return row["memory_id"] if row and row["memory_id"] else None
+            row = cur.execute(
+                "SELECT memory_id FROM vault_files WHERE path=? AND (? IS NULL OR agent=?)",
+                (path, agent_id, agent_id),
+            ).fetchone()
+        return row["memory_id"] if row else None
 
     def set_vault_hash(
-        self, path: str, hash_hex: str, memory_id: str | None = None
+        self, path: str, hash_hex: str, memory_id: str | None = None,
+        *, agent_id: str | None = None,
     ) -> None:
-        """Insert or update the vault_files row for `path` (idempotent)."""
+        owner = (agent_id if agent_id is not None
+                 else (self.get_memory(memory_id) or {}).get("agent", ""))
         with self.transaction() as cur:
+            if memory_id:
+                cur.execute(
+                    "DELETE FROM vault_files WHERE path=? AND agent='' AND memory_id IS NULL",
+                    (path,),
+                )
             cur.execute(
-                "INSERT OR REPLACE INTO vault_files(path, hash, memory_id, indexed_at) "
-                "VALUES(?,?,?,?)",
-                (path, hash_hex, memory_id, _now_iso()),
+                "INSERT OR REPLACE INTO vault_files(agent,path,hash,memory_id,indexed_at) "
+                "VALUES(?,?,?,?,?)", (owner, path, hash_hex, memory_id, _now_iso()),
             )
 
-    def get_vault_passages(self, path: str) -> list[dict[str, Any]]:
-        """Return passage mappings for one vault path in ordinal order."""
+    def get_vault_passages(
+        self, path: str, *, agent_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         with self.read() as cur:
-            cur.execute(
-                "SELECT path, ordinal, memory_id, heading_path, start_offset, end_offset "
-                "FROM vault_passages WHERE path=? ORDER BY ordinal",
-                (path,),
-            )
-            return [dict(row) for row in cur.fetchall()]
+            return [dict(row) for row in cur.execute(
+                "SELECT * FROM vault_passages WHERE path=? AND (? IS NULL OR agent=?) "
+                "ORDER BY ordinal", (path, agent_id, agent_id),
+            ).fetchall()]
 
     def set_vault_passage(
-        self,
-        path: str,
-        ordinal: int,
-        memory_id: str,
-        heading_path: str,
-        start_offset: int,
-        end_offset: int,
+        self, path: str, ordinal: int, memory_id: str, heading_path: str,
+        start_offset: int, end_offset: int, *, agent_id: str | None = None,
     ) -> None:
+        owner = (agent_id if agent_id is not None
+                 else (self.get_memory(memory_id) or {}).get("agent", ""))
         with self.transaction() as cur:
             cur.execute(
                 "INSERT OR REPLACE INTO vault_passages "
-                "(path, ordinal, memory_id, heading_path, start_offset, end_offset) "
-                "VALUES(?,?,?,?,?,?)",
-                (path, ordinal, memory_id, heading_path, start_offset, end_offset),
+                "(agent,path,ordinal,memory_id,heading_path,start_offset,end_offset) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (owner, path, ordinal, memory_id, heading_path, start_offset, end_offset),
             )
 
-    def forget_vault_passages_after(self, path: str, ordinal: int) -> list[str]:
-        """Forget obsolete passages after a note shrinks; return memory ids."""
+    def forget_vault_passages_after(
+        self, path: str, ordinal: int, *, agent_id: str | None = None,
+    ) -> list[str]:
         with self.transaction() as cur:
-            cur.execute(
-                "SELECT memory_id FROM vault_passages WHERE path=? AND ordinal>?",
-                (path, ordinal),
-            )
-            ids = [str(row["memory_id"]) for row in cur.fetchall()]
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                cur.execute(
-                    f"UPDATE memories SET status='forgotten', updated_at=? "
-                    f"WHERE id IN ({placeholders})",
-                    [_now_iso(), *ids],
-                )
-            cur.execute("DELETE FROM vault_passages WHERE path=? AND ordinal>?", (path, ordinal))
+            ids = [str(row[0]) for row in cur.execute(
+                "SELECT memory_id FROM vault_passages WHERE path=? AND ordinal>? "
+                "AND (? IS NULL OR agent=?)", (path, ordinal, agent_id, agent_id),
+            ).fetchall()]
+            for mid in ids:
+                cur.execute("UPDATE memories SET status='forgotten',updated_at=? WHERE id=?",
+                            (_now_iso(), mid))
+            cur.execute("DELETE FROM vault_passages WHERE path=? AND ordinal>? "
+                        "AND (? IS NULL OR agent=?)", (path, ordinal, agent_id, agent_id))
             return ids
 
-    def get_all_vault_files(self) -> list[dict[str, Any]]:
-        """Return all known vault_files rows: {path, hash, memory_id, indexed_at}."""
+    def get_all_vault_files(self, *, agent_id: str | None = None) -> list[dict[str, Any]]:
         with self.read() as cur:
-            cur.execute(
-                "SELECT path, hash, memory_id, indexed_at FROM vault_files"
-            )
-            return [dict(r) for r in cur.fetchall()]
+            return [dict(row) for row in cur.execute(
+                "SELECT * FROM vault_files WHERE (? IS NULL OR agent=?)", (agent_id, agent_id),
+            ).fetchall()]
 
     def find_orphan_forgotten_memory_ids(self) -> list[str]:
         """Return IDs of forgotten memories with no source_id and no vault file.
@@ -2481,59 +2810,39 @@ class RemnantDB:
             cur.execute(sql)
             return [r["id"] for r in cur.fetchall()]
 
-    def mark_vault_forgotten(self, path: str) -> str | None:
-        """Forget the memory linked to a vault path and remove the row.
-
-        Returns the memory_id that was forgotten (or None if no row existed),
-        so callers can audit/react. The memory row is preserved (status set to
-        'forgotten', never deleted) per Remnant's "nothing is ever deleted" rule.
-        """
+    def mark_vault_forgotten(self, path: str, *, agent_id: str | None = None) -> str | None:
+        """Forget only this owner's mappings, retaining the original evidence rows."""
         with self.transaction() as cur:
-            cur.execute("SELECT memory_id FROM vault_files WHERE path=?", (path,))
-            row = cur.fetchone()
-            mid = row["memory_id"] if row else None
-            cur.execute("SELECT memory_id FROM vault_passages WHERE path=?", (path,))
-            passage_ids = [str(r["memory_id"]) for r in cur.fetchall()]
-            ids = list(dict.fromkeys(([str(mid)] if mid else []) + passage_ids))
-            if ids:
-                placeholders = ",".join("?" for _ in ids)
-                cur.execute(
-                    f"UPDATE memories SET status='forgotten', updated_at=? "
-                    f"WHERE id IN ({placeholders})",
-                    [_now_iso(), *ids],
-                )
-            cur.execute("DELETE FROM vault_passages WHERE path=?", (path,))
-            cur.execute("DELETE FROM vault_files WHERE path=?", (path,))
-        return str(ids[0]) if ids else None
+            rows = cur.execute(
+                "SELECT agent,memory_id FROM vault_files WHERE path=? AND (? IS NULL OR agent=?)",
+                (path, agent_id, agent_id),
+            ).fetchall()
+            for row in rows:
+                owner = row["agent"]
+                ids = [str(p[0]) for p in cur.execute(
+                    "SELECT memory_id FROM vault_passages WHERE path=? AND agent=?",
+                    (path, owner),
+                ).fetchall()]
+                if row["memory_id"]:
+                    ids.append(row["memory_id"])
+                for mid in set(ids):
+                    cur.execute("UPDATE memories SET status='forgotten',updated_at=? WHERE id=?",
+                                (_now_iso(), mid))
+                cur.execute("DELETE FROM vault_passages WHERE path=? AND agent=?", (path, owner))
+                cur.execute("DELETE FROM vault_files WHERE path=? AND agent=?", (path, owner))
+            return rows[0]["memory_id"] if rows else None
 
     def mark_vault_forgotten_for_missing(
-        self, present_paths: set[str]
+        self, present_paths: set[str], *, agent_id: str | None = None,
     ) -> list[str]:
-        """Forget memories for every vault_files row whose path is not in
-        `present_paths`. Returns the list of forgotten memory ids (may be
-        empty). Used by the re-index pass to handle deleted files.
-        """
-        forgotten: list[str] = []
-        with self.transaction() as cur:
-            cur.execute("SELECT path, memory_id FROM vault_files")
-            rows = cur.fetchall()
-            for r in rows:
-                if r["path"] in present_paths:
-                    continue
-                cur.execute("SELECT memory_id FROM vault_passages WHERE path=?", (r["path"],))
-                passage_ids = [str(p["memory_id"]) for p in cur.fetchall()]
-                mid = r["memory_id"]
-                ids = list(dict.fromkeys(([str(mid)] if mid else []) + passage_ids))
-                if ids:
-                    placeholders = ",".join("?" for _ in ids)
-                    cur.execute(
-                        f"UPDATE memories SET status='forgotten', updated_at=? "
-                        f"WHERE id IN ({placeholders})",
-                        [_now_iso(), *ids],
-                    )
-                    forgotten.extend(ids)
-                cur.execute("DELETE FROM vault_passages WHERE path=?", (r["path"],))
-                cur.execute("DELETE FROM vault_files WHERE path=?", (r["path"],))
+        forgotten = []
+        for row in self.get_all_vault_files(agent_id=agent_id):
+            if row["path"] not in present_paths:
+                ids = [p["memory_id"] for p in self.get_vault_passages(
+                    row["path"], agent_id=row["agent"],
+                )]
+                mid = self.mark_vault_forgotten(row["path"], agent_id=row["agent"])
+                forgotten.extend(dict.fromkeys(([mid] if mid else []) + ids))
         return forgotten
 
     def get_memory_by_source_id(
@@ -2562,7 +2871,9 @@ class RemnantDB:
                 pass
         return d
 
-    def get_memory_by_content_hash(self, content_hash: str) -> dict[str, Any] | None:
+    def get_memory_by_content_hash(
+        self, content_hash: str, *, agent_id: str | None = None
+    ) -> dict[str, Any] | None:
         """Return the most recent active memory with a matching content_hash.
 
         Used by the migration import path to dedup incoming facts across
@@ -2574,8 +2885,8 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(
                 "SELECT * FROM memories WHERE content_hash=? AND status='active' "
-                "ORDER BY updated_at DESC LIMIT 1",
-                (content_hash,),
+                "AND (? IS NULL OR agent=?) ORDER BY updated_at DESC LIMIT 1",
+                (content_hash, agent_id, agent_id),
             )
             row = cur.fetchone()
         if row is None:
@@ -2594,7 +2905,7 @@ class RemnantDB:
         return d
 
     def list_active_memories_for_decay(
-        self, *, batch_size: int | None = None
+        self, *, batch_size: int | None = None, agent_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Return active memory ids with trust_score and updated_at.
 
@@ -2606,6 +2917,9 @@ class RemnantDB:
             "WHERE status='active'"
         )
         params: list[Any] = []
+        if agent_id is not None:
+            sql += " AND agent=?"
+            params.append(agent_id)
         if batch_size:
             sql += " LIMIT ?"
             params.append(batch_size)
@@ -2720,20 +3034,23 @@ class RemnantDB:
         return _decode_thread(dict(row))
 
     def list_threads(
-        self, *, status: str | None = None, limit: int = 50
+        self, *, status: str | None = None, limit: int = 50, agent_id: str | None = None
     ) -> list[dict[str, Any]]:
-        sql = "SELECT * FROM threads"
+        sql = "SELECT * FROM threads WHERE 1=1"
         params: list[Any] = []
         if status is not None:
-            sql += " WHERE status=?"
+            sql += " AND status=?"
             params.append(status)
+        if agent_id is not None:
+            sql += " AND added_by=?"
+            params.append(agent_id)
         sql += " ORDER BY last_activity DESC LIMIT ?"
         params.append(limit)
         with self.read() as cur:
             cur.execute(sql, params)
             return [_decode_thread(dict(r)) for r in cur.fetchall()]
 
-    def stale_threads(self, *, days: int = 14) -> list[dict[str, Any]]:
+    def stale_threads(self, *, days: int = 14, agent_id: str | None = None) -> list[dict[str, Any]]:
         """Return active threads whose last_activity is older than `days`."""
         cutoff = time.strftime(
             "%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - days * 86400)
@@ -2741,14 +3058,14 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(
                 "SELECT * FROM threads WHERE status='active' AND last_activity < ? "
-                "ORDER BY last_activity ASC",
-                (cutoff,),
+                "AND (? IS NULL OR added_by=?) ORDER BY last_activity ASC",
+                (cutoff, agent_id, agent_id),
             )
             return [_decode_thread(dict(r)) for r in cur.fetchall()]
 
-    def sweep_stale_threads(self, *, days: int = 14) -> list[str]:
+    def sweep_stale_threads(self, *, days: int = 14, agent_id: str | None = None) -> list[str]:
         """Mark inactive active threads as stale. Returns the marked ids."""
-        stale = self.stale_threads(days=days)
+        stale = self.stale_threads(days=days, agent_id=agent_id)
         if not stale:
             return []
         marked: list[str] = []
@@ -2869,9 +3186,8 @@ class RemnantDB:
     ) -> list[dict[str, Any]]:
         """Return active memories visible across the agent scope.
 
-        For cross-agent duplicate detection: when `agent_id` is None all active
-        memories are considered; otherwise agent-scoped memories of `agent_id`
-        plus all shared/fleet memories from other agents.
+        Unscoped reads are for operator maintenance only. A supplied owner
+        restricts every source and visibility label to that owner.
         """
         sql = (
             "SELECT id, content, agent, visibility, source, type, created_at "
@@ -2879,7 +3195,7 @@ class RemnantDB:
         )
         params: list[Any] = []
         if agent_id is not None:
-            sql += " AND (agent=? OR visibility IN ('shared','fleet'))"
+            sql += " AND agent=?"
             params.append(agent_id)
         elif visibility is not None:
             sql += " AND visibility=?"
@@ -2894,7 +3210,11 @@ class RemnantDB:
 
     def close(self) -> None:
         with self._lock:
+            if getattr(self, "_closed", False):
+                return
+            self.flush_diagnostics()
             self._conn.close()
+            self._closed = True
 
 
 def _to_fts_query(query: str) -> str:

@@ -30,13 +30,14 @@ class EffectiveIdentity:
         if self.legacy:
             return self.configured_agent
         components = {
+            "profile": self.configured_agent,
             "agent": self.agent_identity or self.configured_agent,
             "platform": self.platform_scope,
             "user": self.user_key,
             "workspace": self.workspace,
         }
         encoded = json.dumps(components, sort_keys=True, separators=(",", ":"))
-        return f"identity:v1:{_digest(encoded)}"
+        return f"identity:v2:{_digest(encoded)}"
 
     @property
     def viewer_key(self) -> str:

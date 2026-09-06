@@ -254,7 +254,10 @@ def test_graph_expand_finds_neighbours(hermes_home: Path):
         # Create two entities with a relation.
         eid_a = db.resolve_entity("alpha device", agent_id="default", entity_type="tool")
         eid_b = db.resolve_entity("beta controller", agent_id="default", entity_type="tool")
-        db.add_relation(entity_a=eid_a, entity_b=eid_b, relation_type="depends_on")
+        mid = db.insert_memory(content="Alpha device uses beta controller", agent="default")
+        db.link_entity(memory_id=mid, entity_id=eid_a, agent_id="default")
+        db.add_relation(entity_a=eid_a, entity_b=eid_b, relation_type="depends_on",
+                        source_memory_id=mid)
         terms = _graph_expand(db, "alpha device", agent_id="default")
         assert "alpha device" in terms
         assert "beta controller" in terms
@@ -460,9 +463,11 @@ def test_prefetch_skips_oversized_result_and_keeps_later_fact(
 
     provider._config.injection_token_budget = 80
     long_note = "x" * 2_000
+    long_id = provider._db.insert_memory(content=long_note, agent="default")
+    short_id = provider._db.insert_memory(content="Sven likes tea", agent="default")
     results = [
-        {"id": "long", "content": long_note, "visibility": "private"},
-        {"id": "short", "content": "Sven likes tea", "visibility": "private"},
+        {"id": long_id, "content": long_note, "visibility": "private"},
+        {"id": short_id, "content": "Sven likes tea", "visibility": "private"},
     ]
 
     monkeypatch.setattr(

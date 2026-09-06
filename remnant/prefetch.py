@@ -231,6 +231,7 @@ def prefetch(
     session_id: str,
     messages: list[dict[str, Any]] | None = None,
     deadline_ms: int | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run hybrid retrieval, dedup, budget, and diff-based suppression.
 
@@ -248,6 +249,9 @@ def prefetch(
     def _record(outcome: str, reason: str | None, t0: float,
                 count: int = 0, tokens: int = 0) -> None:
         """Best-effort stats recording — never breaks prefetch."""
+        if diagnostics is not None:
+            diagnostics.update(outcome=outcome, reason=reason)
+            return
         try:
             elapsed = (time.monotonic() - t0) * 1000.0
             db.record_prefetch(
@@ -327,6 +331,7 @@ def prefetch(
     # formatting/SQLite work.  A failed attempt is a normal degraded path, not
     # a reason to throw away the keyword baseline.
     semantic_ready = False
+    semantic_used = False
     embedding_budget_ms = int(getattr(cfg, "prefetch_embedding_timeout_ms", 250) or 0)
     remaining_ms = max(0.0, deadline_s * 1000.0 - (time.monotonic() - t0) * 1000.0)
     embedding_budget_ms = min(embedding_budget_ms, max(0, int(remaining_ms - 50)))
@@ -337,7 +342,7 @@ def prefetch(
             query,
             timeout_s=embedding_budget_ms / 1000.0,
         )
-        semantic_ready = bool(provider._session_query_vec.get(session_id))
+        semantic_ready = bool(session_embedder and session_embedder.embed(query))
         semantic_remaining_ms = (
             deadline_s * 1000.0 - (time.monotonic() - t0) * 1000.0
         )
@@ -345,15 +350,17 @@ def prefetch(
         # do not start it when there is no room left for ranking and formatting.
         if semantic_ready and semantic_remaining_ms >= 100:
             try:
-                semantic_results = hybrid_search(
-                    db,
-                    cfg,
-                    query,
-                    agent_id=agent_id,
-                    limit=limit,
-                    strategy="auto",
-                    embedder=session_embedder,
-                )
+                with db.deadline(t0 + deadline_s - 0.05):
+                    semantic_results = hybrid_search(
+                        db,
+                        cfg,
+                        query,
+                        agent_id=agent_id,
+                        limit=limit,
+                        strategy="auto",
+                        embedder=session_embedder,
+                    )
+                semantic_used = True
             except Exception:
                 semantic_results = []
             # Put the hybrid ranking ahead of expansion-only keyword results,
@@ -406,6 +413,7 @@ def prefetch(
                         "created_at": turn.get("created_at"),
                         "score": 1.0,
                         "pending": True,
+                        "agent_id": agent_id,
                         "claim_status": "unprocessed",
                     })
         except Exception:
@@ -454,13 +462,7 @@ def prefetch(
     # rather than converting a useful result into an empty injection.
 
     ctx_hash = hashlib.sha256(context.encode("utf-8")).hexdigest()
-    # Diff-based suppression: same context as last turn in this session.
-    if provider._last_injected_hash.get(session_id) == ctx_hash:
-        _record("empty", "diff_suppression", t0)
-        return {}
-    provider._last_injected_hash[session_id] = ctx_hash
-
-    injection_reason = None if semantic_ready else "semantic_timeout_keyword_fallback"
+    injection_reason = None if semantic_used else "semantic_timeout_keyword_fallback"
     _record("injected", injection_reason, t0, count=len(selected),
             tokens=_approx_tokens(context))
     result = {

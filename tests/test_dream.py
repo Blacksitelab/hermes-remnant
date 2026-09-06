@@ -180,8 +180,8 @@ def test_store_memory_default_source_manual_without_turn(hermes_home: Path):
 
 
 def _seed_pair(db, emb, cfg, fact_a, fact_b):
-    _store_fact(db, emb, cfg, fact_a, agent="alice", visibility="shared")
-    _store_fact(db, emb, cfg, fact_b, agent="bob", visibility="shared")
+    _store_fact(db, emb, cfg, fact_a, agent=cfg.agent_id, visibility="shared")
+    _store_fact(db, emb, cfg, fact_b, agent=cfg.agent_id, visibility="shared")
     return db.get_recent_memories(since_ts=time.time() - 3600)
 
 
@@ -260,12 +260,11 @@ def test_night_dream_stores_dream_memory_for_connection(monkeypatch, hermes_home
 
 
 def test_dream_merge_uses_source_dream(monkeypatch, hermes_home: Path):
-    """A cross-agent same_fact merge produces a ``source='dream'`` shared
-    memory whose ``metadata.merged_from`` lists the original ids."""
+    """Cross-profile facts never enter dream consolidation."""
     from remnant import dream as dream_mod
 
     db = _open_db(hermes_home)
-    cfg = RemnantConfig(dream_day_budget=3)
+    cfg = RemnantConfig(agent_id="alice", dream_day_budget=3)
     emb = _fake_embed(db, cfg)
     try:
         mid_a = _store_fact(
@@ -292,18 +291,9 @@ def test_dream_merge_uses_source_dream(monkeypatch, hermes_home: Path):
 
         monkeypatch.setattr(dream_mod, "_cloud_judge", fake_judge)
         res = day_dream(db, cfg, emb)
-        assert res["actions"] >= 1
-
-        a = db.get_memory(mid_a)
-        b = db.get_memory(mid_b)
-        assert a["status"] == "superseded"
-        assert b["status"] == "superseded"
-        merged = db.get_memory(a["superseded_by"])
-        assert merged is not None
-        assert merged["source"] == "dream"
-        assert merged["visibility"] == "shared"
-        meta = merged.get("metadata") or {}
-        assert meta.get("merged_from") == [mid_a, mid_b]
+        assert res["actions"] == 0
+        assert db.get_memory(mid_a)["status"] == "active"
+        assert db.get_memory(mid_b)["status"] == "active"
     finally:
         db.close()
 

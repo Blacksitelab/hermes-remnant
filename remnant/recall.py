@@ -247,6 +247,19 @@ class RecallService:
             diagnostics["reason"] = "candidate_discovery_failed"
             raw = []
 
+        # Candidate adapters and cached context are untrusted authorization inputs.
+        ids = [str(row.get("id")) for row in raw if row.get("id") and not row.get("pending")]
+        owned = set()
+        if ids:
+            with self.db.read() as cur:
+                marks = ",".join("?" for _ in ids)
+                owned = {row[0] for row in cur.execute(
+                    f"SELECT id FROM memories WHERE id IN ({marks}) AND agent=?",
+                    [*ids, request.agent_id],
+                )}
+        raw = [row for row in raw if row.get("id") in owned or (
+            row.get("pending") and row.get("agent_id") == request.agent_id
+        )]
         diagnostics["candidate_count"] = len(raw)
         self._pending_overlay(request, raw)
         raw = _dedup_against_messages(raw, request.messages)

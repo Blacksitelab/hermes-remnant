@@ -42,7 +42,7 @@ def test_health_reports_operational_dimensions(tmp_path: Path):
         assert report["unresolved_conflicts"] == 1
         assert report["active_relation_evidence"] == 1
         assert report["prefetch_latency_ms"]["p95"] == 12.0
-        assert report["semantic_scan"]["configured_limit"] == 5000
+        assert report["semantic_scan"]["configured_limit"] == 0
         assert report["semantic_scan"]["ann_recommended"] is False
         assert report["operation_metrics"][0]["operation"] == "embedding"
     finally:

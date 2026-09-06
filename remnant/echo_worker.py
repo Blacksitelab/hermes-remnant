@@ -144,10 +144,14 @@ class EchoWorker:
             )
 
     def _run(self) -> None:
+        next_compaction = time.monotonic() + 300.0
         while not self._stop.is_set():
             did_work = False
             try:
                 did_work = self.run_once()
+                if time.monotonic() >= next_compaction:
+                    next_compaction = time.monotonic() + 300.0
+                    self.service.compact()
             except Exception:
                 # A worker failure must never take down the provider.
                 did_work = False

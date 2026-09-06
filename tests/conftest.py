@@ -28,3 +28,11 @@ def _remnant_db_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     db_home = tmp_path / "remnant_db_home"
     db_home.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("REMNANT_DB_HOME", str(db_home))
+    from remnant import dream
+
+    original = dream._expand_diary_path
+    monkeypatch.setattr(
+        dream, "_expand_diary_path",
+        lambda path: str(tmp_path / "DREAMS.md")
+        if str(path) == "~/.hermes/remnant/DREAMS.md" else original(path),
+    )
