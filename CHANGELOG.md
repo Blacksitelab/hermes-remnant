@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.1 - profile state and fleet recovery
+
+- Scoped vault reindexing no longer forgets notes outside the selected scope.
+- Schema 17 gives dream cooldowns, budgets, topic caches and night watermarks
+  a profile owner, and separates thread ownership from author attribution.
+  Unambiguous legacy ownership is migrated; ambiguous rows require an explicit map.
+- Runtime identities import memory files from the configured filesystem profile.
+- Add offline recovery from explicitly ordered, read-only store snapshots,
+  retaining memory IDs and remapping colliding turn IDs and their evidence links.
+  Recovery refuses conflicting owners and publishes only a verified new database.
+- Correct the 0.3.0 validation scope: its 6,223-row shared-store check did not
+  cover the other production databases or all services.
+
 ## 0.3.0 - profile isolation and retrieval efficiency
 
 - Enforce profile ownership across search, context, graph, imports, threads,

@@ -140,7 +140,7 @@ def _run_dream(
 
     # 1. Cooldown: per-mode timestamp gate (min interval between runs).
     ts_key = _K_DAY_RUN_TS if mode == "day" else _K_NIGHT_RUN_TS
-    last_run = db.get_state(ts_key)
+    last_run = db.get_state(ts_key, agent_id=config.agent_id)
     if last_run is not None:
         cooldown_s = config.dream_cooldown_minutes * 60
         # Cooldown applies per run for the day mode; for night mode the
@@ -152,12 +152,12 @@ def _run_dream(
     counter_key = _K_DAY_COUNTER if mode == "day" else _K_NIGHT_COUNTER
     date_key = _K_DAY_COUNTER_DATE if mode == "day" else _K_NIGHT_COUNTER_DATE
     today = time.strftime("%Y-%m-%d", time.gmtime(now))
-    counter_date = db.get_state(date_key)
-    counter = int(db.get_state(counter_key, 0) or 0)
+    counter_date = db.get_state(date_key, agent_id=config.agent_id)
+    counter = int(db.get_state(counter_key, 0, agent_id=config.agent_id) or 0)
     if counter_date != today:
         counter = 0
-        db.set_state(date_key, today)
-        db.set_state(counter_key, 0)
+        db.set_state(date_key, today, agent_id=config.agent_id)
+        db.set_state(counter_key, 0, agent_id=config.agent_id)
     if counter >= budget:
         return {"mode": mode, "skipped": "budget_exhausted", "counter": counter}
 
@@ -167,7 +167,7 @@ def _run_dream(
     if getattr(config, "trust_decay_enabled", True):
         search_decay_trust_scores(db, config, dry_run=False)
 
-    since_ts = _window_start(db, mode, now)
+    since_ts = _window_start(db, mode, now, agent_id=config.agent_id)
     recent = db.get_recent_memories(since_ts=since_ts, agent_id=config.agent_id, limit=200)
     # Cloud judgment is only allowed to see explicitly shareable memories.
     # Private memories may still be retrieved by normal agent search, but they
@@ -175,23 +175,25 @@ def _run_dream(
     recent = [m for m in recent if is_shareable_visibility(m.get("visibility"))]
     if not recent:
         # Nothing new; still record the run so cooldown resets.
-        db.set_state(ts_key, now)
+        db.set_state(ts_key, now, agent_id=config.agent_id)
         return {"mode": mode, "candidates": 0, "actions": 0}
 
     # 4. Local cosine pre-filter. Build a bounded candidate pair list.
     pairs = _select_candidate_pairs(db, recent, mode=mode)
     if not pairs:
-        db.set_state(ts_key, now)
+        db.set_state(ts_key, now, agent_id=config.agent_id)
         return {"mode": mode, "candidates": 0, "actions": 0}
 
     # 5. Two-stage cloud judgment.
     judgments = _cloud_judge(config, pairs, mode=mode)
     if not judgments:
-        db.set_state(ts_key, now)
+        db.set_state(ts_key, now, agent_id=config.agent_id)
         return {"mode": mode, "candidates": len(pairs), "actions": 0}
 
     # 6. Enforce per-topic cooldown on surviving judgments.
-    recent_topics: dict[str, float] = db.get_state(_K_RECENT_TOPICS, {}) or {}
+    recent_topics: dict[str, float] = db.get_state(
+        _K_RECENT_TOPICS, {}, agent_id=config.agent_id,
+    ) or {}
     cooldown_s = config.dream_cooldown_minutes * 60
     kept: list[dict[str, Any]] = []
     for j in judgments:
@@ -201,7 +203,7 @@ def _run_dream(
             continue
         kept.append(j)
         recent_topics[topic_key] = now
-    db.set_state(_K_RECENT_TOPICS, recent_topics)
+    db.set_state(_K_RECENT_TOPICS, recent_topics, agent_id=config.agent_id)
 
     # 7. Act on results (bounded by remaining budget).
     remaining = budget - counter
@@ -248,7 +250,8 @@ def _run_dream(
                         topic=title[:120],
                         importance=0.6,
                         source="dream",
-                        added_by=config.agent_id,
+                        added_by=actor,
+                        owner=config.agent_id,
                     )
                 except Exception as e:
                     log.warning("thread creation failed: %s", e)
@@ -263,8 +266,8 @@ def _run_dream(
         _append_diary(config, mode, line)
 
     # 8. Persist run state.
-    db.set_state(ts_key, now)
-    db.set_state(counter_key, counter + actions)
+    db.set_state(ts_key, now, agent_id=config.agent_id)
+    db.set_state(counter_key, counter + actions, agent_id=config.agent_id)
 
     return {
         "mode": mode,
@@ -646,10 +649,10 @@ def _expand_diary_path(p: str) -> str:
     return expanduser(p)
 
 
-def _window_start(db: RemnantDB, mode: str, now: float) -> float:
+def _window_start(db: RemnantDB, mode: str, now: float, *, agent_id: str) -> float:
     if mode == "day":
         return now - DAY_WINDOW_S
-    last_night = db.get_state(_K_NIGHT_RUN_TS)
+    last_night = db.get_state(_K_NIGHT_RUN_TS, agent_id=agent_id)
     if last_night is not None:
         return float(last_night)
     # First night run: look back 24h to keep the candidate set bounded.

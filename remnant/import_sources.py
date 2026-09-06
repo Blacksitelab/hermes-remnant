@@ -88,6 +88,12 @@ def _content_hash(text: str) -> str:
 _MEMORY_FILES = ("MEMORY.md", "USER.md")
 
 
+def source_profile_name(hermes_home: str | Path, configured_agent: str) -> str:
+    """Filesystem profile, independent of the runtime storage identity."""
+    home = Path(hermes_home)
+    return home.name if home.parent.name == "profiles" else configured_agent
+
+
 def discover_memory_store_entries(
     hermes_home: str | Path,
 ) -> Iterator[tuple[str, str, str]]:
@@ -313,8 +319,7 @@ def import_memory_store(
     }
     actor = config.agent_id
 
-    home = Path(hermes_home)
-    source_profile = home.name if home.parent.name == "profiles" else config.agent_id
+    source_profile = source_profile_name(hermes_home, config.agent_id)
     for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
         if prof != (profile or source_profile):
             continue

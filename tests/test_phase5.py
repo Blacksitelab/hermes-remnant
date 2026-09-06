@@ -154,7 +154,8 @@ def test_phase5_config_defaults():
 def test_thread_create_get_list(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        tid = create_thread(db, title="Build server", topic="build", importance=0.7,
+        tid = create_thread(db, owner="default", title="Build server",
+                            topic="build", importance=0.7,
                             tags=["infra"], related_entities=["build-srv"])
         assert tid
         t = db.get_thread(tid)
@@ -174,9 +175,9 @@ def test_thread_create_requires_title_and_topic(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
         with pytest.raises(ValueError):
-            create_thread(db, title="", topic="x")
+            create_thread(db, owner="default", title="", topic="x")
         with pytest.raises(ValueError):
-            create_thread(db, title="t", topic="")
+            create_thread(db, owner="default", title="t", topic="")
     finally:
         db.close()
 
@@ -184,7 +185,7 @@ def test_thread_create_requires_title_and_topic(hermes_home: Path):
 def test_thread_update(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        tid = create_thread(db, title="A", topic="a")
+        tid = create_thread(db, owner="default", title="A", topic="a")
         res = update_thread(db, tid, title="A2", importance=0.9, tags=["new"])
         assert res["title"] == "A2"
         assert res["importance"] == 0.9
@@ -206,7 +207,7 @@ def test_thread_update_unknown_returns_none(hermes_home: Path):
 def test_thread_resolve(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        tid = create_thread(db, title="A", topic="a")
+        tid = create_thread(db, owner="default", title="A", topic="a")
         res = resolve_thread(db, tid)
         assert res["status"] == "resolved"
     finally:
@@ -216,8 +217,8 @@ def test_thread_resolve(hermes_home: Path):
 def test_thread_list_status_filter(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        t1 = create_thread(db, title="A", topic="a")
-        t2 = create_thread(db, title="B", topic="b")
+        t1 = create_thread(db, owner="default", title="A", topic="a")
+        t2 = create_thread(db, owner="default", title="B", topic="b")
         resolve_thread(db, t1)
         active = list_threads(db, status="active")
         assert {t["id"] for t in active} == {t2}
@@ -235,7 +236,7 @@ def test_thread_list_status_filter(hermes_home: Path):
 def test_stale_threads_marks_old(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        tid = create_thread(db, title="old", topic="old")
+        tid = create_thread(db, owner="default", title="old", topic="old")
         # Manually back-date last_activity to 20 days ago.
         old = time.strftime("%Y-%m-%dT%H:%M:%SZ",
                             time.gmtime(time.time() - 20 * 86400))
@@ -257,7 +258,7 @@ def test_stale_threads_marks_old(hermes_home: Path):
 def test_stale_threads_skips_recent(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        create_thread(db, title="fresh", topic="fresh")
+        create_thread(db, owner="default", title="fresh", topic="fresh")
         assert sweep_stale_threads(db, days=14) == []
     finally:
         db.close()
@@ -371,8 +372,8 @@ def test_day_dream_budget_exhausted(hermes_home: Path, monkeypatch):
     try:
         # Pre-set the budget counter to the cap.
         today = time.strftime("%Y-%m-%d", time.gmtime())
-        db.set_state("day_counter_date", today)
-        db.set_state("day_counter", cfg.dream_day_budget)
+        db.set_state("day_counter_date", today, agent_id=cfg.agent_id)
+        db.set_state("day_counter", cfg.dream_day_budget, agent_id=cfg.agent_id)
         res = day_dream(db, cfg, emb)
         assert res["skipped"] == "budget_exhausted"
         assert res["counter"] == cfg.dream_day_budget
@@ -386,7 +387,7 @@ def test_day_dream_cooldown_skips(hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         # Pretend a day run happened moments ago.
-        db.set_state("day_run_ts", time.time() - 60)
+        db.set_state("day_run_ts", time.time() - 60, agent_id=cfg.agent_id)
         res = day_dream(db, cfg, emb)
         assert res["skipped"] == "cooldown"
     finally:
@@ -423,7 +424,7 @@ def test_dream_cooldown_per_topic(monkeypatch, hermes_home: Path):
         assert r1["actions"] >= 1
         # Second run on the same pair: cooldown should drop the judgment.
         # Force a fresh window so candidates are re-selected.
-        db.set_state("night_run_ts", time.time() - 10)  # not cooldown-gated
+        db.set_state("night_run_ts", time.time() - 10, agent_id=cfg.agent_id)  # not cooldown-gated
         r2 = night_dream(db, cfg, emb)
         assert r2["candidates"] >= 1
         assert r2["actions"] == 0, "cooldown should suppress repeated topic"
@@ -551,7 +552,7 @@ def test_dream_state_persisted_after_run(monkeypatch, hermes_home: Path):
         before = time.time()
         res = night_dream(db, cfg, emb)
         assert res["candidates"] >= 1
-        ts = db.get_state("night_run_ts")
+        ts = db.get_state("night_run_ts", agent_id=cfg.agent_id)
         assert ts is not None and float(ts) >= before
     finally:
         db.close()

@@ -1,5 +1,10 @@
 # Remnant 0.3.0 validation
 
+**Scope correction:** the 6,223-row result below covers the shared store only.
+The production services had explicit profile-store overrides, and three profiles
+loaded separate plugin copies. This did not validate a complete fleet rollout.
+See [0.3.1 recovery](2026-09-06-profile-recovery.md) for the follow-up.
+
 Baseline: `142aff3` (0.2.2). Release: profile isolation, correction retention,
 compact semantic scoring, deadline-aware prefetch, and bounded derived caches.
 

@@ -122,7 +122,7 @@ def test_health_report_exposes_schema_and_claim_lifecycle():
     db = open_db(default_db_path())
     try:
         report = health_report(db)
-        assert report["schema_version"] == 16
+        assert report["schema_version"] == 17
         assert "claims_by_resolution" in report
         assert "pending_extraction_age_s" in report
     finally:
