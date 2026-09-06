@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.2 - simpler recall, unchanged capabilities
+
+- Route recent unprocessed turns and conversation deduplication through the
+  shared recall service for both tools and automatic prefetch.
+- Consolidate search-result filtering and remove unused context formatting and
+  allocation implementations. Ownership and scope checks remain in place.
+- Remove unused Pydantic and Watchfiles runtime dependencies.
+- Reuse the query norm during exact vector scoring and compute ranking bounds
+  once per score lane. Keep the same ranking formula and vector format.
+- Report the context compiler's token count in prefetch diagnostics.
+- Preserve committed recall if the optional pending-turn lookup fails.
+
+All existing tools, dreams, Echo, graph retrieval, claims, imports and recovery
+remain available with unchanged defaults. No schema or embedding migration.
+
 ## 0.3.1 - profile state and fleet recovery
 
 - Scoped vault reindexing no longer forgets notes outside the selected scope.

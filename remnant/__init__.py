@@ -52,7 +52,7 @@ from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 
 
 class _SessionEmbedder:

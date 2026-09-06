@@ -185,6 +185,7 @@ class RecallService:
                     "created_at": turn.get("created_at"),
                     "score": 1.0,
                     "pending": True,
+                    "agent_id": request.agent_id,
                     "claim_status": "unprocessed",
                 },
             )
@@ -261,11 +262,16 @@ class RecallService:
             row.get("pending") and row.get("agent_id") == request.agent_id
         )]
         diagnostics["candidate_count"] = len(raw)
-        self._pending_overlay(request, raw)
+        try:
+            self._pending_overlay(request, raw)
+        except Exception:
+            # A delayed extraction queue must not erase committed recall.
+            diagnostics.update(degraded=True, reason="pending_overlay_failed")
+        before_dedup = len(raw)
         raw = _dedup_against_messages(raw, request.messages)
         diagnostics["post_dedup_count"] = len(raw)
         if not raw:
-            diagnostics.setdefault("reason", "no_results")
+            diagnostics.setdefault("reason", "all_deduped" if before_dedup else "no_results")
             diagnostics["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 3)
             return RecallResponse(diagnostics=diagnostics)
 
@@ -308,10 +314,7 @@ class RecallService:
             else self.config.injection_token_budget
         )
         compiled_context: CompiledContext | None = None
-        if request.output_mode == "context":
-            results = results[:limit]
-        else:
-            results = results[:limit]
+        results = results[:limit]
         context = ""
         if request.output_mode == "context":
             budget = effective_budget

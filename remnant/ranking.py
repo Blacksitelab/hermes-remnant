@@ -55,12 +55,12 @@ def rank_results(
         lane = str(row.get("_score_lane") or "unknown")
         value = float(row.get("score") or 0.0)
         lane_values.setdefault(lane, []).append(value)
+    lane_bounds = {lane: (min(values), max(values)) for lane, values in lane_values.items()}
 
     def _relevance(row: dict[str, Any]) -> tuple[float, float, str]:
         lane = str(row.get("_score_lane") or "unknown")
         native = float(row.get("score") or 0.0)
-        values = lane_values.get(lane) or [native]
-        low, high = min(values), max(values)
+        low, high = lane_bounds[lane]
         if high <= low:
             normalized = 1.0 if native > 0 else 0.01
         else:

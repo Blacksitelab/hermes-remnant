@@ -29,19 +29,22 @@ def _hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def cosine(a: list[float], b: list[float]) -> float:
+def cosine(a: list[float], b: list[float], *, squared_norm_a: float | None = None) -> float:
+    """Cosine similarity; a scan can reuse its unchanged query's squared norm."""
     if not a or not b or len(a) != len(b):
         return 0.0
+    if squared_norm_a is None:
+        squared_norm_a = 0.0
+        for x in a:
+            squared_norm_a += x * x
     dot = 0.0
-    na = 0.0
     nb = 0.0
     for x, y in zip(a, b):
         dot += x * y
-        na += x * x
         nb += y * y
-    if na == 0.0 or nb == 0.0:
+    if squared_norm_a == 0.0 or nb == 0.0:
         return 0.0
-    return dot / math.sqrt(na * nb)
+    return dot / math.sqrt(squared_norm_a * nb)
 
 
 class Embedder:
