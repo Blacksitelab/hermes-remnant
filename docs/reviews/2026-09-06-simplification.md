@@ -19,6 +19,8 @@ threads, vault indexing, imports and recovery remain available.
 - The 240 leadership and 120 held-out scenarios retain identical retrieval
   metrics: recall@5 and context precision 1.0, stale exposure zero. These are
   prepared-claim regression cases, not evidence of perfect extraction or answers.
+  Context text also matches after excluding the 20 historical fixtures'
+  run-local claim-closing timestamps; the held-out context is byte-identical.
 - Whole-package Ruff, compilation and wheel/sdist build pass. A clean virtual
   environment imports every installed-wheel module and passes database health
   without either removed dependency installed.
@@ -55,3 +57,18 @@ PYTHONPATH=. python evaluation/benchmarks/retrieval_hardening.py
 [Machine-readable comparison](../../evaluation/baselines/simplification-2026-09-06.json).
 The [first-principles analysis](../memory-first-principles.md) describes a
 separate, bounded accuracy experiment; it is not shipped behaviour.
+
+## Production-copy rehearsal
+
+A SQLite online backup on BSL-AI passed integrity and foreign-key checks and
+contains 9,140 memories across four owners. Both 0.3.1 and 0.3.2 were exercised
+against the same read-only snapshot using the gateway's Python 3.11 runtime and
+configured embedding service. All keyword, semantic, graph and hybrid result
+IDs match by profile, all returned IDs belong to the caller, provider context
+hashes match, and the existing Claire thread remains visible. The default
+profile receives no fleet results or context. Caller owner overrides do not
+broaden access.
+
+This was one deployment-shaped probe per profile, not a latency benchmark.
+Claire's prefetch was about 457 ms in both runs; the controlled scoring speedup
+must not be presented as a measured improvement for every live request.
