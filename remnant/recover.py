@@ -141,6 +141,13 @@ def build_recovery(manifest: dict[str, Any], output: str | Path) -> dict[str, An
                                 owner_col = OWNER_COLUMNS.get(table)
                                 if owner_col:
                                     owner = row[owner_col]
+                                    if (not owner
+                                        and table in ('memory_entities', 'entity_sightings')):
+                                        backing = source.execute(
+                                            'SELECT agent FROM memories WHERE id=?',
+                                            (row['memory_id'],),
+                                        ).fetchone()
+                                        owner = backing['agent'] if backing else None
                                     if table == 'threads' and not owner:
                                         owner = spec.get('thread_owners', {}).get(row['id'])
                                     if table == 'dream_state' and not owner:

@@ -116,3 +116,24 @@ def test_recovery_refuses_combining_profile_owners(tmp_path):
             'path': str(tmp_path / 'unused.db'),
             'owners': {'alice': 'alice', 'bob': 'alice'},
         }]}, tmp_path / 'result.db')
+
+
+def test_recovery_infers_nullable_legacy_link_owners_from_backing_memory(tmp_path):
+    source = tmp_path / 'legacy-links.db'
+    memory = seed(source, 'alice')
+    db = open_db(source)
+    entity = db.resolve_entity('Legacy shared node')
+    db.link_entity(memory_id=memory, entity_id=entity, agent_id='alice')
+    db._conn.execute('UPDATE memory_entities SET agent=NULL')
+    db._conn.execute("INSERT INTO entity_sightings VALUES('legacy',NULL,?,'2026-09-06')",
+                     (memory,))
+    db.close()
+    output = tmp_path / 'recovered.db'
+    build_recovery({'sources': [{'path': str(source), 'owners': {'alice': 'alice'}}]}, output)
+    db = open_db(output)
+    try:
+        for table in ('memory_entities', 'entity_sightings'):
+            assert db._conn.execute(f'SELECT agent FROM {table}').fetchone()[0] == 'alice'
+        assert db.get_entity(entity)['agent'] is None
+    finally:
+        db.close()

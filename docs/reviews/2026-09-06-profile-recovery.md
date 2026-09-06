@@ -29,8 +29,9 @@ supplies another profile's owner override. The default profile receives no fleet
 memories. The final deployment must repeat snapshots and validation after all
 writers are stopped; rehearsal counts are not a frozen production count.
 
-452 automated tests pass, including the four regressions and recovery checks for
+453 automated tests pass, including the four regressions and recovery checks for
 colliding numeric turn IDs, duplicate source snapshots, input preservation,
-unknown owners, conflicting evidence and output overwrite refusal.
+unknown owners, conflicting evidence, output overwrite refusal, and legacy graph
+links whose owner must be inferred from their backing memory.
 
 See [the recovery procedure](../profile-recovery.md) for operator gates and rollback.
