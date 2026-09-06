@@ -4,7 +4,8 @@ Implements the Hermes ``MemoryProvider`` ABC. Configuration stays profile-scoped
 under ``hermes_home`` (loaded from ``hermes_home/remnant.json``), but the SQLite
 database is **shared** across all profiles/agents at
 ``~/.hermes/remnant/remnant.db`` (overridable via ``REMNANT_DB_HOME``) so that
-storage can be backed up centrally while provider access remains profile-owned. ``sync_turn`` is non-blocking:
+storage can be backed up centrally while provider access remains profile-owned.
+``sync_turn`` is non-blocking:
 it persists the raw turn and enqueues extraction in a single SQLite
 transaction, then wakes the background worker.
 """
@@ -979,7 +980,8 @@ class RemnantMemoryProvider(MemoryProvider):
     ) -> dict[str, Any]:
         """Import memories from an existing store.
 
-        ``source`` is ``"memory_store"`` (the current profile's MEMORY.md / USER.md), ``"hindsight"`` (bounded broad-query recall), or ``"vault"``
+        ``source`` is ``"memory_store"`` (the current profile's MEMORY.md / USER.md),
+        ``"hindsight"`` (bounded broad-query recall), or ``"vault"``
         (delegates to ``reindex_vault``). Returns a stats dict. Safe to call
         from an external cron/timer.
         """
