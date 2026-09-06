@@ -114,6 +114,10 @@ profile can retrieve and modify only its own memories, including vault notes.
 access. Named profiles use their directory name as their storage identity;
 configurations under `hermes_home/remnant.json` remain independent.
 
+For upgrades from split profile stores, use the explicit
+[offline fleet recovery procedure](docs/profile-recovery.md). Schema migration
+alone does not combine databases or change running service paths.
+
 Version 0.3.0 migrates vault tracking to `(profile, path)` keys without changing
 existing memory ownership. Runtime identity v2 also includes the profile. Older
 runtime identity v1 records remain preserved but require an explicit operator

@@ -45,14 +45,14 @@ from .echo_worker import EchoWorker
 from .embed import Embedder
 from .extract import ExtractionWorker
 from .identity import EffectiveIdentity, effective_identity
-from .import_sources import import_hindsight, import_memory_store
+from .import_sources import import_hindsight, import_memory_store, source_profile_name
 from .ingest import ingest_turn, store_memory
 from .prefetch import prefetch as _run_prefetch
 from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 
 class _SessionEmbedder:
@@ -575,6 +575,8 @@ class RemnantMemoryProvider(MemoryProvider):
             session_id=session_id,
             agent_id=agent_id,
             hermes_home=self._hermes_home,
+            configured_profile=(self._effective_identity.configured_agent
+                                if self._effective_identity else None),
             echo=self._echo,
         )
         # Hermes puts tool results directly into message content; the Ollama
@@ -987,8 +989,14 @@ class RemnantMemoryProvider(MemoryProvider):
         """
         if self._db is None or self._config is None or self._embedder is None:
             return {"error": "provider not initialized"}
-        if profile is not None and profile != self._config.agent_id:
+        source_profile = source_profile_name(
+            self._hermes_home,
+            self._effective_identity.configured_agent
+            if self._effective_identity else self._config.agent_id,
+        )
+        if profile is not None and profile != source_profile:
             return {"error": "imports are restricted to the current profile"}
+        profile = source_profile
         if source == "vault":
             return self.reindex_vault()
         if source not in ("memory_store", "hindsight"):

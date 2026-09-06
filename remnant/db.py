@@ -24,9 +24,9 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
-from .scope import VISIBILITY_ORDER, normalize_profile_scope
+from .scope import VISIBILITY_ORDER, normalize_profile_scope, path_in_profile_scope
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents. Provider APIs enforce ownership; only operator APIs allow unscoped
@@ -277,6 +277,7 @@ CREATE TABLE IF NOT EXISTS threads (
     related_entities TEXT,
     source TEXT,
     added_by TEXT,
+    owner TEXT,
     created_at TEXT NOT NULL,
     last_activity TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -286,9 +287,11 @@ CREATE INDEX IF NOT EXISTS idx_threads_topic ON threads(topic);
 CREATE INDEX IF NOT EXISTS idx_threads_last_activity ON threads(last_activity);
 
 CREATE TABLE IF NOT EXISTS dream_state (
-    key TEXT PRIMARY KEY,
+    owner TEXT NOT NULL DEFAULT '',
+    key TEXT NOT NULL,
     value TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(owner, key)
 );
 
 -- Issue #5: pending entity sightings. When the regex extraction path defers
@@ -561,6 +564,7 @@ class RemnantDB:
             cur.executescript(_SCHEMA)
             cur.executescript(_FTS_TRIGGERS)
             self._apply_migrations(cur)
+            self._migrate_profile_state(cur)
             vault_columns = {row["name"] for row in cur.execute("PRAGMA table_info(vault_files)")}
             if "agent" not in vault_columns:
                 # Preserve every legacy mapping under its backing memory's owner.
@@ -614,6 +618,43 @@ class RemnantDB:
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES(?,?)",
                 ("version", str(SCHEMA_VERSION)),
             )
+
+    def _migrate_profile_state(self, cur: sqlite3.Cursor) -> None:
+        """Keep authorship separate from ownership; never guess in a mixed store."""
+        thread_cols = {row["name"] for row in cur.execute("PRAGMA table_info(threads)")}
+        state_cols = {row["name"] for row in cur.execute("PRAGMA table_info(dream_state)")}
+        if "owner" in thread_cols and "owner" in state_cols:
+            return
+        owners = [row[0] for row in cur.execute(
+            "SELECT agent FROM memories WHERE agent IS NOT NULL AND agent NOT IN ('','system') "
+            "UNION SELECT agent_id FROM turns WHERE agent_id NOT IN ('','system')"
+        )]
+        sole_owner = owners[0] if len(owners) == 1 else None
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            if "owner" not in thread_cols:
+                cur.execute("ALTER TABLE threads ADD COLUMN owner TEXT")
+                cur.execute(
+                    "UPDATE threads SET owner=CASE WHEN added_by IS NOT NULL "
+                    "AND added_by NOT IN ('','system') THEN added_by ELSE ? END",
+                    (sole_owner,),
+                )
+            if "owner" not in state_cols:
+                cur.execute("ALTER TABLE dream_state RENAME TO dream_state_legacy")
+                cur.execute(
+                    "CREATE TABLE dream_state(owner TEXT NOT NULL DEFAULT '', key TEXT NOT NULL, "
+                    "value TEXT NOT NULL, updated_at TEXT NOT NULL, PRIMARY KEY(owner,key))"
+                )
+                cur.execute(
+                    "INSERT INTO dream_state SELECT ?,key,value,updated_at FROM dream_state_legacy",
+                    (sole_owner or "",),
+                )
+                cur.execute("DROP TABLE dream_state_legacy")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_threads_owner ON threads(owner)")
+            cur.execute("COMMIT")
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     def _apply_migrations(self, cur: sqlite3.Cursor) -> None:
         """Idempotent column additions for tables created in earlier phases.
@@ -2834,10 +2875,12 @@ class RemnantDB:
 
     def mark_vault_forgotten_for_missing(
         self, present_paths: set[str], *, agent_id: str | None = None,
+        profile_scope: list[str] | None = None,
     ) -> list[str]:
         forgotten = []
         for row in self.get_all_vault_files(agent_id=agent_id):
-            if row["path"] not in present_paths:
+            if (row["path"] not in present_paths
+                and path_in_profile_scope(row["path"], profile_scope)):
                 ids = [p["memory_id"] for p in self.get_vault_passages(
                     row["path"], agent_id=row["agent"],
                 )]
@@ -2956,22 +2999,26 @@ class RemnantDB:
         related_entities: list[str] | None = None,
         source: str = "manual",
         added_by: str = "system",
+        owner: str | None = None,
     ) -> str:
         """Create a thread. Returns its id."""
         if not title.strip() or not topic.strip():
             raise ValueError("title and topic are required")
+        owner = owner or added_by
+        if not owner or owner == "system":
+            raise ValueError("an explicit thread owner is required")
         tid = _uuid()
         now = _now_iso()
         with self.transaction() as cur:
             cur.execute(
                 "INSERT INTO threads(id, title, topic, status, importance, tags, "
                 "related_entities, source, added_by, created_at, last_activity, "
-                "updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "updated_at, owner) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     tid, title, topic, "active", importance,
                     json.dumps(tags) if tags else None,
                     json.dumps(related_entities) if related_entities else None,
-                    source, added_by, now, now, now,
+                    source, added_by, now, now, now, owner,
                 ),
             )
             return tid
@@ -3042,7 +3089,7 @@ class RemnantDB:
             sql += " AND status=?"
             params.append(status)
         if agent_id is not None:
-            sql += " AND added_by=?"
+            sql += " AND owner=?"
             params.append(agent_id)
         sql += " ORDER BY last_activity DESC LIMIT ?"
         params.append(limit)
@@ -3058,7 +3105,7 @@ class RemnantDB:
         with self.read() as cur:
             cur.execute(
                 "SELECT * FROM threads WHERE status='active' AND last_activity < ? "
-                "AND (? IS NULL OR added_by=?) ORDER BY last_activity ASC",
+                "AND (? IS NULL OR owner=?) ORDER BY last_activity ASC",
                 (cutoff, agent_id, agent_id),
             )
             return [_decode_thread(dict(r)) for r in cur.fetchall()]
@@ -3082,10 +3129,10 @@ class RemnantDB:
 
     # -- dream_state (Phase 5) -------------------------------------------------
 
-    def get_state(self, key: str, default: Any = None) -> Any:
+    def get_state(self, key: str, default: Any = None, *, agent_id: str = "") -> Any:
         """Return a JSON-decoded value from dream_state, or `default`."""
         with self.read() as cur:
-            cur.execute("SELECT value FROM dream_state WHERE key=?", (key,))
+            cur.execute("SELECT value FROM dream_state WHERE owner=? AND key=?", (agent_id, key))
             row = cur.fetchone()
         if row is None:
             return default
@@ -3094,13 +3141,13 @@ class RemnantDB:
         except (json.JSONDecodeError, TypeError):
             return default
 
-    def set_state(self, key: str, value: Any) -> None:
+    def set_state(self, key: str, value: Any, *, agent_id: str = "") -> None:
         """Persist a JSON-serializable value under `key`."""
         with self.transaction() as cur:
             cur.execute(
-                "INSERT OR REPLACE INTO dream_state(key, value, updated_at) "
-                "VALUES(?,?,?)",
-                (key, json.dumps(value, default=str), _now_iso()),
+                "INSERT OR REPLACE INTO dream_state(owner, key, value, updated_at) "
+                "VALUES(?,?,?,?)",
+                (agent_id, key, json.dumps(value, default=str), _now_iso()),
             )
 
     def get_recent_memories(

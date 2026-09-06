@@ -27,7 +27,7 @@ from .db import RemnantDB
 from .edit import memory_edit
 from .embed import Embedder
 from .graph import graph_traverse
-from .import_sources import import_hindsight, import_memory_store
+from .import_sources import import_hindsight, import_memory_store, source_profile_name
 from .ingest import store_memory
 from .recall import RecallRequest, RecallService
 from .reflect import memory_reflect
@@ -359,6 +359,7 @@ def handle_tool_call(
     session_id: str,
     agent_id: str | None = None,
     hermes_home: str | None = None,
+    configured_profile: str | None = None,
     echo: Any | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call. Returns a tool-result dict for the agent."""
@@ -538,12 +539,14 @@ def handle_tool_call(
             return {"error": f"unknown import source: {source}"}
         dry_run = bool(args.get("dry_run", False))
         shadow = bool(args.get("shadow", False))
+        home = hermes_home or str(Path.home() / ".hermes")
+        source_profile = source_profile_name(home, configured_profile or aid)
         profile = args.get("profile")
         if profile is not None:
             profile = str(profile).strip() or None
-        if profile is not None and profile != aid:
+        if profile is not None and profile != source_profile:
             return {"error": "imports are restricted to the current profile"}
-        profile = aid
+        profile = source_profile
         if source == "vault":
             force = bool(args.get("force", False))
             stats = index_vault(db, config, embedder, force=force)
@@ -574,7 +577,7 @@ def handle_tool_call(
             return {"error": "action is required"}
         if action in {"update", "resolve"}:
             thread = db.get_thread(str(args.get("thread_id") or ""))
-            if thread is None or thread.get("added_by") != aid:
+            if thread is None or thread.get("owner") != aid:
                 return {"error": "thread not found"}
         if action == "create":
             title = str(args.get("title", "")).strip()

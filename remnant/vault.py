@@ -402,9 +402,9 @@ def index_vault(
         return {"indexed": indexed, "skipped": skipped, "forgotten": 0, "failed": 1}
     for abs_path in markdown_paths:
         rel = _relative_path(abs_path, vault_root)
+        seen_paths.add(rel)
         if not path_in_profile_scope(rel, config.profile_scope):
             continue
-        seen_paths.add(rel)
         if not force:
             try:
                 hash_hex = _file_hash(abs_path)
@@ -420,7 +420,9 @@ def index_vault(
         if mid:
             indexed += 1
 
-    forgotten = db.mark_vault_forgotten_for_missing(seen_paths, agent_id=config.agent_id)
+    forgotten = db.mark_vault_forgotten_for_missing(
+        seen_paths, agent_id=config.agent_id, profile_scope=config.profile_scope,
+    )
     return {"indexed": indexed, "skipped": skipped, "forgotten": len(forgotten)}
 
 

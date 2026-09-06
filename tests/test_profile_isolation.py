@@ -205,3 +205,102 @@ def test_model_backfill_sends_only_selected_profiles_evidence(db):
     result = run_model_backfill(db, RemnantConfig(agent_id="bob"), model_call=model)
     assert result["targeted"] == 1
     assert prompts and "Alice" not in prompts[0]
+
+
+def test_scoped_vault_reindex_preserves_out_of_scope_mappings(db, tmp_path):
+    for folder in ('inside', 'outside'):
+        (tmp_path / folder).mkdir()
+        (tmp_path / folder / 'note.md').write_text(f'# {folder}\nOriginal note')
+    cfg = RemnantConfig(agent_id='alice', vault_path=str(tmp_path), embed_dim=2)
+    index_vault(db, cfg, Vectors())
+    outside = db.get_vault_memory('outside/note.md', agent_id='alice')
+    cfg.profile_scope = ['inside']
+    (tmp_path / 'inside/note.md').unlink()
+    result = index_vault(db, cfg, Vectors())
+    assert result['forgotten'] == 1
+    assert db.get_vault_memory('outside/note.md', agent_id='alice') == outside
+    assert db.get_memory(outside)['status'] == 'active'
+    cfg.profile_scope = []
+    index_vault(db, cfg, Vectors())
+    assert db.get_vault_memory('outside/note.md', agent_id='alice') == outside
+
+
+def test_dream_state_is_owned_including_night_window(db, monkeypatch):
+    import time
+
+    from remnant import dream
+
+    now = time.time()
+    today = time.strftime('%Y-%m-%d', time.gmtime(now))
+    for key, value in (('day_run_ts', now), ('night_run_ts', now),
+                       ('day_counter_date', today), ('day_counter', 999),
+                       ('recent_topics', {'secret': now})):
+        db.set_state(key, value, agent_id='alice')
+    seen = []
+    monkeypatch.setattr(db, 'get_recent_memories',
+                        lambda **kw: seen.append(kw) or [])
+    cfg = RemnantConfig(agent_id='bob', trust_decay_enabled=False)
+    assert 'skipped' not in day_dream(db, cfg, Vectors())
+    dream.night_dream(db, cfg, Vectors())
+    assert seen[-1]['agent_id'] == 'bob'
+    assert seen[-1]['since_ts'] < now - 86000
+    assert db.get_state('day_counter', agent_id='bob') == 0
+    assert db.get_state('recent_topics', agent_id='bob') is None
+    assert db.get_state('day_counter', agent_id='alice') == 999
+    assert dream._window_start(db, 'night', now, agent_id='alice') == now
+
+
+def test_runtime_identity_import_uses_filesystem_profile(db, tmp_path):
+    from remnant.identity import effective_identity
+
+    home = tmp_path / 'profiles' / 'bob'
+    home.mkdir(parents=True)
+    (home / 'MEMORY.md').write_text('- Bob prefers a midnight editor theme.')
+    identity = effective_identity(configured_agent='bob', session_id='test',
+                                  runtime_identity_enabled=True)
+    p = make_provider(db, identity.storage_key)
+    p._effective_identity = identity
+    p._hermes_home = str(home)
+    result = json.loads(p.handle_tool_call('memory_import', {'source': 'memory_store'}))
+    assert result['stats']['imported'] == 1
+    assert db.list_memories(agent_id=identity.storage_key)
+    assert db.list_memories(agent_id='bob') == []
+    assert p.import_memory('memory_store', profile='bob', dry_run=True)['discovered'] == 1
+    assert p.import_memory('memory_store', profile='alice').get('error')
+    assert json.loads(p.handle_tool_call('memory_import', {
+        'source': 'memory_store', 'profile': 'alice',
+    })).get('error')
+
+
+@pytest.mark.parametrize('mixed', [False, True])
+def test_legacy_system_thread_and_state_migration_requires_known_owner(tmp_path, mixed):
+    path = tmp_path / 'legacy-state.db'
+    old = open_db(path)
+    old.insert_memory(content='Alice evidence', agent='alice')
+    if mixed:
+        old.insert_memory(content='Bob evidence', agent='bob')
+    tid = old.insert_thread(title='Existing dream', topic='Legacy topic',
+                            added_by='system', owner='alice')
+    old._conn.executescript('''
+        ALTER TABLE threads DROP COLUMN owner;
+        DROP TABLE dream_state;
+        CREATE TABLE dream_state(key TEXT PRIMARY KEY, value TEXT NOT NULL,
+                                 updated_at TEXT NOT NULL);
+        INSERT INTO dream_state VALUES('night_run_ts','123','2026-09-06');
+        UPDATE schema_meta SET value='16' WHERE key='version';
+    ''')
+    old.close()
+    new = open_db(path)
+    try:
+        thread = new.get_thread(tid)
+        assert thread['added_by'] == 'system'  # Authorship is retained.
+        assert thread['owner'] == (None if mixed else 'alice')
+        assert bool(new.list_threads(agent_id='alice')) is (not mixed)
+        assert new.list_threads(agent_id='bob') == []
+        assert new.get_state('night_run_ts', agent_id='alice') == (None if mixed else 123)
+        if mixed:
+            assert new.get_state('night_run_ts') == 123  # Preserved for explicit mapping.
+        with pytest.raises(ValueError, match='owner'):
+            new.insert_thread(title='Unowned', topic='Unowned')
+    finally:
+        new.close()

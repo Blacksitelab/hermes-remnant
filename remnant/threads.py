@@ -31,6 +31,7 @@ def create_thread(
     related_entities: list[str] | None = None,
     source: str = "manual",
     added_by: str = "system",
+    owner: str | None = None,
 ) -> str:
     """Create a thread and return its id."""
     return db.insert_thread(
@@ -41,6 +42,7 @@ def create_thread(
         related_entities=related_entities,
         source=source,
         added_by=added_by,
+        owner=owner,
     )
 
 
