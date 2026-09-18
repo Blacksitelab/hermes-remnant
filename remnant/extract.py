@@ -17,6 +17,7 @@ import logging
 import re
 import threading
 import time
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -131,10 +132,13 @@ class ExtractionWorker:
         db: RemnantDB,
         embedder: Embedder,
         config: RemnantConfig,
+        *,
+        after_extraction: Callable[[], Any] | None = None,
     ):
         self._db = db
         self._embedder = embedder
         self._config = config
+        self._after_extraction = after_extraction
         self._keep_alive = getattr(config, "extract_keep_alive", "2m")
         self._client = httpx.Client(timeout=config.extract_timeout)
         self._stop = threading.Event()
@@ -245,6 +249,11 @@ class ExtractionWorker:
                     self._enqueue_startup()
                     self._startup_done.set()
                 self._drain()
+                if self._after_extraction is not None and not self._stop.is_set():
+                    # The callback claims at most one historical job. It is
+                    # intentionally after the normal drain, so ordinary turns
+                    # never acquire a second model call.
+                    self._after_extraction()
                 self._db.flush_diagnostics()
                 if time.monotonic() >= next_maintenance and not self._stop.is_set():
                     next_maintenance = time.monotonic() + 300.0

@@ -269,6 +269,10 @@ class RemnantConfig:
     # scoped, which would otherwise prevent useful cross-session recall.
     runtime_identity_enabled: bool = False
     ranking_profile: str = "claims-v1"
+    # Historical recall is explicit and reads Hermes' profile-local state.db.
+    history_enabled: bool = True
+    history_timezone: str = "UTC"
+    history_summary_enabled: bool = True
     recent_turn_overlay_limit: int = 3
     recent_turn_overlay_max_age_s: int = 900
     recent_turn_overlay_max_chars: int = 4000

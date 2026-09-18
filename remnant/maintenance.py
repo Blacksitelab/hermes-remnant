@@ -239,6 +239,30 @@ def health_report(db: RemnantDB, config: RemnantConfig | None = None) -> dict[st
     availability = availability_report(db_path=Path(db.path))
     total_prefetch = sum(prefetch.values())
     scan_limit = (config or RemnantConfig()).semantic_scan_limit
+    history_cache = db.history_summary_health()
+    cur_history_statuses = history_cache["statuses"]
+    with db.read() as cur:
+        cur.execute(
+            "SELECT elapsed_ms FROM operation_metrics "
+            "WHERE operation IN ('history_recall','history_summary') "
+            "ORDER BY id DESC LIMIT 1000"
+        )
+        history_latencies = [float(row["elapsed_ms"]) for row in cur.fetchall()]
+        cur.execute(
+            "SELECT COUNT(*) AS n,"
+            "COALESCE(SUM(CASE WHEN status='ready' THEN 1 ELSE 0 END),0) AS ready "
+            "FROM history_summaries "
+            "WHERE status IN ('ready','running','pending','retry_wait','dead_letter')"
+        )
+        history_sources = dict(cur.fetchone())
+    history_by_status = {
+        "ready": int(cur_history_statuses.get("ready", 0)),
+        "partial": int(history_cache.get("partial", 0)),
+        "pending": int(cur_history_statuses.get("pending", 0)),
+        "retry": int(cur_history_statuses.get("retry_wait", 0)),
+        "dead_letter": int(cur_history_statuses.get("dead_letter", 0)),
+        "running": int(cur_history_statuses.get("running", 0)),
+    }
     return {
         "availability": availability,
         "schema_version": SCHEMA_VERSION,
@@ -294,6 +318,29 @@ def health_report(db: RemnantDB, config: RemnantConfig | None = None) -> dict[st
         },
         "last_vault_scan": last_vault_scan,
         "last_dream_runs": dream_runs,
+        "history": {
+            "summary_cache": {
+                "rows": history_cache["rows"],
+                "cap": history_cache["cap"],
+                "usage": round(history_cache["rows"] / history_cache["cap"], 4)
+                if history_cache["cap"] else 0.0,
+                "by_status": history_by_status,
+            },
+            "summary_attempts": history_cache["attempts"],
+            "summary_failures": history_cache["failures"],
+            "latency_ms": {
+                "p50": _percentile(history_latencies, 0.50),
+                "p95": _percentile(history_latencies, 0.95),
+                "sample": len(history_latencies),
+            },
+            "returned_vs_available": {
+                "returned": None,
+                "available": None,
+                "measured": False,
+                "retained_summary_rows": history_sources["n"],
+                "ready_summary_rows": history_sources["ready"],
+            },
+        },
     }
 
 

@@ -44,6 +44,7 @@ from .echo_evaluate import EchoEvaluator
 from .echo_worker import EchoWorker
 from .embed import Embedder
 from .extract import ExtractionWorker
+from .history import HistoryService
 from .identity import EffectiveIdentity, effective_identity
 from .import_sources import import_hindsight, import_memory_store, source_profile_name
 from .ingest import ingest_turn, store_memory
@@ -154,6 +155,9 @@ _SYSTEM_PROMPT_BLOCK = (
     "vault documents to a set of allowed path prefixes.\n"
     "Use the `memory_store` tool to save a durable fact explicitly.\n"
     "Use the `memory_reflect` tool to synthesize an answer across stored memories.\n"
+    "Use the `memory_history` tool for explicit questions about past conversations. "
+    "Historical dates require an explicit year and IANA timezone when needed; "
+    "results may be partial and always show source links and uncertainty.\n"
     "Use the `memory_graph` tool to explore entities and their connected memories.\n"
     "Use the `memory_edit` tool to update, merge, forget, score, or share memories. "
     "Nothing is ever deleted: forgotten memories stay in the DB but are hidden from "
@@ -291,6 +295,25 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
             "when the gateway supplies a stable platform user identity"
         ),
         "default": False,
+    },
+    {
+        "key": "history_enabled",
+        "description": "Enable explicit historical conversation recall",
+        "default": True,
+        "type": "boolean",
+        "required": False,
+    },
+    {
+        "key": "history_timezone",
+        "description": "Default IANA timezone for historical date boundaries",
+        "default": "UTC",
+        "type": "string",
+        "required": False,
+    },
+    {
+        "key": "history_summary_enabled",
+        "description": "Enable bounded asynchronous historical session summaries",
+        "default": True,
         "type": "boolean",
         "required": False,
     },
@@ -429,6 +452,7 @@ class RemnantMemoryProvider(MemoryProvider):
         self._db: RemnantDB | None = None
         self._embedder: Embedder | None = None
         self._worker: ExtractionWorker | None = None
+        self._history: HistoryService | None = None
         self._echo: EchoService | None = None
         self._echo_worker: EchoWorker | None = None
         self._session_id: str = ""
@@ -507,7 +531,18 @@ class RemnantMemoryProvider(MemoryProvider):
                 model_busy=lambda: bool(self._worker and self._worker.active_jobs),
             )
             self._echo_worker.start()
-        self._worker = ExtractionWorker(self._db, self._embedder, self._config)
+        self._history = HistoryService(
+            self._db,
+            self._config,
+            profile_home=self._hermes_home,
+            trusted_session_ids={self._session_id},
+        )
+        self._worker = ExtractionWorker(
+            self._db,
+            self._embedder,
+            self._config,
+            after_extraction=self._history.process_one_summary_if_pending,
+        )
         self._worker.start()
         self._prefetch_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="remnant-prefetch"
@@ -578,6 +613,7 @@ class RemnantMemoryProvider(MemoryProvider):
             configured_profile=(self._effective_identity.configured_agent
                                 if self._effective_identity else None),
             echo=self._echo,
+            history=self._history,
         )
         # Hermes puts tool results directly into message content; the Ollama
         # cloud proxy rejects dict content ("invalid message content type:
@@ -923,6 +959,8 @@ class RemnantMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
         """Give already-queued turn extraction a short bounded flush window."""
+        if self._history is not None and self._agent_context in {"primary", ""}:
+            self._history.enqueue_session(self._session_id)
         if self._worker is not None:
             self._worker.wait_until_idle(timeout_s=1.5, session_id=self._session_id)
 
@@ -935,9 +973,18 @@ class RemnantMemoryProvider(MemoryProvider):
         rewound: bool = False,
         **_: Any,
     ) -> None:
-        """Discard session-local recall state when Hermes rotates a session."""
+        """Discard session-local recall state when Hermes rotates sessions."""
         old_session_id = self._session_id
+        if (
+            old_session_id
+            and old_session_id != new_session_id
+            and self._history is not None
+            and self._agent_context in {"primary", ""}
+        ):
+            self._history.enqueue_session(old_session_id)
         self._session_id = new_session_id or "default"
+        if self._history is not None:
+            self._history.trusted_session_ids.add(self._session_id)
         affected = {old_session_id, self._session_id, parent_session_id}
         if reset or rewound:
             affected.add(new_session_id)

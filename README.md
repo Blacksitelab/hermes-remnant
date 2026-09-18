@@ -19,6 +19,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 - **Self-edits** — agents can update, merge, forget, share, unshare, and score memories through tools.
 - **Searches three ways** — BM25 keyword, cosine vector similarity, entity-graph traversal, plus a hybrid RRF fusion.
 - **Proactively injects context** via Hermes' `prefetch()` hook, with a hard deadline, token budget, and diff-based suppression.
+- **Recalls conversation history explicitly** with `memory_history`, using the profile-local Hermes archive for dated, relative, topic, decision, correction, and unresolved-work questions.
 - **Indexes the Obsidian vault** as `document` memories, respecting workspace exclusions, frontmatter, locked notes, and per-agent profile scopes.
 - **Extracts entities with GLiNER** — a lightweight NER model (`urchade/gliner_small_v2`) extracts named entities with typed labels (person, tool, service, project, place, organization, concept). Falls back to regex if GLiNER is unavailable.
 - **Classifies typed relations** — co-occurrence edges are classified into semantic types (owns, uses, created, depends_on, monitors, manages, interacts_with, references, part_of) using entity-type heuristics.
@@ -167,9 +168,10 @@ remnant/
 ├── entity.py               # Entity extraction (GLiNER + regex fallback), resolution, alias normalization
 ├── graph.py                 # Pure-SQLite graph traversal
 ├── search.py                # BM25, vector, RRF, graph, profile-scope search
-├── tools.py                 # Tool schemas and dispatch (search/store/edit/graph/reflect/import/thread)
+├── tools.py                 # Tool schemas and dispatch (search/history/store/edit/graph/reflect/import/thread)
 ├── edit.py                  # memory_edit actions + audit logging
 ├── prefetch.py              # Proactive prefetch with deadline/budget/dedup + entity-graph query expansion
+├── history.py               # Read-only Hermes archive adapter and bounded historical recall
 ├── reflect.py               # memory_reflect synthesis
 ├── vault.py                 # Obsidian vault indexer
 ├── threads.py               # Thread CRUD + stale sweep
@@ -215,6 +217,7 @@ The provider implements the Hermes `MemoryProvider` ABC:
 | `get_tool_schemas()` | Exposes all memory tools |
 | `handle_tool_call(tool_name, args, ...)` | Dispatches to internal tools |
 | `on_session_switch()` | Clears per-session recall state when Hermes rotates sessions |
+| `on_session_end()` | Coalesces an asynchronous historical-summary job for the ended session |
 | `backup_paths()` | Declares the shared database for Hermes backups |
 | `shutdown()` | Stops worker, closes DB |
 
@@ -248,8 +251,64 @@ the configured embedding or extraction service is unavailable.
 | `memory_edit` | Update, merge, forget, feedback, share, unshare a memory |
 | `memory_graph` | Traverse entity graph around a named entity |
 | `memory_reflect` | Synthesize an answer across top memories |
+| `memory_history` | Recall source-linked historical conversation evidence by time, topic, or session |
 | `memory_thread` | Create, update, resolve, list, or sweep stale threads |
 | `memory_import` | Import from `vault`, `memory_store`, or `hindsight` |
+
+---
+
+## Historical conversation recall
+
+`memory_history` is explicit rather than automatic: use it for questions about
+what was discussed, a project decision, a correction, an abandoned proposal, or
+unresolved alternatives. Examples:
+
+```json
+{"query":"the deployment rollback decision","synthesize":false}
+{"start":"2024-06-14","timezone":"Pacific/Auckland"}
+{"relative":"yesterday","timezone":"America/New_York"}
+{"query":"printer project","cursor":"<next_cursor from the previous result>"}
+```
+
+`start` is inclusive and `end` is exclusive. A date-only `start` selects that
+local calendar day; a datetime start needs an explicit end. `today`,
+`yesterday`, and `last_week` use local civil midnights in the selected IANA
+zone, while `6h`, `2d`, and `1w` are rolling elapsed durations. Dates must have
+a four-digit year; naive datetimes and unknown zones are rejected. DST
+short/long days are handled as calendar boundaries, not as 24-hour arithmetic.
+
+The tool reads only the active profile's Hermes `state.db`. It returns native
+session/message links, uncertainty, and coverage. Interactive sessions are
+preferred; `cron` history is labelled as automated. Hidden sessions, kanban,
+subagent/tool scaffolding, rewound inactive rows, hidden display rows, and
+compressed-summary rows are excluded. Runtime-identity mode additionally
+requires known ownership in Remnant turns; unknown historical ownership fails
+closed. Parent/delegation links do not grant access to another session.
+
+Coverage is deliberately bounded and may be partial: at most 200 date-session
+candidates, 20 sessions, 100 topic hits, 80 raw messages, and 2,000 characters
+per excerpt are considered in one call. Continue with `next_cursor` when
+`has_more` is true. Search terms are lexical hints, not semantic guarantees;
+an empty accessible result means no evidence was found in the searched
+coverage, not that the topic was never discussed. Model synthesis is optional,
+uses at most one call, and every paraphrase must cite supplied source records;
+invalid output falls back to deterministic source-linked excerpts. Archived
+text is untrusted data and never instructions.
+
+Summaries run asynchronously after session boundaries and are only a bounded
+cache, not a second transcript store: no summary embeddings, no new ordinary
+turn model call, 1,000 cache rows, 64 queued jobs per owner, three attempts per
+source version, and 20 summary attempts per owner per UTC day. A missing,
+stale, unavailable, or dead-letter summary falls back to raw archive evidence.
+The request path has a 3-second archive-query ceiling, 5,500 estimated model
+input tokens including framing/provenance, 1,024 output tokens, and a 4,000
+token serialized result ceiling. Disable new history work with
+`history_enabled: false`; the Hermes archive is never modified. Preserve a
+database backup before schema rollback, since older Remnant versions do not
+accept a newer schema.
+
+Configuration defaults are `history_enabled: true`,
+`history_timezone: UTC`, and `history_summary_enabled: true`.
 
 ---
 
