@@ -983,3 +983,62 @@ def test_correction_regression_indexed_fallback_is_resumable(
         assert len(seen) == len(set(seen))
     finally:
         service.db.close()
+
+
+def test_correction_regression_partial_fts_keeps_raw_matches(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(
+        archive.path,
+        "partial-index",
+        [(12_000, "quasar indexed", BASE), (12_001, "quasar raw", BASE + 1)],
+    )
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+        connection.execute("DELETE FROM messages_fts WHERE rowid=?", (12_001,))
+    service = service_for(archive, tmp_path)
+    try:
+        args: dict[str, object] = {"query": "quasar", "synthesize": False}
+        seen: list[int] = []
+        for _ in range(5):
+            result = service.recall(args)
+            seen.extend(item["source"]["message_id"] for item in result["evidence"])
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"query": "quasar", "cursor": result["next_cursor"], "synthesize": False}
+        else:
+            pytest.fail("partial-index recall did not terminate")
+        assert sorted(seen) == [12_000, 12_001]
+    finally:
+        service.db.close()
+
+
+def test_correction_regression_raw_keyset_advances_through_no_match_batches(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(
+        archive.path,
+        "late-raw",
+        [(12_100 + index, "ordinary text", BASE + index) for index in range(24)]
+        + [(12_124, "late quasar match", BASE + 24)],
+    )
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute("DROP TABLE messages_fts")
+    service = service_for(archive, tmp_path)
+    try:
+        args: dict[str, object] = {"query": "quasar", "synthesize": False}
+        seen: list[int] = []
+        for _ in range(8):
+            result = service.recall(args)
+            seen.extend(item["source"]["message_id"] for item in result["evidence"])
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"query": "quasar", "cursor": result["next_cursor"], "synthesize": False}
+        else:
+            pytest.fail("raw keyset scan did not reach the late match")
+        assert 12_124 in seen
+        assert len(seen) == len(set(seen))
+    finally:
+        service.db.close()

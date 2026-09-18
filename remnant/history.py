@@ -37,6 +37,7 @@ MAX_SESSIONS_PER_PAGE = 20
 MAX_TOPIC_HITS = 100
 MAX_RAW_MESSAGES = 80
 MAX_RAW_PAGE_FETCH = MAX_RAW_MESSAGES + 1
+MAX_RAW_SCAN_BATCH = max(1, MAX_RAW_MESSAGES // 5)
 MAX_SESSION_ID_CHARS = 512
 MAX_EXCERPT_CHARS = 2000
 MAX_MODEL_INPUT_TOKENS = 5500
@@ -480,6 +481,37 @@ def _decode_cursor(token: str, fingerprint: str) -> dict[str, Any]:
                 raise HistoryRequestError("continuation cursor has an invalid cache offset")
         if mode == "topic" and "cache_done" in value and not isinstance(value["cache_done"], bool):
             raise HistoryRequestError("continuation cursor has an invalid cache state")
+        if mode == "topic" and "raw_after" in value:
+            raw_after = value.get("raw_after")
+            if (
+                isinstance(raw_after, bool)
+                or not isinstance(raw_after, int)
+                or not 0 <= raw_after <= MAX_MESSAGE_ID
+            ):
+                raise HistoryRequestError("continuation cursor has invalid raw scan state")
+        if mode == "topic" and "raw_before" in value:
+            raw_before = value.get("raw_before")
+            if (
+                isinstance(raw_before, bool)
+                or not isinstance(raw_before, int)
+                or not 0 <= raw_before <= MAX_MESSAGE_ID
+            ):
+                raise HistoryRequestError("continuation cursor has invalid raw scan state")
+        if mode == "topic" and "raw_hit_ids" in value:
+            raw_hit_ids = value.get("raw_hit_ids")
+            if (
+                not isinstance(raw_hit_ids, list)
+                or len(raw_hit_ids) > MAX_RAW_SCAN_BATCH
+                or any(
+                    isinstance(message_id, bool)
+                    or not isinstance(message_id, int)
+                    or not 0 <= message_id <= MAX_MESSAGE_ID
+                    for message_id in raw_hit_ids
+                )
+            ):
+                raise HistoryRequestError("continuation cursor has invalid raw scan state")
+        if mode == "topic" and "raw_done" in value and not isinstance(value["raw_done"], bool):
+            raise HistoryRequestError("continuation cursor has invalid raw scan state")
         if mode == "topic" and "floors" in value:
             floors = value.get("floors")
             if (
@@ -977,12 +1009,7 @@ class HistoryArchive:
         limit: int = MAX_TOPIC_HITS,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], bool, bool]:
-        """Search visible raw text with bounded match-local projections.
-
-        The lexical scan remains the correctness fallback when Hermes' FTS
-        projection is absent or rebuilding; a cancelled fallback is incomplete,
-        never a claim of exhaustive discovery.
-        """
+        """Search the bounded FTS projection; raw scanning supplies completeness."""
         terms = [str(term).casefold() for term in terms if term]
         if not terms or (session_ids is not None and not session_ids):
             return [], False, False
@@ -1026,32 +1053,68 @@ class HistoryArchive:
                 ).fetchall()
             result = [dict(row) for row in rows]
         except sqlite3.Error:
-            index_incomplete = True
-        if not result:
-            lexical_where = [
-                *common_where,
-                "(" + " OR ".join(
-                    "instr(lower(COALESCE(m.content,'')), ?) > 0" for _ in terms
-                ) + ")",
-            ]
-            lexical_params = [*params_base, *terms]
-            try:
-                with self._connect() as conn:
-                    rows = conn.execute(
-                        f"SELECT {self._message_select(terms)} FROM messages m "
-                        "JOIN sessions s ON s.id=m.session_id "
-                        "WHERE "
-                        + " AND ".join(lexical_where)
-                        + " ORDER BY m.timestamp,m.id LIMIT ? OFFSET ?",
-                        [*projection_params, *lexical_params, limit + 1, offset],
-                    ).fetchall()
-                result = [dict(row) for row in rows]
-            except sqlite3.Error:
-                index_incomplete = True
-                result = []
-                return [], True, True
+            return [], False, True
         has_more = len(result) > limit
         return result[:limit], has_more, index_incomplete
+
+    def scan_raw_messages(
+        self,
+        terms: list[str],
+        *,
+        resolved: ResolvedRange | None = None,
+        session_ids: set[str] | None = None,
+        after_id: int = 0,
+        limit: int = MAX_RAW_SCAN_BATCH,
+    ) -> tuple[list[dict[str, Any]], bool, int, bool]:
+        """Scan a bounded raw batch using a message-id high-water mark.
+
+        The scan deliberately does not use match-count offsets: rows without a
+        match still advance the cursor, while an interrupted query returns its
+        unchanged position and an explicit retry signal.
+        """
+        terms = [str(term).casefold() for term in terms if term]
+        if not terms or (session_ids is not None and not session_ids):
+            return [], False, max(0, int(after_id)), False
+        limit = max(1, min(int(limit), MAX_RAW_SCAN_BATCH))
+        after_id = max(0, min(int(after_id), MAX_MESSAGE_ID))
+        common_where = [
+            self._visible_message(),
+            "COALESCE(s.hidden,0)=0",
+            "COALESCE(s.source,'') NOT IN ('kanban','subagent','tool')",
+            "m.id>?",
+        ]
+        params_base: list[Any] = []
+        if resolved is not None and resolved.start_epoch is not None:
+            common_where.append("m.timestamp>=?")
+            params_base.append(resolved.start_epoch)
+        if resolved is not None and resolved.end_epoch is not None:
+            common_where.append("m.timestamp<?")
+            params_base.append(resolved.end_epoch)
+        if session_ids is not None:
+            marks = ",".join("?" for _ in session_ids)
+            common_where.append(f"m.session_id IN ({marks})")
+            params_base.extend(sorted(session_ids))
+        projection_params = self._match_projection_params(terms)
+        try:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    f"SELECT {self._message_select(terms)} FROM messages m "
+                    "JOIN sessions s ON s.id=m.session_id "
+                    "WHERE "
+                    + " AND ".join(common_where)
+                    + " ORDER BY m.id LIMIT ?",
+                    [*projection_params, *params_base, after_id, limit + 1],
+                ).fetchall()
+        except sqlite3.Error:
+            return [], True, after_id, True
+        batch = [dict(row) for row in rows[:limit]]
+        next_after = int(batch[-1]["id"]) if batch else after_id
+        matches = [
+            row
+            for row in batch
+            if any(term in str(row.get("content") or "").casefold() for term in terms)
+        ]
+        return matches, len(rows) > limit, next_after, False
 
     def matching_session_ids(
         self,
@@ -2139,6 +2202,11 @@ class HistoryService:
             # assert a lexical match. Returning no evidence is safer than scanning the archive.
             return _Page([], [], [], reason="query_has_no_search_terms")
         offset = int(cursor.get("offset", 0)) if cursor and cursor.get("mode") == "topic" else 0
+        raw_after = (
+            int(cursor.get("raw_after", 0)) if cursor and cursor.get("mode") == "topic" else 0
+        )
+        raw_before = raw_after
+        raw_done = bool(cursor and cursor.get("mode") == "topic" and cursor.get("raw_done"))
         cache_done = bool(cursor and cursor.get("mode") == "topic" and cursor.get("cache_done"))
         cache_offset = (
             int(cursor.get("cache_offset", 0))
@@ -2147,10 +2215,41 @@ class HistoryService:
         )
         hits, hit_more, incomplete = archive.search_messages(
             terms,
-            # Keep the raw batch bounded so advancing its offset cannot skip
-            # unreturned session groups when cache candidates are merged.
+            # Keep the indexed batch bounded; raw scanning owns completeness.
             limit=MAX_SESSIONS_PER_PAGE,
             offset=offset,
+        )
+        if raw_done:
+            raw_hits: list[dict[str, Any]] = []
+            raw_more = False
+            raw_interrupted = False
+        else:
+            raw_hits, raw_more, raw_after, raw_interrupted = archive.scan_raw_messages(
+                terms,
+                after_id=raw_after,
+                limit=MAX_RAW_SCAN_BATCH,
+            )
+        if raw_interrupted:
+            return _Page(
+                [],
+                [],
+                [],
+                discovery_complete=False,
+                index_incomplete=True,
+                reason="archive_query_interrupted_retry",
+            )
+        raw_done = raw_done or not raw_more
+        indexed_hits = hits
+        merged_hits: dict[tuple[str, int], dict[str, Any]] = {}
+        for hit in (*hits, *raw_hits):
+            try:
+                key = (str(hit["session_id"]), int(hit["id"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+            merged_hits.setdefault(key, hit)
+        hits = sorted(
+            merged_hits.values(),
+            key=lambda row: (float(row.get("timestamp") or 0), int(row.get("id") or 0)),
         )
         grouped: dict[str, list[dict[str, Any]]] = {}
         for hit in hits:
@@ -2192,22 +2291,31 @@ class HistoryService:
         rows.extend(cache_selected)
         next_cache_offset = cache_offset + cache_consumed
         cache_exhausted = not cached_more and cache_consumed >= len(cached_rows)
-        next_has_more = hit_more or (not cache_done and (cached_more or not cache_exhausted))
+        next_has_more = (
+            (not raw_done and (raw_more or hit_more))
+            or (not cache_done and (cached_more or not cache_exhausted))
+        )
         if len(rows) > MAX_SESSIONS_PER_PAGE:
             rows = rows[:MAX_SESSIONS_PER_PAGE]
         row_ids = [str(row["id"]) for row in rows]
         selected_hits = [hit for hit in hits if str(hit["session_id"]) in row_ids]
         state = None
-        if next_has_more or incomplete or cache_selected:
+        if next_has_more or incomplete or cache_selected or hits:
             state = {
                 "mode": "topic",
-                "offset": offset + len(hits),
+                "offset": offset + len(indexed_hits),
+                "raw_after": raw_after,
+                "raw_before": raw_before,
+                "raw_hit_ids": [int(row["id"]) for row in raw_hits],
+                "raw_done": raw_done,
                 "cache_offset": next_cache_offset,
                 "cache_done": cache_done or cache_exhausted,
                 "cache_base_offset": cache_offset,
                 "cache_selected_count": len(cache_selected),
                 "cache_skipped_count": cache_consumed - len(cache_selected),
             }
+            if cursor and cursor.get("mode") == "topic" and cursor.get("floors"):
+                state["floors"] = dict(cursor["floors"])
             if not next_has_more and not incomplete:
                 state["budget_only"] = True
         return _Page(
@@ -2985,9 +3093,7 @@ def _adjust_cursor_after_budget(
                 ),
                 default=-1,
             )
-            if index < 0:
-                return None
-            next_offset = base + index + 1
+            next_offset = base + index + 1 if index >= 0 else state_offset
         else:
             next_offset = state_offset
         floors = dict(cursor_state.get("floors", {}) if state else {})
@@ -3000,6 +3106,28 @@ def _adjust_cursor_after_budget(
                 floors[session_id] = max(retained_ids)
         next_state = dict(state or {})
         next_state.update({"mode": "topic", "offset": next_offset})
+        if "raw_after" in next_state:
+            # The raw cursor advances past a whole bounded batch. If fitting dropped
+            # evidence, replay that batch; per-session floors suppress duplicates while
+            # allowing omitted matches to be returned on the next bounded call.
+            next_state["offset"] = state_offset
+            raw_before = next_state.get("raw_before")
+            if not isinstance(raw_before, int) and input_state:
+                raw_before = input_state.get("raw_after")
+            raw_hit_ids = next_state.get("raw_hit_ids")
+            retained_message_ids = {message_id for _, message_id in retained}
+            replay_raw = (
+                bool(set(raw_hit_ids) - retained_message_ids)
+                if isinstance(raw_hit_ids, list)
+                else True
+            )
+            if (
+                replay_raw
+                and isinstance(raw_before, int)
+                and int(next_state.get("raw_after", 0)) > raw_before
+            ):
+                next_state["raw_after"] = raw_before
+                next_state["raw_done"] = False
         if floors:
             next_state["floors"] = floors
         cache_selected_count = next_state.get("cache_selected_count")
