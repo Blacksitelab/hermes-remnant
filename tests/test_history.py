@@ -950,3 +950,36 @@ def test_correction_regression_numeric_cursor_overflow_is_invalid_request(
         assert result["status"] == "invalid_request"
     finally:
         service.db.close()
+
+
+def test_correction_regression_indexed_fallback_is_resumable(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(
+        archive.path,
+        "fts-fallback",
+        [
+            (9_000 + index, f"quasar fallback {index}", BASE + index)
+            for index in range(120)
+        ],
+    )
+    with sqlite3.connect(archive.path) as connection:
+        connection.execute("DROP TABLE messages_fts")
+    service = service_for(archive, tmp_path)
+    try:
+        args: dict[str, object] = {"query": "quasar", "synthesize": False}
+        seen: list[int] = []
+        for _ in range(20):
+            result = service.recall(args)
+            assert result["coverage"]["index_incomplete"] is True
+            seen.extend(item["source"]["message_id"] for item in result["evidence"])
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"query": "quasar", "cursor": result["next_cursor"], "synthesize": False}
+        else:
+            pytest.fail("bounded lexical fallback did not drain")
+        assert sorted(seen) == list(range(9_000, 9_120))
+        assert len(seen) == len(set(seen))
+    finally:
+        service.db.close()

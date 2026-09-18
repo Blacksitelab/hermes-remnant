@@ -1697,8 +1697,7 @@ class HistoryService:
             elif (
                 message_cursor_active
                 and page.cursor_state
-                and page.cursor_state.get("mode") != "session"
-                and not page.cursor_state.get("budget_only")
+                and page.cursor_state.get("mode") == "date"
             ):
                 page.has_more = page.cursor_state is not None
             elif topic_more:
