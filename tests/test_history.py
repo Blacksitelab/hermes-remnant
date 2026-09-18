@@ -7,6 +7,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -529,6 +530,12 @@ def test_review_regressions_partition_summary_claims_and_retry_missing_archive(
             archive_key=archive_a.archive_key, agent_id="default", session_id="day"
         )
         assert row and row["status"] == "pending"
+        missing = HistoryService(db, config, profile_home=tmp_path / "missing-worker")
+        assert missing.process_one_summary() is False
+        row = db.get_history_summary(
+            archive_key=archive_a.archive_key, agent_id="default", session_id="day"
+        )
+        assert row and row["status"] == "pending"
     finally:
         db.close()
 
@@ -687,3 +694,259 @@ def test_review_regressions_close_archive_connections_and_honor_deadline(
         assert result["coverage"]["discovery_complete"] is False
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("session_width", [36, 110])
+def test_correction_regression_drains_long_date_pages(
+    tmp_path: Path, session_width: int
+) -> None:
+    home = tmp_path / f"archive-{session_width}"
+    archive = HistoryArchive(make_archive(home), profile_home=home)
+    work = tmp_path / f"work-{session_width}"
+    work.mkdir()
+    service = service_for(archive, work)
+    expected: list[int] = []
+    try:
+        for session_index in range(20):
+            session_id = f"session-{session_index:02d}".ljust(session_width, "x")
+            rows = [
+                (
+                    10_000 + session_index * 10 + message_index,
+                    "x" * 1_900,
+                    BASE + session_index + message_index,
+                )
+                for message_index in range(9)
+            ]
+            _add_session_messages(archive.path, session_id, rows)
+            expected.extend(row[0] for row in rows)
+
+        args: dict[str, object] = {"start": "2024-06-14", "synthesize": False}
+        seen: list[int] = []
+        for _ in range(120):
+            result = service.recall(args)
+            assert conservative_token_count(json.dumps(result, ensure_ascii=False)) <= 4_000
+            seen.extend(
+                item["source"]["message_id"]
+                for item in result["evidence"]
+                if item["source"]["message_id"] in expected
+            )
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"start": "2024-06-14", "cursor": result["next_cursor"], "synthesize": False}
+        else:
+            pytest.fail("date recall did not drain within the bounded test pages")
+        assert sorted(seen) == sorted(expected)
+        assert len(seen) == len(set(seen))
+    finally:
+        service.db.close()
+
+
+def test_correction_regression_rejects_mixed_summary_and_synthesis_citations(
+    archive: HistoryArchive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from remnant import history as history_module
+
+    _add_session_messages(
+        archive.path,
+        "mixed",
+        [
+            (7_000 + index, f"message {index}", BASE + index)
+            for index in range(60)
+        ],
+    )
+    service = service_for(archive, tmp_path, history_summary_enabled=True)
+    try:
+        rows = service.archive.get_messages("mixed")
+        valid = _reference_from_message(rows[0])
+        unseen = _reference_from_message(rows[29])
+        service.enqueue_session("mixed")
+        monkeypatch.setattr(
+            history_module,
+            "chat",
+            lambda **_: json.dumps(
+                {
+                    "topics": ["mixed"],
+                    "statements": [
+                        {
+                            "text": "depends on unseen evidence",
+                            "sources": [valid, unseen],
+                        }
+                    ],
+                }
+            ),
+        )
+        assert service.process_one_summary() is False
+        stored = service.db.get_history_summary(
+            archive_key=archive.archive_key, agent_id="default", session_id="mixed"
+        )
+        assert stored and stored["status"] != "ready"
+
+        day_reference = _reference_from_message(service.archive.get_messages("day")[0])
+        monkeypatch.setattr(
+            history_module,
+            "chat",
+            lambda **_: json.dumps(
+                {
+                    "statements": [
+                        {
+                            "text": "unsupported joint claim",
+                            "sources": [
+                                day_reference,
+                                {"session_id": "foreign", "message_id": 999},
+                            ],
+                        }
+                    ]
+                }
+            ),
+        )
+        result = service.recall({"session_id": "day"})
+        assert not any(
+            statement["text"] == "unsupported joint claim"
+            for statement in result["statements"]
+        )
+    finally:
+        service.db.close()
+
+
+def test_correction_regression_topic_match_and_cache_union_drain(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(
+        archive.path,
+        "late-match",
+        [(8_000, "x" * 2_200 + " quasar", BASE)],
+    )
+    _add_session_messages(
+        archive.path,
+        "raw-match",
+        [(8_001, "quasar raw discussion", BASE + 1)],
+    )
+    service = service_for(archive, tmp_path)
+    try:
+        expected = {8_000, 8_001}
+        for index in range(25):
+            session_id = f"cached-{index:02d}"
+            message_id = 8_100 + index
+            _add_session_messages(
+                archive.path,
+                session_id,
+                [(message_id, "star discussion", BASE + index + 2)],
+            )
+            row = service.archive.get_messages(session_id)[0]
+            assert service.db.enqueue_history_summary(
+                archive_key=archive.archive_key,
+                agent_id=service.agent_id,
+                session_id=session_id,
+            )
+            claim = service.db.claim_history_summary(
+                agent_id=service.agent_id, archive_key=archive.archive_key, daily_limit=1_000
+            )
+            assert claim
+            assert service.db.complete_history_summary(
+                claim["id"],
+                source_version=service.archive.source_version(session_id) or "",
+                summary={
+                    "topics": ["quasar"],
+                    "statements": [
+                        {
+                            "text": "quasar cached discussion",
+                            "sources": [_reference_from_message(row)],
+                        }
+                    ],
+                },
+                coverage={},
+                claim_token=claim["claim_token"],
+                archive_key=archive.archive_key,
+            )
+            expected.add(message_id)
+
+        args: dict[str, object] = {"query": "quasar", "synthesize": False}
+        seen: list[int] = []
+        late_excerpt_seen = False
+        for _ in range(10):
+            result = service.recall(args)
+            seen.extend(item["source"]["message_id"] for item in result["evidence"])
+            late_excerpt_seen = late_excerpt_seen or any(
+                item["source"]["message_id"] == 8_000 and "quasar" in item["excerpt"]
+                for item in result["evidence"]
+            )
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"query": "quasar", "cursor": result["next_cursor"], "synthesize": False}
+        else:
+            pytest.fail("topic recall did not drain within the bounded test pages")
+        assert late_excerpt_seen
+        assert sorted(seen) == sorted(expected)
+    finally:
+        service.db.close()
+
+
+def test_correction_regression_reauthorization_deadline_returns_partial(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    db = open_db(tmp_path / "reauthorization.db")
+    service = HistoryService(
+        db,
+        RemnantConfig(
+            agent_id="alice", runtime_identity_enabled=True, history_summary_enabled=False
+        ),
+        archive=archive,
+    )
+    holder: list[threading.Thread] = []
+    try:
+        db.insert_turn(session_id="day", agent_id="alice", user_text="owned", assistant_text="")
+        ready = threading.Event()
+
+        def hold_lock() -> None:
+            with db.read():
+                ready.set()
+                time.sleep(3.2)
+
+        original = service.archive.validate_session
+
+        def validate_then_lock(*args: object, **kwargs: object) -> object:
+            result = original(*args, **kwargs)
+            if not holder:
+                thread = threading.Thread(target=hold_lock)
+                holder.append(thread)
+                thread.start()
+                assert ready.wait(1)
+            return result
+
+        with patch.object(service.archive, "validate_session", validate_then_lock):
+            result = service.recall({"session_id": "day", "synthesize": False})
+        assert result["status"] == "partial"
+        assert result["coverage"]["discovery_complete"] is False
+    finally:
+        for thread in holder:
+            thread.join()
+        db.close()
+
+
+def test_correction_regression_numeric_cursor_overflow_is_invalid_request(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    from remnant import history as history_module
+
+    service = service_for(archive, tmp_path)
+    try:
+        request, resolved = service._validate_request(
+            history_module.HistoryRequest(start="2024-06-14", synthesize=False)
+        )
+        token = history_module._encode_cursor(
+            {
+                "v": 1,
+                "fingerprint": history_module._fingerprint(request, service.agent_id),
+                "resolved_range": resolved.as_dict(),
+                "mode": "date",
+                "after": [10**400, "s"],
+            }
+        )
+        result = service.recall(
+            {"start": "2024-06-14", "cursor": token, "synthesize": False}
+        )
+        assert result["status"] == "invalid_request"
+    finally:
+        service.db.close()
