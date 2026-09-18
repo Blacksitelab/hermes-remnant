@@ -162,13 +162,28 @@ def test_is_available_without_init():
 # --- sync_turn timing -------------------------------------------------------
 
 
-def test_sync_turn_under_10ms(provider: RemnantMemoryProvider):
+def _sync_turn_budget_ms(provider: RemnantMemoryProvider) -> float:
+    """Latency budget for a local turn commit, by journal mode.
+
+    ``sync_turn`` must never wait on extraction (the unreachable extractor
+    costs ~5000ms), so any small local-commit budget distinguishes the two.
+    WAL/NORMAL commits fit the original 10ms budget; the S-012 DELETE/FULL
+    fallback used on affected or unverified SQLite engines pays a real
+    per-commit fsync (measured ~7ms median, occasionally more under suite
+    load), so it gets a wider budget that is still far below a network wait.
+    """
+    mode = provider._db._conn.execute("PRAGMA journal_mode").fetchone()[0]
+    return 10.0 if str(mode).lower() == "wal" else 50.0
+
+
+def test_sync_turn_under_local_commit_budget(provider: RemnantMemoryProvider):
     # Warm the connection so first-call overhead (schema create) isn't counted.
     provider.sync_turn("warmup user", "warmup assistant", session_id="warmup")
+    budget = _sync_turn_budget_ms(provider)
     t0 = time.perf_counter()
     provider.sync_turn("hello world", "hi there", session_id="timing")
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    assert elapsed_ms < 10.0, f"sync_turn took {elapsed_ms:.2f}ms"
+    assert elapsed_ms < budget, f"sync_turn took {elapsed_ms:.2f}ms (budget {budget})"
     # Turn must have been persisted.
     with provider._db.read() as cur:  # type: ignore[union-attr]
         cur.execute("SELECT COUNT(*) AS c FROM turns WHERE session_id='timing'")
@@ -195,10 +210,11 @@ def test_sync_turn_persists_and_enqueues(provider: RemnantMemoryProvider):
 def test_sync_turn_does_not_block_on_extraction(provider: RemnantMemoryProvider):
     """Even if the worker is stopped, sync_turn must return immediately."""
     provider._worker.stop()  # type: ignore[union-attr]
+    budget = _sync_turn_budget_ms(provider)
     t0 = time.perf_counter()
     provider.sync_turn("x", "y", session_id="noblock")
     elapsed_ms = (time.perf_counter() - t0) * 1000
-    assert elapsed_ms < 10.0
+    assert elapsed_ms < budget, f"sync_turn took {elapsed_ms:.2f}ms (budget {budget})"
     # Queue row still written despite worker being down.
     db = provider._db  # type: ignore[union-attr]
     assert db is not None

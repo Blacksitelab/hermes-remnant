@@ -37,6 +37,27 @@ def path_in_profile_scope(path: str | None, prefixes: Iterable[str] | None) -> b
     )
 
 
+def document_scope_allows(row: dict, prefixes: list[str] | None) -> bool:
+    """Stored-row vault profile-scope decision shared by recall filters.
+
+    ``row`` carries the stored ``source``/``type``/``source_id`` fields (or
+    lacks them, in which case it is treated as a non-document). ``None`` means
+    no scope restriction at the retrieval boundary; an empty normalized list
+    means no document is allowed. Non-document memories are never path-scoped.
+    Mirrors ``remnant.db._append_profile_scope_sql`` exactly — keep the two
+    in sync.
+    """
+    if prefixes is None:
+        return True
+    is_document = row.get("source") == "vault" or row.get("type") == "document"
+    if not is_document:
+        return True
+    normalized = normalize_profile_scope(prefixes)
+    if not normalized:
+        return False
+    return path_in_profile_scope(row.get("source_id"), normalized)
+
+
 def _prefix_contains(parent: str, child: str) -> bool:
     return child == parent or child.startswith(parent + "/")
 
@@ -87,6 +108,7 @@ def visibility_allows(memory_visibility: str | None, requested: str | None) -> b
 __all__ = [
     "SHAREABLE_VISIBILITIES",
     "VISIBILITY_ORDER",
+    "document_scope_allows",
     "effective_profile_scope",
     "is_shareable_visibility",
     "normalize_profile_scope",

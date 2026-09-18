@@ -26,7 +26,12 @@ from .context import (
 from .db import RemnantDB
 from .embed import Embedder
 from .ranking import rank_results
-from .resolve import resolve_results
+from .resolve import historical_query_intent, resolve_results
+from .scope import (
+    document_scope_allows,
+    effective_profile_scope,
+    visibility_allows,
+)
 from .search import search
 
 OutputMode = Literal["results", "context"]
@@ -205,6 +210,83 @@ class RecallService:
             enriched.append(item)
         return enriched
 
+    def _authorize_candidates(
+        self, raw: list[dict[str, Any]], request: RecallRequest,
+    ) -> list[dict[str, Any]]:
+        """S-011 candidate boundary: authorize from stored rows, never adapter fields.
+
+        Reads canonical owner/status/visibility/source/type/source_id by ID in
+        one batch and keeps a candidate only when the stored row passes owner,
+        active-status, visibility-ceiling and vault profile-scope policy.
+        Adapter-supplied policy/content fields are not trusted: content and
+        provenance are rehydrated from storage for accepted rows, and only the
+        ranking/discovery annotations the lanes actually consume are retained.
+        Pending turns come only from the scoped pending-overlay loader, so an
+        injected ``pending=True`` row (or any row with no stored backing) is
+        rejected. Superseded rows survive only under the existing claim-aware
+        historical intent, matching the search lanes.
+        """
+        ids = [str(row.get("id")) for row in raw if row.get("id") and not row.get("pending")]
+        stored: dict[str, dict[str, Any]] = {}
+        if ids:
+            unique_ids = list(dict.fromkeys(ids))
+            marks = ",".join("?" for _ in unique_ids)
+            with self.db.read() as cur:
+                stored = {
+                    str(r["id"]): dict(r)
+                    for r in cur.execute(
+                        f"SELECT id, agent, status, visibility, source, type, source_id, "
+                        f"content, tags, metadata, timestamp, updated_at, confidence, "
+                        f"trust_score, verified, seen_count "
+                        f"FROM memories WHERE id IN ({marks})",
+                        unique_ids,
+                    )
+                }
+        historical = historical_query_intent(request.query) and bool(
+            getattr(self.config, "claim_aware_ranking_enabled", False)
+        )
+        allowed_status = ("active", "superseded") if historical else ("active",)
+        # The retrieval boundary sees the effective scope: the configured scope
+        # capped by any requested scope (tool arguments may only narrow).
+        scope = effective_profile_scope(self.config.profile_scope, request.profile_scope)
+        if not self.config.profile_scope and not request.profile_scope:
+            scope = None
+        out: list[dict[str, Any]] = []
+        for row in raw:
+            if row.get("pending"):
+                # Pending turns come only from _pending_overlay below.
+                continue
+            evidence = stored.get(str(row.get("id")))
+            if evidence is None:
+                continue  # unknown/deleted ID: fail closed
+            if evidence.get("agent") != request.agent_id:
+                continue
+            if evidence.get("status") not in allowed_status:
+                continue
+            if not visibility_allows(evidence.get("visibility"), request.visibility):
+                continue
+            if not document_scope_allows(evidence, scope):
+                continue
+            item = dict(row)
+            # Rehydrate authoritative content/provenance; forgeable fields on
+            # the incoming row must not survive the boundary.
+            item["content"] = evidence.get("content")
+            item["visibility"] = evidence.get("visibility")
+            item["source"] = evidence.get("source")
+            item["type"] = evidence.get("type")
+            item["source_id"] = evidence.get("source_id")
+            item["agent"] = evidence.get("agent")
+            item["agent_id"] = evidence.get("agent")
+            item["created_at"] = evidence.get("timestamp")
+            item["updated_at"] = evidence.get("updated_at")
+            # Keep only the discovery/ranking annotations existing lanes need.
+            for key in ("score", "_score_lane", "rank", "heading_path",
+                        "start_offset", "end_offset"):
+                if row.get(key) is not None:
+                    item[key] = row[key]
+            out.append(item)
+        return out
+
     def recall(
         self,
         request: RecallRequest,
@@ -249,18 +331,7 @@ class RecallService:
             raw = []
 
         # Candidate adapters and cached context are untrusted authorization inputs.
-        ids = [str(row.get("id")) for row in raw if row.get("id") and not row.get("pending")]
-        owned = set()
-        if ids:
-            with self.db.read() as cur:
-                marks = ",".join("?" for _ in ids)
-                owned = {row[0] for row in cur.execute(
-                    f"SELECT id FROM memories WHERE id IN ({marks}) AND agent=?",
-                    [*ids, request.agent_id],
-                )}
-        raw = [row for row in raw if row.get("id") in owned or (
-            row.get("pending") and row.get("agent_id") == request.agent_id
-        )]
+        raw = self._authorize_candidates(raw, request)
         diagnostics["candidate_count"] = len(raw)
         try:
             self._pending_overlay(request, raw)

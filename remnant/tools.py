@@ -541,11 +541,15 @@ def handle_tool_call(
         depth = int(args.get("depth", 2))
         if not entity:
             return {"error": "entity is required"}
+        # S-011: the explicit graph observes the configured vault scope; a tool
+        # argument may narrow but never broaden it.
+        scope = config.profile_scope or None
         res = graph_traverse(
             db,
             entity,
             agent_id=aid,
             depth=depth,
+            profile_scope=scope,
             evidence_only=bool(getattr(config, "relation_evidence_enabled", False)),
         )
         graph_response = RecallService(db, config).recall(
@@ -554,6 +558,7 @@ def handle_tool_call(
                 agent_id=aid,
                 strategy="graph",
                 limit=100,
+                profile_scope=scope,
             ),
             candidates=res["memories"],
         )

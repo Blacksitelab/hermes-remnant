@@ -48,23 +48,78 @@ def _relative_path(absolute_path: str | Path, vault_root: str | Path) -> str:
     """Return `absolute_path` relative to `vault_root`, using '/' separators.
 
     Always returns a posix-style relative string regardless of platform so
-    source_ids are stable across OSes.
+    source_ids are stable across OSes. Resolution is canonical: a path that
+    resolves outside the configured root raises ``ValueError`` (rejection, not
+    a fallback source_id); symlink loops raise ``RuntimeError``. Callers must
+    separately require an existing regular file before reading.
     """
     ap = Path(absolute_path)
     root = Path(vault_root)
-    try:
-        rel = ap.resolve().relative_to(root.resolve())
-    except ValueError:
-        # If resolution fails (e.g. non-existent path during tests), fall back
-        # to a string-prefix strip without resolving symlinks.
-        rel = Path(ap)
-        root_abs = str(root)
-        if not root_abs.endswith("/"):
-            root_abs += "/"
-        s = str(ap)
-        if s.startswith(root_abs):
-            rel = Path(s[len(root_abs):])
+    rel = ap.resolve().relative_to(root.resolve())
     return "/".join(rel.parts)
+
+
+def _lexical_rel(path: str | Path, vault_root: str | Path) -> str | None:
+    """Vault-relative path without resolving the leaf symlink, or None.
+
+    Used for the entry side of the two-sided containment check: an alias
+    (excluded folder link, out-of-scope link) must be rejected even when its
+    canonical target is allowed.
+    """
+    try:
+        return "/".join(Path(path).relative_to(Path(vault_root)).parts)
+    except ValueError:
+        return None
+
+
+def _validated_index_target(
+    abs_path: str | Path,
+    vault_root: str | Path,
+    exclude_patterns: list[str],
+    profile_scope: list[str] | None,
+    *,
+    require_file: bool = True,
+) -> tuple[str, Path] | None:
+    """S-010 containment boundary for every vault indexing entrance.
+
+    Returns ``(canonical_rel, read_path)`` when `abs_path` may be indexed, or
+    ``None`` for a policy rejection. The configured root (after resolving its
+    own symlinks — a vault-root symlink is the trusted canonical root, not an
+    escape) is the boundary; both the lexical entry path and the resolved
+    canonical target must pass the exclusion and profile-scope checks; escapes,
+    broken links and symlink loops are rejected before any hash, read, embed
+    or entity callback. The canonical relative path is the storage identity;
+    the validated canonical target is what gets hashed and read.
+
+    ``OSError`` propagates so callers can distinguish an unreadable scan
+    (failed scan, no reconciliation) from a rejected link (skip).
+    # ponytail: no defense against an adversary concurrently replacing
+    # canonical ancestor directories; that needs a descriptor-relative
+    # no-follow design and a separate review.
+    """
+    entry = Path(abs_path)
+    root = Path(vault_root)
+    try:
+        resolved = entry.resolve()
+    except RuntimeError:
+        return None  # symlink loop
+    try:
+        canonical_rel = "/".join(resolved.relative_to(root.resolve()).parts)
+    except ValueError:
+        return None  # resolved escape outside the canonical root
+    lexical_rel = _lexical_rel(entry, root)
+    if lexical_rel is None:
+        # Addressed through the canonical location rather than an alias; the
+        # canonical checks below are the boundary.
+        lexical_rel = canonical_rel
+    for rel in {lexical_rel, canonical_rel}:
+        if not _should_index(rel, exclude_patterns):
+            return None
+        if not path_in_profile_scope(rel, profile_scope):
+            return None
+    if require_file and not resolved.is_file():
+        return None
+    return canonical_rel, resolved
 
 
 def _should_index(relative_path: str, exclude_patterns: list[str]) -> bool:
@@ -249,20 +304,17 @@ def index_file(
     - Locked notes are indexed normally; the lock flag is in metadata so
       search can mask content for other agents.
     """
-    vault_root = Path(config.vault_path)
-    abs_path = Path(path)
-    rel = _relative_path(abs_path, vault_root)
-    if not _should_index(rel, config.vault_exclude) or not path_in_profile_scope(
-        rel, config.profile_scope,
-    ):
+    validated = _validated_index_target(
+        path, config.vault_path, config.vault_exclude, config.profile_scope,
+    )
+    if validated is None:
         return None
-    if abs_path.suffix.lower() not in _MARKDOWN_SUFFIXES:
-        return None
-    if not abs_path.is_file():
+    rel, read_path = validated
+    if read_path.suffix.lower() not in _MARKDOWN_SUFFIXES:
         return None
 
     try:
-        hash_hex = _file_hash(abs_path)
+        hash_hex = _file_hash(read_path)
     except OSError as e:
         log.warning("vault: cannot hash %s: %s", rel, e)
         return None
@@ -281,7 +333,7 @@ def index_file(
         return existing_mid
 
     try:
-        raw = abs_path.read_text(encoding="utf-8", errors="replace")
+        raw = read_path.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         log.warning("vault: cannot read %s: %s", rel, e)
         return None
@@ -396,27 +448,28 @@ def index_vault(
         # configuration typo.
         return {"indexed": 0, "skipped": 0, "forgotten": 0, "failed": 1}
 
-    markdown_paths = _walk_markdown(vault_root, config.vault_exclude)
-    if markdown_paths is None:
+    candidates = _walk_markdown(vault_root, config)
+    if candidates is None:
         log.warning("vault: unable to complete directory scan: %s", vault_root)
         return {"indexed": indexed, "skipped": skipped, "forgotten": 0, "failed": 1}
-    for abs_path in markdown_paths:
-        rel = _relative_path(abs_path, vault_root)
-        seen_paths.add(rel)
-        if not path_in_profile_scope(rel, config.profile_scope):
+    for rel, read_path in candidates:
+        # Canonical identity dedupes symlink aliases pointing at one target.
+        if rel in seen_paths:
             continue
+        seen_paths.add(rel)
         if not force:
             try:
-                hash_hex = _file_hash(abs_path)
+                hash_hex = _file_hash(read_path)
             except OSError:
                 continue
             existing = db.get_vault_hash(rel, agent_id=config.agent_id)
             if existing == hash_hex and db.get_vault_memory(rel, agent_id=config.agent_id):
                 # An unchanged file may still have missing derived embeddings.
-                index_file(db, config, embedder, abs_path)
+                # index_file revalidates containment at its own boundary.
+                index_file(db, config, embedder, read_path)
                 skipped += 1
                 continue
-        mid = index_file(db, config, embedder, abs_path)
+        mid = index_file(db, config, embedder, read_path)
         if mid:
             indexed += 1
 
@@ -427,15 +480,22 @@ def index_vault(
 
 
 def _walk_markdown(
-    vault_root: Path, exclude_patterns: list[str]
-) -> list[Path] | None:
-    """Yield markdown files under `vault_root` that pass the exclusion filter.
+    vault_root: Path, config: RemnantConfig
+) -> list[tuple[str, Path]] | None:
+    """Walk the vault and return validated ``(canonical_rel, read_path)`` pairs.
 
-    Sorted for stable, deterministic indexing order. Uses a manual walk so the
-    excluded top-level folders are pruned at the directory level (never even
-    descended into), keeping token/speed costs minimal.
+    Sorted for stable, deterministic indexing order. Excluded top-level
+    folders are pruned at the directory level. Every returned entry has passed
+    the S-010 containment boundary (``_validated_index_target``): escapes,
+    broken links and symlink loops are skipped before any hashing or reading.
+    A directory that cannot be listed makes the whole scan fail (``None``) so
+    reconciliation never interprets an unreadable subtree as deleted notes.
+    # ponytail: rejects a directory symlink entirely rather than checking
+    # per-entry containment inside it; the walker keeps its single sorted
+    # rglob contract. Add contained dirlink traversal only if that is a
+    # real vault shape.
     """
-    out: list[Path] = []
+    out: list[tuple[str, Path]] = []
     # Sort top-level entries so exclusions are cheap and order is stable.
     try:
         top_entries = sorted(vault_root.iterdir(), key=lambda p: p.name)
@@ -443,17 +503,26 @@ def _walk_markdown(
         return None
     for entry in top_entries:
         try:
-            rel = _relative_path(entry, vault_root)
-            if not _should_index(rel, exclude_patterns):
+            top_rel = _lexical_rel(entry, vault_root)
+            if top_rel is not None and not _should_index(top_rel, config.vault_exclude):
                 continue
+            if entry.is_dir() and entry.is_symlink():
+                continue  # directory aliases are not indexing entrances
             if entry.is_dir():
                 for p in sorted(entry.rglob("*")):
-                    if p.is_file() and p.suffix.lower() in _MARKDOWN_SUFFIXES:
-                        prel = _relative_path(p, vault_root)
-                        if _should_index(prel, exclude_patterns):
-                            out.append(p)
+                    if p.suffix.lower() not in _MARKDOWN_SUFFIXES:
+                        continue
+                    validated = _validated_index_target(
+                        p, vault_root, config.vault_exclude, config.profile_scope,
+                    )
+                    if validated is not None:
+                        out.append(validated)
             elif entry.is_file() and entry.suffix.lower() in _MARKDOWN_SUFFIXES:
-                out.append(entry)
+                validated = _validated_index_target(
+                    entry, vault_root, config.vault_exclude, config.profile_scope,
+                )
+                if validated is not None:
+                    out.append(validated)
         except OSError:
             # A partial walk is unsafe: reconciliation must not interpret
             # unreadable subtrees as deleted notes.

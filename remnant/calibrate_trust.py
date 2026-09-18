@@ -47,6 +47,11 @@ def _parse_iso(ts: str | None) -> float:
 def calibrate_trust(db_path: str, dry_run: bool = True) -> dict:
     """Recalibrate trust scores for all active memories."""
     conn = sqlite3.connect(db_path)
+    # S-012: obey the shared journal policy before any write. A dry run only
+    # inspects (no mode change) but still fails closed on unsafe existing WAL.
+    from .db import configure_sqlite_journal
+
+    configure_sqlite_journal(conn, allow_mode_change=not dry_run)
     c = conn.cursor()
 
     c.execute("""

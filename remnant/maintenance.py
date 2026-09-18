@@ -27,7 +27,13 @@ from .config import (
     load_config,
     save_config,
 )
-from .db import SCHEMA_VERSION, RemnantDB, default_db_path, open_db
+from .db import (
+    SCHEMA_VERSION,
+    RemnantDB,
+    configure_sqlite_journal,
+    default_db_path,
+    open_db,
+)
 from .identity import effective_identity
 from .lifecycle import backfill_relation_evidence
 
@@ -354,12 +360,21 @@ def backup_database(db: RemnantDB, output: Path) -> dict[str, Any]:
     try:
         with db._lock:
             db._conn.backup(destination)
+        # S-012: a fresh private destination is validated like any writable
+        # database; the backup API can carry WAL-ness over from the source, so
+        # an affected/unverified runtime forces the safe DELETE mode here.
+        mode = configure_sqlite_journal(destination, private_file=True)
         integrity = str(destination.execute("PRAGMA integrity_check").fetchone()[0])
         if integrity != "ok":
             raise RuntimeError(f"backup integrity check failed: {integrity}")
     finally:
         destination.close()
-    return {"backup": str(target), "schema_version": SCHEMA_VERSION, "integrity": integrity}
+    return {
+        "backup": str(target),
+        "schema_version": SCHEMA_VERSION,
+        "integrity": integrity,
+        "journal_mode": mode,
+    }
 
 
 def restore_database(backup: Path, output: Path) -> dict[str, Any]:
@@ -378,13 +393,17 @@ def restore_database(backup: Path, output: Path) -> dict[str, Any]:
         if source_integrity != "ok":
             raise RuntimeError(f"source integrity check failed: {source_integrity}")
         source.backup(destination)
+        # S-012: validate the restored output's journal mode before returning
+        # it as a usable database; a WAL backup restored on an affected or
+        # unverified runtime is switched to the safe DELETE mode.
+        mode = configure_sqlite_journal(destination, private_file=True)
         restored_integrity = str(destination.execute("PRAGMA integrity_check").fetchone()[0])
         if restored_integrity != "ok":
             raise RuntimeError(f"restore integrity check failed: {restored_integrity}")
     finally:
         source.close()
         destination.close()
-    return {"restored": str(target_path), "integrity": restored_integrity}
+    return {"restored": str(target_path), "integrity": restored_integrity, "journal_mode": mode}
 
 
 def migrate_legacy_default_agent(

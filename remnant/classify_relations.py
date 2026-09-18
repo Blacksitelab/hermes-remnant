@@ -193,6 +193,11 @@ def classify_all_relations(db_path: str, dry_run: bool = True) -> dict:
     the two entities co-occur, and apply lexical pattern matching.
     """
     conn = sqlite3.connect(db_path)
+    # S-012: obey the shared journal policy before any write. A dry run only
+    # inspects (no mode change) but still fails closed on unsafe existing WAL.
+    from .db import configure_sqlite_journal
+
+    configure_sqlite_journal(conn, allow_mode_change=not dry_run)
     c = conn.cursor()
 
     # Get all related_to relations with entity names and source memory

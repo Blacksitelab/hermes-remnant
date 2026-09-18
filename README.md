@@ -58,7 +58,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 
 | Component | Choice | Reason |
 |-----------|--------|--------|
-| Storage | SQLite + FTS5 | Zero dependency, single-file, WAL mode, fast |
+| Storage | SQLite + FTS5 | Zero dependency, single-file, WAL on fixed engines, DELETE fallback, fast |
 | Embeddings | `nomic-embed-text` via BSL1 Ollama (768-dim) | Already loaded, CPU/GPU-capable, simple HTTP API |
 | Entity extraction | `urchade/gliner_small_v2` via GLiNER (CPU) | Purpose-built NER, ~400 MB, millisecond inference, typed entities |
 | Extraction / rerank / reflect | `gemma4:12b` on BSL1 via Ollama OpenAI-compatible API | Proven for extraction, already running |
@@ -126,6 +126,53 @@ mapping before reuse. Configured-owner mode retains its existing keys.
 Keep a SQLite backup before updating: rolling back across schema 16 requires
 restoring that database backup along with the earlier code. Direct database
 access and operator maintenance commands remain administrative capabilities.
+
+### SQLite journal mode and the WAL-reset race
+
+Upstream SQLite documents a WAL-reset race affecting engines 3.7.0 through
+3.51.2, fixed in 3.51.3 and the backport lines 3.44.6 (3.44.x) and 3.50.7
+(3.50.x): <https://sqlite.org/wal.html#walresetbug>. The race needs multiple
+connections writing and checkpointing one WAL file, and a passing
+`integrity_check` does not prove safety against it. Remnant has not reproduced
+corruption.
+
+Remnant therefore chooses the journal mode from the *linked SQLite engine
+version* (`configure_sqlite_journal` in `remnant/db.py`, covering `RemnantDB`,
+`reextract`, `calibrate_trust` and `classify_relations`):
+
+- Recognized fixed upstream engines (>=3.51.3, 3.44.6+, 3.50.7+) keep
+  WAL with `synchronous=NORMAL`.
+- Affected or unverified engines use `DELETE` with `synchronous=FULL` for
+  fresh/non-WAL files. Vendor builds that keep older version numbers are
+  treated as unverified, not proven vulnerable: `DELETE` works without
+  upgrading, and no distribution or package metadata is trusted. Recognizing a
+  specific vendor build requires separately reviewed exact-build evidence; no
+  force-WAL bypass exists.
+- An existing WAL database on an affected or unverified engine is refused with
+  an actionable `RuntimeError` *before* any write, migration, checkpoint or
+  mode change. There is no automatic live WAL-to-DELETE conversion, because
+  acquiring SQLite's conversion lock is not a substitute for a coordinated
+  process shutdown while older clients may re-enable WAL.
+- Backup, restore and recovery destinations are private files this process
+  owns, so they convert to `DELETE` instead of refusing; shared writable
+  sources are never checkpointed.
+
+Operator transition guidance (documentation only, not automated): stop every
+client that shares the database, prevent legacy writers from re-enabling WAL,
+take a verified backup, then convert or switch to a patched runtime on a
+disposable copy first. Never delete `-wal`/`-shm` sidecars as a workaround.
+Expect `DELETE`/`FULL` to cost throughput compared with WAL/NORMAL; no specific
+level is promised without measuring your workload. Conversion timing, runtime
+choice and any cleanup of previously escaped vault data remain operator
+decisions.
+
+Vault indexing resolves each candidate against the canonical vault root before
+hashing, reading, embedding or entity extraction. Escapes, broken links,
+symlink loops and excluded-scope aliases are rejected, and a stable in-vault
+symlink is indexed only when both its entry path and its canonical target pass
+the exclusion and profile-scope checks — deduplicated under the canonical
+relative path. This is not a race-free sandbox against an adversary
+concurrently replacing canonical ancestor directories.
 
 ---
 

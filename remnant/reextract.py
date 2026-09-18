@@ -35,7 +35,14 @@ def reextract(
     Returns a summary dict with counts.
     """
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA journal_mode=WAL")
+    # S-012: this connection writes alongside RemnantDB on the real (non-dry)
+    # path, so it must obey the same journal policy before its first write:
+    # refuses unsafe existing WAL; DELETE/FULL on affected or unverified
+    # engines. A dry run only inspects (no mode change), but still fails
+    # closed on unsafe existing WAL.
+    from remnant.db import configure_sqlite_journal
+
+    configure_sqlite_journal(conn, allow_mode_change=not dry_run)
     c = conn.cursor()
 
     # Get all active memories with content

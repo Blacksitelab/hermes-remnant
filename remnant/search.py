@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import heapq
 import math
-import re
 import sys
 from array import array
 from datetime import datetime
@@ -25,7 +24,7 @@ from typing import Any
 from .config import RRF_K, RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder, cosine
-from .resolve import retrieval_query
+from .resolve import historical_query_intent, retrieval_query
 from .scope import (
     effective_profile_scope,
     normalize_profile_scope,
@@ -167,14 +166,7 @@ def search(
     # viewer is treated as a non-owner anonymous search (locked content masked).
     viewer = agent_id if agent_id is not None else config.agent_id
     lexical_query = retrieval_query(query)
-    history_intent = bool(
-        re.search(
-            r"\b(when|then|before|previously|used to|historical|history|at that time)\b",
-            query,
-            re.I,
-        )
-        or re.search(r"\b20\d{2}-[01]\d-[0-3]\d\b", query)
-    )
+    history_intent = historical_query_intent(query)
 
     if strategy == "graph":
         from .graph import graph_search

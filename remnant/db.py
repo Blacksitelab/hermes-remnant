@@ -34,6 +34,41 @@ HISTORY_SUMMARY_DAILY_CALL_CAP = 20
 HISTORY_SUMMARY_MAX_ATTEMPTS = 3
 HISTORY_SUMMARY_LEASE_S = 900.0
 
+# S-012: SQLite WAL-reset race (sqlite.org/wal.html#walresetbug) affects
+# upstream engines 3.7.0–3.51.2; fixes are 3.51.3+ plus the backport lines
+# 3.44.6+ (3.44.x) and 3.50.7+ (3.50.x). WAL is only permitted on recognized
+# fixed upstream engines; everything else (including vendor builds carrying
+# older version numbers, which may or may not carry the backport) is
+# unverified and uses DELETE/FULL. No distro/package-metadata guessing and no
+# force-WAL bypass; extending recognition needs reviewed exact-build evidence.
+_WAL_SAFE_PATCH_FLOORS = {44: 6, 50: 7}
+
+
+def wal_safe_sqlite(version: str | None) -> bool:
+    """Classify the *linked SQLite engine* version string as WAL-safe."""
+    if not version:
+        return False
+    try:
+        parts = [int(p) for p in str(version).strip().split(".")]
+    except ValueError:
+        return False
+    if len(parts) < 2:
+        return False
+    major, minor = parts[0], parts[1]
+    patch = parts[2] if len(parts) > 2 else 0
+    if (major, minor) >= (3, 51):
+        return (major, minor) > (3, 51) or patch >= 3
+    floor = _WAL_SAFE_PATCH_FLOORS.get(minor) if major == 3 else None
+    return floor is not None and patch >= floor
+
+
+def _engine_is_memory(conn: sqlite3.Connection) -> bool:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return False
+    return bool(row) and row[2] in ("", ":memory:")
+
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents. Provider APIs enforce ownership; only operator APIs allow unscoped
 # reads. REMNANT_DB_HOME overrides the file location (also used by tests).
@@ -538,6 +573,92 @@ END;
 """
 
 
+def configure_sqlite_journal(
+    conn: sqlite3.Connection,
+    *,
+    allow_mode_change: bool = True,
+    private_file: bool = False,
+) -> str:
+    """S-012 shared connection-journal policy. Returns the resulting mode.
+
+    WAL (with synchronous=NORMAL) is permitted only on recognized fixed
+    upstream engines (``wal_safe_sqlite``). A *shared writable* database
+    already in WAL on an affected or unverified engine is refused with a
+    ``RuntimeError`` before any write, migration or checkpoint — the caller
+    must close the connection; no automatic WAL->DELETE conversion happens,
+    because acquiring the conversion lock is not a substitute for a
+    coordinated process shutdown. Everything else uses DELETE with
+    synchronous=FULL. A ``:memory:`` database is left on its own memory
+    journal mode. Actual pragma results are verified; an unexpected mode or
+    refusal raises and the caller closes the connection.
+
+    ``allow_mode_change=False`` only inspects (dry-run clients must not change
+    journal settings) but still fails closed on unsafe existing WAL.
+    ``private_file=True`` marks a destination this process just created and
+    exclusively owns (backup/restore/recovery outputs): the backup API can
+    carry WAL-ness over from the source, so on an affected or unverified
+    engine such a file is converted to the safe DELETE mode instead of
+    refused — it is not a shared live database, so no other client can race
+    the conversion. Private outputs never *attempt* WAL; DELETE is always
+    safe for them.
+    """
+    if _engine_is_memory(conn):
+        return "memory"
+    engine = sqlite3.sqlite_version
+    current = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    wal_safe = wal_safe_sqlite(engine)
+    if current == "wal" and wal_safe:
+        # Keep WAL/NORMAL on recognized fixed engines (shared or private).
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        result = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        if result != "wal":
+            raise RuntimeError(
+                f"Remnant journal policy: WAL expected but engine reports {result!r}; "
+                "refusing to continue"
+            )
+        return "wal"
+    if current == "wal" and not private_file:
+        raise RuntimeError(
+            f"Remnant journal policy: database is in WAL mode on SQLite {engine}, "
+            "which is affected or unverified for the WAL reset race "
+            "(sqlite.org/wal.html#walresetbug). Stop all clients sharing this "
+            "database and use an operator-approved patched runtime or an offline "
+            "WAL->DELETE conversion; see the Remnant README. No write, "
+            "migration or checkpoint was performed."
+        )
+    if not allow_mode_change:
+        return current
+    if wal_safe and not private_file:
+        try:
+            result = str(conn.execute("PRAGMA journal_mode=wal").fetchone()[0]).lower()
+        except sqlite3.Error as exc:
+            raise RuntimeError(
+                f"Remnant journal policy: WAL mode could not be enabled on SQLite "
+                f"{engine}: {exc}; refusing to continue"
+            ) from exc
+        if result != "wal":
+            raise RuntimeError(
+                f"Remnant journal policy: WAL expected but engine reports {result!r}; "
+                "refusing to continue"
+            )
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        return "wal"
+    # Affected/unverified engine (or a private destination): DELETE with
+    # synchronous=FULL. A private WAL-inheriting backup output is converted
+    # here rather than refused; see the docstring.
+    if current != "delete":
+        result = str(
+            conn.execute("PRAGMA journal_mode=delete").fetchone()[0]
+        ).lower()
+        if result != "delete":
+            raise RuntimeError(
+                f"Remnant journal policy: DELETE mode expected but engine reports "
+                f"{result!r} on SQLite {engine}; refusing to continue"
+            )
+    conn.execute("PRAGMA synchronous=FULL;")
+    return "delete"
+
+
 def _pack_embedding(vec: list[float]) -> bytes:
     if not vec or not all(math.isfinite(value) for value in vec):
         raise ValueError("embedding must contain finite values")
@@ -581,11 +702,16 @@ class RemnantDB:
             isolation_level=None,  # autocommit; explicit transactions used where needed
             check_same_thread=False,
         )
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA temp_store=MEMORY;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        conn.execute("PRAGMA busy_timeout=5000;")
+        try:
+            # S-012: journal/synchronous policy, decided and verified before any
+            # migration or write. Raises (and closes) on unsafe existing WAL.
+            configure_sqlite_journal(conn)
+            conn.execute("PRAGMA temp_store=MEMORY;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            conn.close()
+            raise
         conn.row_factory = sqlite3.Row
         return conn
 
@@ -2788,9 +2914,31 @@ class RemnantDB:
         Returns ``{"entities": [...], "memories": [...]}`` where entities are
         dicts ``{id, name, type, depth}`` (the seed at depth 0) and memories
         are deduped active memories linked to any visited entity.
+
+        S-011: owner, active status and effective path scope gate the seed,
+        every traversed relation's supporting memory, exposed entity metadata
+        and returned memory rows. A hidden-only seed or edge reveals nothing.
         """
-        if agent_id is not None and not self.get_memories_for_entity(entity_id, agent_id=agent_id):
-            return {"entities": [], "memories": []}
+        # Seed eligibility uses the same stored-row authorization as memories,
+        # but only when there is an authorization dimension to enforce. An
+        # unscoped, ownerless traversal (internal callers) keeps its existing
+        # contract: the caller already supplied the seed name.
+        if agent_id is not None or profile_scope is not None:
+            seed_sql = (
+                "SELECT m.id FROM memory_entities me JOIN memories m ON m.id = me.memory_id "
+                "WHERE me.entity_id IN (?) AND m.status='active'"
+            )
+            seed_params: list[Any] = [entity_id]
+            if agent_id is not None:
+                seed_sql += " AND m.agent=?"
+                seed_params.append(agent_id)
+            seed_sql, seed_params = _append_profile_scope_sql(
+                seed_sql, seed_params, profile_scope,
+            )
+            seed_sql += " LIMIT 1"
+            with self.read() as cur:
+                if cur.execute(seed_sql, seed_params).fetchone() is None:
+                    return {"entities": [], "memories": []}
         visited: dict[str, int] = {entity_id: 0}
         order: list[str] = [entity_id]
         frontier: list[str] = [entity_id]
@@ -2804,14 +2952,18 @@ class RemnantDB:
                 f"(SELECT r.entity_a,r.entity_b FROM {table} r "
                 f"JOIN memories m ON m.id=r.{memory_column} "
                 "WHERE m.status='active' AND (? IS NULL OR m.agent=?)"
-                + (" AND r.active=1" if evidence_only else "") + ")"
+                + (" AND r.active=1" if evidence_only else "")
             )
+            relation_source, relation_params = _append_profile_scope_sql(
+                relation_source, [agent_id, agent_id], profile_scope,
+            )
+            relation_source += ")"
             sql = (
                 f"SELECT entity_a AS other FROM {relation_source} "
                 f"WHERE entity_b IN ({placeholders}) UNION SELECT entity_b AS other "
                 f"FROM {relation_source} WHERE entity_a IN ({placeholders})"
             )
-            params = [agent_id, agent_id, *frontier, agent_id, agent_id, *frontier]
+            params = [*relation_params, *frontier, *relation_params, *frontier]
             with self.read() as cur:
                 cur.execute(sql, params)
                 rows = cur.fetchall()
@@ -2824,7 +2976,11 @@ class RemnantDB:
                     next_frontier.append(other)
             frontier = next_frontier
 
-        # Load entity metadata for visited entities.
+        # Load entity metadata for visited entities. Every visited node is
+        # backed by authorized data by construction: the seed passed the gate
+        # above, and each hop crossed only edges whose supporting memory passed
+        # the same owner/status/scope policy. A hidden-only seed or a
+        # hidden-only connecting edge therefore reveals nothing.
         entities_out: list[dict[str, Any]] = []
         if order:
             placeholders = ",".join("?" for _ in order)
@@ -3677,6 +3833,12 @@ def _append_profile_scope_sql(
     document rows are path-scoped, so an imported document cannot bypass the
     policy by carrying a different source label. An empty effective scope
     therefore excludes vault/document rows while retaining ordinary facts.
+
+    Path matching is literal and normalized exactly like
+    ``scope.path_in_profile_scope`` / ``scope.document_scope_allows``: literal
+    case-sensitive comparison after backslash-to-slash and edge-slash
+    normalization, with a ``/`` boundary between prefix and child. LIKE
+    wildcards (``%``, ``_``) must never authorize a path.
     """
     if profile_scope is None:
         return sql, params
@@ -3688,10 +3850,12 @@ def _append_profile_scope_sql(
             + f" AND COALESCE({alias}.type, '') <> 'document'",
             params,
         )
+    normalized = f"TRIM(REPLACE({alias}.source_id, char(92), '/'), '/')"
     clauses: list[str] = []
     for prefix in prefixes:
-        clauses.append(f"{alias}.source_id=? OR {alias}.source_id LIKE ?")
-        params.extend([prefix, prefix + "/%"])
+        # Exact match or a '/'-boundary child of it: no wildcard semantics.
+        clauses.append(f"({normalized}=? OR substr({normalized},1,?)=?)")
+        params.extend([prefix, len(prefix) + 1, prefix + "/"])
     non_document = (
         f"COALESCE({alias}.source, '') <> 'vault'"
         f" AND COALESCE({alias}.type, '') <> 'document'"

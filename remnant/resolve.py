@@ -41,6 +41,16 @@ def retrieval_query(query: str) -> str:
     return value or str(query or "").strip()
 
 
+def historical_query_intent(query: str) -> bool:
+    """The existing claim-aware historical/date retrieval intent predicate.
+
+    Shared by the SQL candidate lanes and the recall candidate boundary so
+    superseded memories surface under exactly one policy: history wording or
+    an explicit date in the query, combined with claim-aware ranking.
+    """
+    return bool(_HISTORY_RE.search(query or "") or _DATE_RE.search(query or ""))
+
+
 def _parse_qualifiers(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
         return value
@@ -200,4 +210,4 @@ def resolve_results(
     return selected
 
 
-__all__ = ["resolve_results", "retrieval_query"]
+__all__ = ["historical_query_intent", "resolve_results", "retrieval_query"]

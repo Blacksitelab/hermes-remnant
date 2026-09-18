@@ -16,7 +16,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
-from .db import open_db
+from .db import configure_sqlite_journal, open_db
 
 # Rebuild disposable caches/telemetry instead of merging stale ranking state.
 TABLES = (
@@ -47,6 +47,11 @@ def _snapshot(source: Path, destination: Path) -> None:
     with closing(sqlite3.connect(source.resolve().as_uri() + '?mode=ro', uri=True)) as src:
         with closing(sqlite3.connect(destination)) as dst:
             src.backup(dst)
+            # S-012: the copy can inherit the source's WAL-ness via the backup
+            # API. This snapshot is a private destination this process owns,
+            # so an affected/unverified runtime converts it to the safe DELETE
+            # mode instead of refusing; WAL-safe runtimes keep WAL.
+            configure_sqlite_journal(dst, private_file=True)
     db = open_db(destination)
     try:
         if db._conn.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
