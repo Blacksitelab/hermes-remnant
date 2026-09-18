@@ -27,7 +27,7 @@ TABLES = (
 )
 DISPOSABLE = (
     'embedding_cache', 'prefetch_stats', 'operation_metrics', 'echo_utility',
-    'echo_pair_utility', 'echo_daily_metrics',
+    'echo_pair_utility', 'echo_daily_metrics', 'history_summaries',
 )
 OWNER_COLUMNS = {
     'turns': 'agent_id', 'memories': 'agent', 'entities': 'agent',

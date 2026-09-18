@@ -27,6 +27,7 @@ from .db import RemnantDB
 from .edit import memory_edit
 from .embed import Embedder
 from .graph import graph_traverse
+from .history import HistoryService
 from .import_sources import import_hindsight, import_memory_store, source_profile_name
 from .ingest import store_memory
 from .recall import RecallRequest, RecallService
@@ -41,6 +42,74 @@ from .vault import index_vault
 log = logging.getLogger("remnant.tools")
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_history",
+            "description": (
+                "Recall explicit historical conversation evidence from Hermes' "
+                "profile-local session archive. Use for past dates, ranges, "
+                "relative time, topics/projects, decisions, corrections, "
+                "abandoned proposals, and unresolved alternatives. Results are "
+                "bounded, source-linked, and may be partial; use the cursor for "
+                "continuation. Ordinary memory_search is for durable facts."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Topic/project terms or a historical question (max 1000 characters)."
+                        ),
+                    },
+                    "start": {
+                        "type": "string",
+                        "description": (
+                            "Inclusive ISO date or offset-aware datetime; dates require a year."
+                        ),
+                    },
+                    "end": {
+                        "type": "string",
+                        "description": "Exclusive ISO date or offset-aware datetime.",
+                    },
+                    "relative": {
+                        "type": "string",
+                        "pattern": "^(today|yesterday|last_week|[1-9][0-9]*\\s*[hdw])$",
+                        "description": (
+                            "Local calendar selector, or a positive rolling "
+                            "duration such as 6h/2d/1w."
+                        ),
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": (
+                            "IANA timezone for date boundaries (default provider setting or UTC)."
+                        ),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Exact Hermes source session ID to inspect.",
+                    },
+                    "around_message_id": {
+                        "type": "integer",
+                        "description": "Positive Hermes message ID anchor; requires session_id.",
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Bounded continuation token returned by a prior call.",
+                    },
+                    "synthesize": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "Allow at most one bounded synthesis call; false returns evidence only."
+                        ),
+                    },
+                },
+            },
+        },
+    },
     {
         "type": "function",
         "function": {
@@ -361,9 +430,20 @@ def handle_tool_call(
     hermes_home: str | None = None,
     configured_profile: str | None = None,
     echo: Any | None = None,
+    history: HistoryService | None = None,
 ) -> dict[str, Any]:
     """Dispatch a tool call. Returns a tool-result dict for the agent."""
     aid = config.agent_id
+    if tool_name == "memory_history":
+        if not isinstance(args, dict):
+            return {"error": "history arguments must be an object"}
+        service = history or HistoryService(
+            db,
+            config,
+            profile_home=hermes_home,
+            trusted_session_ids={session_id} if session_id else set(),
+        )
+        return service.recall(args)
     if tool_name == "memory_search":
         query = str(args.get("query", "")).strip()
         try:

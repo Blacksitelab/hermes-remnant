@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sqlite3
 import struct
 import threading
@@ -26,7 +27,12 @@ from typing import Any
 
 from .scope import VISIBILITY_ORDER, normalize_profile_scope, path_in_profile_scope
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
+HISTORY_SUMMARY_ROW_CAP = 1_000
+HISTORY_SUMMARY_OWNER_CAP = 64
+HISTORY_SUMMARY_DAILY_CALL_CAP = 20
+HISTORY_SUMMARY_MAX_ATTEMPTS = 3
+HISTORY_SUMMARY_LEASE_S = 900.0
 
 # Shared DB home: a single SQLite database used across all Hermes profiles /
 # agents. Provider APIs enforce ownership; only operator APIs allow unscoped
@@ -484,6 +490,31 @@ CREATE TABLE IF NOT EXISTS operation_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_operation_metrics_kind
     ON operation_metrics(operation, outcome, created_at);
+
+-- Bounded, disposable historical-summary projections. Hermes state.db remains
+-- the transcript source of truth; these rows contain only validated summaries
+-- and exact source references.
+CREATE TABLE IF NOT EXISTS history_summaries (
+    archive_key TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    source_version TEXT,
+    summary_json TEXT,
+    coverage_json TEXT,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','running','ready','retry_wait','dead_letter')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    available_at REAL NOT NULL DEFAULT 0,
+    claimed_at REAL,
+    claim_token TEXT,
+    updated_at REAL NOT NULL,
+    error_code TEXT,
+    PRIMARY KEY(archive_key, agent_id, session_id)
+);
+CREATE INDEX IF NOT EXISTS idx_history_summary_ready
+    ON history_summaries(agent_id, status, available_at, updated_at);
+CREATE INDEX IF NOT EXISTS idx_history_summary_updated
+    ON history_summaries(updated_at);
 """
 
 # FTS5 triggers keep the index in sync with the base table.
@@ -1024,6 +1055,313 @@ class RemnantDB:
                               max(0, int(output_units)), agent_id, _now_iso()),
             ))
 
+    def _prune_history_summaries(
+        self, cur: sqlite3.Cursor, *, max_rows: int = HISTORY_SUMMARY_ROW_CAP
+    ) -> int:
+        """Prune disposable rows without ever evicting a running claim."""
+        total = int(cur.execute("SELECT COUNT(*) FROM history_summaries").fetchone()[0])
+        excess = max(0, total - max(0, int(max_rows)))
+        if not excess:
+            return 0
+        rows = cur.execute(
+            "SELECT rowid FROM history_summaries WHERE status <> 'running' "
+            "ORDER BY updated_at ASC, rowid ASC LIMIT ?",
+            (excess,),
+        ).fetchall()
+        for row in rows:
+            cur.execute("DELETE FROM history_summaries WHERE rowid=?", (int(row[0]),))
+        return len(rows)
+
+    def enqueue_history_summary(
+        self,
+        *,
+        archive_key: str,
+        agent_id: str,
+        session_id: str,
+        source_version: str | None = None,
+        force: bool = False,
+    ) -> bool:
+        """Coalesce one summary job and enforce global/owner queue caps.
+
+        A ready row is immutable until a caller has revalidated a changed
+        ``source_version``. Boundary hooks therefore enqueue without opening the
+        archive, while an explicit history request can invalidate stale cache.
+        """
+        archive_key = str(archive_key or "").strip()
+        agent_id = str(agent_id or "").strip()
+        session_id = str(session_id or "").strip()
+        if not archive_key or not agent_id or not session_id:
+            return False
+        if any(len(value) > 512 for value in (archive_key, agent_id, session_id)):
+            return False
+        now = time.time()
+        with self.transaction() as cur:
+            existing = cur.execute(
+                "SELECT rowid,* FROM history_summaries "
+                "WHERE archive_key=? AND agent_id=? AND session_id=?",
+                (archive_key, agent_id, session_id),
+            ).fetchone()
+            if existing is not None:
+                changed = source_version is not None and (
+                    existing["source_version"] != str(source_version)
+                )
+                if existing["status"] == "running":
+                    return False
+                if not changed and not force:
+                    return False
+                if existing["status"] not in {"pending", "retry_wait"}:
+                    queued = int(
+                        cur.execute(
+                            "SELECT COUNT(*) FROM history_summaries WHERE agent_id=? "
+                            "AND status IN ('pending','retry_wait','running')",
+                            (agent_id,),
+                        ).fetchone()[0]
+                    )
+                    if queued >= HISTORY_SUMMARY_OWNER_CAP:
+                        return False
+                cur.execute(
+                    "UPDATE history_summaries SET source_version=?,summary_json=NULL,"
+                    "coverage_json=NULL,status='pending',attempts=0,available_at=?,"
+                    "claimed_at=NULL,claim_token=NULL,updated_at=?,error_code=NULL "
+                    "WHERE rowid=?",
+                    (str(source_version), now, now, int(existing["rowid"])),
+                )
+                return True
+            queued = int(
+                cur.execute(
+                    "SELECT COUNT(*) FROM history_summaries WHERE agent_id=? "
+                    "AND status IN ('pending','retry_wait','running')",
+                    (agent_id,),
+                ).fetchone()[0]
+            )
+            if queued >= HISTORY_SUMMARY_OWNER_CAP:
+                return False
+            self._prune_history_summaries(cur, max_rows=HISTORY_SUMMARY_ROW_CAP - 1)
+            total = int(cur.execute("SELECT COUNT(*) FROM history_summaries").fetchone()[0])
+            if total >= HISTORY_SUMMARY_ROW_CAP:
+                return False
+            cur.execute(
+                "INSERT INTO history_summaries(archive_key,agent_id,session_id,"
+                "source_version,status,attempts,available_at,updated_at) "
+                "VALUES(?,?,?,?, 'pending',0,?,?)",
+                (archive_key, agent_id, session_id, source_version, now, now),
+            )
+            return True
+
+    def claim_history_summary(
+        self,
+        *,
+        agent_id: str,
+        lease_s: float = HISTORY_SUMMARY_LEASE_S,
+        daily_limit: int = HISTORY_SUMMARY_DAILY_CALL_CAP,
+    ) -> dict[str, Any] | None:
+        """Atomically claim one summary and reserve its durable daily attempt."""
+        agent_id = str(agent_id or "").strip()
+        if not agent_id:
+            return None
+        now = time.time()
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        budget_key = f"history_calls:{day}"
+        with self.transaction() as cur:
+            expired_before = now - max(1.0, float(lease_s))
+            cur.execute(
+                "UPDATE history_summaries SET status=CASE WHEN attempts>=? "
+                "THEN 'dead_letter' ELSE 'retry_wait' END, available_at=?, "
+                "claimed_at=NULL,claim_token=NULL,updated_at=?,error_code=? "
+                "WHERE agent_id=? AND status='running' "
+                "AND COALESCE(claimed_at,0) < ?",
+                (HISTORY_SUMMARY_MAX_ATTEMPTS, now, now, "lease_expired", agent_id, expired_before),
+            )
+            row = cur.execute(
+                "SELECT rowid,* FROM history_summaries WHERE agent_id=? "
+                "AND status IN ('pending','retry_wait') AND available_at<=? "
+                "AND attempts<? ORDER BY updated_at ASC,rowid ASC LIMIT 1",
+                (agent_id, now, HISTORY_SUMMARY_MAX_ATTEMPTS),
+            ).fetchone()
+            if row is None:
+                return None
+            try:
+                used = int(
+                    json.loads(
+                        cur.execute(
+                            "SELECT value FROM dream_state WHERE owner=? AND key=?",
+                            (agent_id, budget_key),
+                        ).fetchone()[0]
+                    )
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                used = 0
+            if used >= max(0, int(daily_limit)):
+                return None
+            token = _uuid()
+            cur.execute(
+                "INSERT INTO dream_state(owner,key,value,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(owner,key) DO UPDATE SET "
+                "value=excluded.value,updated_at=excluded.updated_at",
+                (agent_id, budget_key, json.dumps(used + 1), _now_iso()),
+            )
+            cur.execute(
+                "UPDATE history_summaries SET status='running',attempts=attempts+1,"
+                "claimed_at=?,claim_token=?,updated_at=? WHERE rowid=?",
+                (now, token, now, int(row["rowid"])),
+            )
+            claimed = cur.execute(
+                "SELECT rowid AS id,* FROM history_summaries WHERE rowid=?",
+                (int(row["rowid"]),),
+            ).fetchone()
+            return dict(claimed) if claimed is not None else None
+
+    def complete_history_summary(
+        self,
+        row_id: int,
+        *,
+        source_version: str,
+        summary: dict[str, Any] | str,
+        coverage: dict[str, Any] | str,
+        claim_token: str | None = None,
+    ) -> bool:
+        """Persist one bounded validated projection after a successful attempt."""
+        summary_json = (
+            summary
+            if isinstance(summary, str)
+            else json.dumps(summary, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+        coverage_json = (
+            coverage
+            if isinstance(coverage, str)
+            else json.dumps(coverage, ensure_ascii=False, separators=(",", ":"), default=str)
+        )
+        if len(summary_json.encode("utf-8")) > 12_000:
+            raise ValueError("history summary exceeds 12000 bytes")
+        if len(coverage_json.encode("utf-8")) > 2_000:
+            raise ValueError("history coverage exceeds 2000 bytes")
+        with self.transaction() as cur:
+            sql = (
+                "UPDATE history_summaries SET source_version=?,summary_json=?,coverage_json=?,"
+                "status='ready',available_at=0,claimed_at=NULL,claim_token=NULL,"
+                "updated_at=?,error_code=NULL "
+                "WHERE rowid=? AND status='running'"
+            )
+            params: list[Any] = [
+                str(source_version),
+                summary_json,
+                coverage_json,
+                time.time(),
+                int(row_id),
+            ]
+            if claim_token:
+                sql += " AND claim_token=?"
+                params.append(str(claim_token))
+            cur.execute(sql, params)
+            return cur.rowcount == 1
+
+    def has_history_summary_work(self, *, agent_id: str) -> bool:
+        """Check whether a summary callback should remain armed."""
+        with self.read() as cur:
+            return (
+                cur.execute(
+                    "SELECT 1 FROM history_summaries WHERE agent_id=? "
+                    "AND status IN ('pending','retry_wait','running') LIMIT 1",
+                    (str(agent_id),),
+                ).fetchone()
+                is not None
+            )
+
+    def fail_history_summary(
+        self,
+        row_id: int,
+        *,
+        error_code: str = "summary_failed",
+        claim_token: str | None = None,
+    ) -> bool:
+        """Retry with bounded backoff, then retain a dead-letter marker."""
+        now = time.time()
+        error = re.sub(r"[^a-z0-9_.-]", "_", str(error_code or "summary_failed").casefold())[:64]
+        with self.transaction() as cur:
+            row = cur.execute(
+                "SELECT attempts FROM history_summaries WHERE rowid=? AND status='running'",
+                (int(row_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            if (
+                claim_token
+                and cur.execute(
+                    "SELECT 1 FROM history_summaries WHERE rowid=? AND claim_token=?",
+                    (int(row_id), str(claim_token)),
+                ).fetchone()
+                is None
+            ):
+                return False
+            attempts = int(row["attempts"] or 0)
+            if attempts >= HISTORY_SUMMARY_MAX_ATTEMPTS:
+                status, available = "dead_letter", 0.0
+            else:
+                status = "retry_wait"
+                available = now + min(300.0, 2.0 ** max(0, attempts - 1))
+            cur.execute(
+                "UPDATE history_summaries SET status=?,available_at=?,claimed_at=NULL,"
+                "claim_token=NULL,updated_at=?,error_code=? WHERE rowid=? AND status='running'",
+                (status, available, now, error, int(row_id)),
+            )
+            return cur.rowcount == 1
+
+    def get_history_summary(
+        self, *, archive_key: str, agent_id: str, session_id: str
+    ) -> dict[str, Any] | None:
+        with self.read() as cur:
+            row = cur.execute(
+                "SELECT rowid AS id,* FROM history_summaries "
+                "WHERE archive_key=? AND agent_id=? AND session_id=?",
+                (str(archive_key), str(agent_id), str(session_id)),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def list_history_summaries(
+        self, *, archive_key: str, agent_id: str, limit: int = HISTORY_SUMMARY_ROW_CAP
+    ) -> list[dict[str, Any]]:
+        limit = max(1, min(int(limit), HISTORY_SUMMARY_ROW_CAP))
+        with self.read() as cur:
+            rows = cur.execute(
+                "SELECT rowid AS id,* FROM history_summaries WHERE archive_key=? "
+                "AND agent_id=? AND status='ready' ORDER BY updated_at DESC,rowid DESC LIMIT ?",
+                (str(archive_key), str(agent_id), limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def history_summary_health(self) -> dict[str, Any]:
+        """Return cache/job counters without reading any Hermes archive."""
+        with self.read() as cur:
+            rows = cur.execute(
+                "SELECT status,attempts,error_code,coverage_json FROM history_summaries"
+            ).fetchall()
+        statuses: dict[str, int] = {}
+        attempts = failures = partial = 0
+        for row in rows:
+            status = str(row["status"])
+            statuses[status] = statuses.get(status, 0) + 1
+            attempts += int(row["attempts"] or 0)
+            failures += int(row["error_code"] is not None)
+            if status == "ready":
+                try:
+                    coverage = json.loads(row["coverage_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    coverage = {}
+                if isinstance(coverage, dict) and (
+                    coverage.get("content_truncated")
+                    or coverage.get("discovery_complete") is False
+                    or coverage.get("sampled")
+                ):
+                    partial += 1
+        return {
+            "rows": len(rows),
+            "statuses": statuses,
+            "attempts": attempts,
+            "failures": failures,
+            "partial": partial,
+            "cap": HISTORY_SUMMARY_ROW_CAP,
+        }
+
     def flush_diagnostics(self) -> None:
         """Best-effort background batch. Retain bounded records if a writer is busy."""
         if not self._lock.acquire(blocking=False):
@@ -1072,6 +1410,14 @@ class RemnantDB:
             for table in ("operation_metrics", "prefetch_stats"):
                 cur.execute(f"DELETE FROM {table} WHERE id <= "
                             f"COALESCE((SELECT MAX(id)-10000 FROM {table}),0)")
+            self._prune_history_summaries(cur)
+            cutoff_day = time.strftime(
+                "%Y-%m-%d", time.gmtime(time.time() - 90 * 86400)
+            )
+            cur.execute(
+                "DELETE FROM dream_state WHERE key LIKE 'history_calls:%' AND key < ?",
+                (f"history_calls:{cutoff_day}",),
+            )
 
     # -- turns -----------------------------------------------------------------
 
