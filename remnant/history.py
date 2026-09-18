@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 from collections.abc import Iterable
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from datetime import time as datetime_time
@@ -50,6 +51,8 @@ SUMMARY_DAILY_CALLS = 20
 SUMMARY_QUEUE_PER_OWNER = 64
 SUMMARY_CACHE_ROWS = 1000
 HISTORY_QUERY_DEADLINE_S = 3.0
+MAX_RELATIVE_DAYS = 36_500
+MAX_MESSAGE_ID = (1 << 63) - 1
 
 _HIDDEN_SOURCES = {"kanban", "subagent", "tool"}
 _VISIBLE_ROLES = {"user", "assistant"}
@@ -178,11 +181,17 @@ class ResolvedRange:
 
     @property
     def start_epoch(self) -> float | None:
-        return self.start_utc.timestamp() if self.start_utc is not None else None
+        try:
+            return self.start_utc.timestamp() if self.start_utc is not None else None
+        except (OSError, OverflowError, ValueError) as exc:
+            raise HistoryRequestError("time bound is outside the supported range") from exc
 
     @property
     def end_epoch(self) -> float | None:
-        return self.end_utc.timestamp() if self.end_utc is not None else None
+        try:
+            return self.end_utc.timestamp() if self.end_utc is not None else None
+        except (OSError, OverflowError, ValueError) as exc:
+            raise HistoryRequestError("time bound is outside the supported range") from exc
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -295,7 +304,10 @@ def _parse_bound(value: str, zone: ZoneInfo) -> tuple[datetime, bool]:
             day = date.fromisoformat(text)
         except ValueError as exc:
             raise HistoryRequestError(f"invalid date: {value!r}") from exc
-        return datetime.combine(day, datetime_time.min, tzinfo=zone), True
+        try:
+            return datetime.combine(day, datetime_time.min, tzinfo=zone), True
+        except (OverflowError, ValueError) as exc:
+            raise HistoryRequestError(f"invalid date: {value!r}") from exc
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError as exc:
@@ -304,7 +316,12 @@ def _parse_bound(value: str, zone: ZoneInfo) -> tuple[datetime, bool]:
         ) from exc
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise HistoryRequestError("datetime bounds must include an explicit UTC offset")
-    return parsed.astimezone(timezone.utc), False
+    try:
+        return parsed.astimezone(timezone.utc), False
+    except (OverflowError, ValueError, OSError) as exc:
+        raise HistoryRequestError(
+            f"datetime bound is outside the supported range: {value!r}"
+        ) from exc
 
 
 def _local_midnight(day: date, zone: ZoneInfo) -> datetime:
@@ -360,8 +377,17 @@ def resolve_range(
                 "relative must be today, yesterday, last_week, or a positive "
                 "duration such as 6h/2d/1w"
             )
-        amount = int(match.group(1)) * {"h": 3600, "d": 86400, "w": 604800}[match.group(2).lower()]
-        return ResolvedRange(name, now - timedelta(seconds=amount), now, now)
+        try:
+            amount = int(match.group(1)) * {
+                "h": 3600,
+                "d": 86400,
+                "w": 604800,
+            }[match.group(2).lower()]
+            if amount > MAX_RELATIVE_DAYS * 86400:
+                raise HistoryRequestError("relative duration exceeds the supported range")
+            return ResolvedRange(name, now - timedelta(seconds=amount), now, now)
+        except (OverflowError, ValueError) as exc:
+            raise HistoryRequestError("relative duration is outside the supported range") from exc
     if start is None and end is None:
         return ResolvedRange(name, None, None, now)
     start_value = _parse_bound(start, zone) if start is not None else (None, False)
@@ -371,14 +397,23 @@ def resolve_range(
     if start_dt is not None and end_dt is None:
         if not start_is_date:
             raise HistoryRequestError("a datetime start requires an explicit end")
-        local_day = start_dt.astimezone(zone).date()
-        end_dt = _local_midnight(local_day + timedelta(days=1), zone)
+        try:
+            local_day = start_dt.astimezone(zone).date()
+            end_dt = _local_midnight(local_day + timedelta(days=1), zone)
+        except (OverflowError, ValueError, OSError) as exc:
+            raise HistoryRequestError("date range is outside the supported range") from exc
     if start_dt is None and end_dt is not None:
         # An explicit end without a start intentionally means older history.
-        end_dt = end_dt.astimezone(timezone.utc)
+        try:
+            end_dt = end_dt.astimezone(timezone.utc)
+        except (OverflowError, ValueError, OSError) as exc:
+            raise HistoryRequestError("date range is outside the supported range") from exc
     if start_dt is not None and end_dt is not None:
-        start_utc = start_dt.astimezone(timezone.utc)
-        end_utc = end_dt.astimezone(timezone.utc)
+        try:
+            start_utc = start_dt.astimezone(timezone.utc)
+            end_utc = end_dt.astimezone(timezone.utc)
+        except (OverflowError, ValueError, OSError) as exc:
+            raise HistoryRequestError("date range is outside the supported range") from exc
         if start_utc >= end_utc:
             raise HistoryRequestError("start must be earlier than end")
         start_dt, end_dt = start_utc, end_utc
@@ -518,6 +553,48 @@ def _decode_cursor(token: str, fingerprint: str) -> dict[str, Any]:
     return value
 
 
+def _resolved_from_cursor(value: Any, expected: ResolvedRange) -> ResolvedRange:
+    """Restore the first page's clock/bounds instead of re-resolving relatives."""
+    if not isinstance(value, dict):
+        raise HistoryRequestError("continuation cursor is missing its resolved range")
+    if value.get("timezone") != expected.timezone:
+        raise HistoryRequestError("continuation cursor timezone does not match this request")
+
+    def parse(name: str, *, required: bool) -> datetime | None:
+        raw = value.get(name)
+        if raw is None and not required:
+            return None
+        if not isinstance(raw, str):
+            raise HistoryRequestError("continuation cursor has an invalid resolved range")
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HistoryRequestError("continuation cursor has an invalid resolved range") from exc
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise HistoryRequestError("continuation cursor has an invalid resolved range")
+        try:
+            return parsed.astimezone(timezone.utc)
+        except (OSError, OverflowError, ValueError) as exc:
+            raise HistoryRequestError("continuation cursor has an invalid resolved range") from exc
+
+    reference_now = parse("reference_now", required=True)
+    start_utc = parse("start_utc", required=False)
+    end_utc = parse("end_utc", required=False)
+    if start_utc is not None and end_utc is not None and start_utc >= end_utc:
+        raise HistoryRequestError("continuation cursor has an invalid resolved range")
+    return ResolvedRange(value["timezone"], start_utc, end_utc, reference_now)
+
+
+class _ClosingConnection(sqlite3.Connection):
+    """Make sqlite's context manager release the descriptor as well as the txn."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
+
+
 class HistoryArchive:
     """Read-only adapter over exactly one trusted Hermes ``state.db``."""
 
@@ -532,7 +609,17 @@ class HistoryArchive:
         self.profile_home = Path(profile_home or self.path.parent).expanduser()
         self._profile_name = profile_name
         self._trusted_path: Path | None = None
+        self._deadline = threading.local()
         self.unavailable_reason = ""
+        self._refresh_trusted_path()
+        self.profile = _profile_name(self.profile_home, profile_name)
+        self.archive_key = (
+            hashlib.sha256(str(self._trusted_path).encode("utf-8")).hexdigest()
+            if self._trusted_path is not None
+            else ""
+        )
+
+    def _refresh_trusted_path(self) -> Path | None:
         try:
             root = self.profile_home.resolve(strict=True)
             candidate = self.path.resolve(strict=True)
@@ -540,33 +627,59 @@ class HistoryArchive:
             if candidate.name != "state.db":
                 raise ValueError("archive must be the profile's state.db")
             self._trusted_path = candidate
+            self.archive_key = hashlib.sha256(str(candidate).encode("utf-8")).hexdigest()
+            self.unavailable_reason = ""
+            return candidate
         except (OSError, RuntimeError, ValueError) as exc:
+            self._trusted_path = None
             self.unavailable_reason = f"trusted archive unavailable: {type(exc).__name__}"
-        self.archive_key = (
-            hashlib.sha256(str(self._trusted_path).encode("utf-8")).hexdigest()
-            if self._trusted_path is not None
-            else ""
-        )
-        self.profile = _profile_name(self.profile_home, profile_name)
+            return None
 
     @property
     def trusted_path(self) -> Path | None:
         return self._trusted_path
 
+    @contextmanager
+    def request_deadline(self, until: float) -> Iterable[None]:
+        previous = getattr(self._deadline, "until", None)
+        self._deadline.until = min(float(until), previous) if previous is not None else float(until)
+        try:
+            yield
+        finally:
+            if previous is None:
+                try:
+                    del self._deadline.until
+                except AttributeError:
+                    pass
+            else:
+                self._deadline.until = previous
+
     def _connect(self) -> sqlite3.Connection:
-        if self._trusted_path is None:
+        trusted_path = self._refresh_trusted_path()
+        if trusted_path is None:
             raise OSError(self.unavailable_reason or "archive unavailable")
-        uri = self._trusted_path.as_uri() + "?mode=ro"
-        connection = sqlite3.connect(uri, uri=True, timeout=0.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        connection.execute("PRAGMA busy_timeout=0")
-        deadline = time.monotonic() + HISTORY_QUERY_DEADLINE_S
-        connection.set_progress_handler(lambda: 1 if time.monotonic() >= deadline else 0, 1_000)
-        return connection
+        uri = trusted_path.as_uri() + "?mode=ro"
+        connection = sqlite3.connect(
+            uri, uri=True, timeout=0.0, factory=_ClosingConnection
+        )
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("PRAGMA busy_timeout=0")
+            deadline = getattr(self._deadline, "until", None) or (
+                time.monotonic() + HISTORY_QUERY_DEADLINE_S
+            )
+            connection.set_progress_handler(
+                lambda: 1 if time.monotonic() >= deadline else 0, 1_000
+            )
+            return connection
+        except Exception:
+            connection.close()
+            raise
 
     def available(self) -> bool:
-        if self._trusted_path is None or not self._trusted_path.is_file():
+        trusted_path = self._refresh_trusted_path()
+        if trusted_path is None or not trusted_path.is_file():
             return False
         try:
             with self._connect() as conn:
@@ -646,13 +759,16 @@ class HistoryArchive:
         self,
         row: sqlite3.Row | dict[str, Any],
         *,
+        session_id: str | None = None,
         agent_id: str,
         remnant_db: Any | None,
         runtime_identity_enabled: bool,
         trusted_session_ids: set[str],
     ) -> bool:
         data = dict(row)
-        sid = str(data.get("id") or data.get("session_id") or "")
+        # Message rows have both ``id`` and ``session_id``. Ownership is keyed
+        # by the source session, never by a message primary key.
+        sid = str(session_id or data.get("session_id") or data.get("id") or "")
         explicit_profile = str(data.get("profile_name") or "").strip()
         if explicit_profile and explicit_profile != self.profile:
             return False
@@ -671,6 +787,8 @@ class HistoryArchive:
                     ).fetchone()
                     is not None
                 )
+        except TimeoutError:
+            raise
         except Exception:
             return False
 
@@ -724,12 +842,28 @@ class HistoryArchive:
             ).fetchone()
         return self._session_row(row) if row else None
 
-    def _message_select(self) -> str:
+    def _message_select(self, terms: list[str] | None = None) -> str:
+        content = "substr(COALESCE(m.content,''),1,2001)"
+        if terms:
+            positions = " ".join(
+                "WHEN instr(lower(COALESCE(m.content,'')), ?) > 0 "
+                "THEN max(1, instr(lower(COALESCE(m.content,'')), ?) - 1000)"
+                for _ in terms
+            )
+            content = (
+                "substr(COALESCE(m.content,''),CASE "
+                + positions
+                + " ELSE 1 END,2001)"
+            )
         return (
-            "m.id,m.session_id,m.role,substr(COALESCE(m.content,''),1,2001) AS content,"
+            f"m.id,m.session_id,m.role,{content} AS content,"
             "m.timestamp,m.active,m.compacted,"
             "m.display_kind,m._compressed_summary,s.profile_name AS profile_name"
         )
+
+    @staticmethod
+    def _match_projection_params(terms: list[str]) -> list[str]:
+        return [value for term in terms for value in (term, term)]
 
     def get_messages(
         self,
@@ -764,6 +898,33 @@ class HistoryArchive:
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_message_sample(
+        self, session_id: str, *, limit: int = MAX_RAW_MESSAGES
+    ) -> list[dict[str, Any]]:
+        """Return bounded true first/last windows for asynchronous summaries."""
+        limit = max(1, min(int(limit), MAX_RAW_MESSAGES))
+        half = max(1, limit // 2)
+        first = self.get_messages(session_id, limit=half)
+        where = [
+            "m.session_id=?",
+            self._visible_message(),
+            "COALESCE(s.hidden,0)=0",
+            "COALESCE(s.source,'') NOT IN ('kanban','subagent','tool')",
+        ]
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._message_select()} FROM messages m "
+                "JOIN sessions s ON s.id=m.session_id WHERE "
+                + " AND ".join(where)
+                + " ORDER BY m.timestamp DESC,m.id DESC LIMIT ?",
+                (session_id, half),
+            ).fetchall()
+        combined = {int(row["id"]): dict(row) for row in (*first, *rows)}
+        return sorted(
+            combined.values(),
+            key=lambda row: (float(row.get("timestamp") or 0), int(row.get("id") or 0)),
+        )[:limit]
 
     def get_message_window(
         self, session_id: str, message_id: int, *, window: int = 2
@@ -807,11 +968,11 @@ class HistoryArchive:
         limit: int = MAX_TOPIC_HITS,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], bool, bool]:
-        """Search visible raw text with deterministic offset pagination.
+        """Search visible raw text with bounded match-local projections.
 
-        FTS is probed for diagnostics, but raw text is the pagination source of
-        truth so mixing two independently offset result sets cannot duplicate or
-        skip source IDs when the index is rebuilding.
+        The lexical scan remains the correctness fallback when Hermes' FTS
+        projection is absent or rebuilding; a cancelled fallback is incomplete,
+        never a claim of exhaustive discovery.
         """
         terms = [str(term).casefold() for term in terms if term]
         if not terms or (session_ids is not None and not session_ids):
@@ -844,20 +1005,23 @@ class HistoryArchive:
                 ).fetchone()
         except sqlite3.Error:
             index_incomplete = True
-        like_where = [
+        lexical_where = [
             *common_where,
-            "(" + " OR ".join("LOWER(COALESCE(m.content,'')) LIKE ?" for _ in terms) + ")",
+            "(" + " OR ".join(
+                "instr(lower(COALESCE(m.content,'')), ?) > 0" for _ in terms
+            ) + ")",
         ]
-        like_params = [*params_base, *(f"%{term}%" for term in terms)]
+        lexical_params = [*params_base, *terms]
+        projection_params = self._match_projection_params(terms)
         try:
             with self._connect() as conn:
                 rows = conn.execute(
-                    f"SELECT {self._message_select()} FROM messages m "
+                    f"SELECT {self._message_select(terms)} FROM messages m "
                     "JOIN sessions s ON s.id=m.session_id "
                     "WHERE "
-                    + " AND ".join(like_where)
+                    + " AND ".join(lexical_where)
                     + " ORDER BY m.timestamp,m.id LIMIT ? OFFSET ?",
-                    [*like_params, limit + 1, offset],
+                    [*projection_params, *lexical_params, limit + 1, offset],
                 ).fetchall()
             result = [dict(row) for row in rows]
         except sqlite3.Error:
@@ -897,8 +1061,10 @@ class HistoryArchive:
         if resolved is not None and resolved.end_epoch is not None:
             where.append("m.timestamp<?")
             params.append(resolved.end_epoch)
-        where.append("(" + " OR ".join("LOWER(COALESCE(m.content,'')) LIKE ?" for _ in terms) + ")")
-        params.extend(f"%{term}%" for term in terms)
+        where.append("(" + " OR ".join(
+            "instr(lower(COALESCE(m.content,'')), ?) > 0" for _ in terms
+        ) + ")")
+        params.extend(terms)
         sql = (
             "SELECT m.session_id,MIN(m.timestamp) AS first_hit,MIN(m.id) AS first_id "
             "FROM messages m JOIN sessions s ON s.id=m.session_id WHERE "
@@ -953,6 +1119,7 @@ class HistoryArchive:
             ).fetchone()
         if row is None or not self._authorized(
             row,
+            session_id=sid,
             agent_id=agent_id,
             remnant_db=remnant_db,
             runtime_identity_enabled=runtime_identity_enabled,
@@ -980,6 +1147,7 @@ class HistoryArchive:
             ).fetchone()
         if row is None or not self._authorized(
             row,
+            session_id=session_id,
             agent_id=agent_id,
             remnant_db=remnant_db,
             runtime_identity_enabled=runtime_identity_enabled,
@@ -1015,7 +1183,10 @@ class HistoryService:
             getattr(config, "history_summary_enabled", True)
         ):
             try:
-                if self.db.has_history_summary_work(agent_id=self.agent_id):
+                if self.db.has_history_summary_work(
+                    agent_id=self.agent_id,
+                    archive_key=str(getattr(self.archive, "archive_key", "")),
+                ):
                     self._summary_wakeup.set()
             except Exception:
                 pass
@@ -1072,7 +1243,10 @@ class HistoryService:
         processed = self.process_one_summary()
         if not processed:
             try:
-                has_work = self.db.has_history_summary_work(agent_id=self.agent_id)
+                has_work = self.db.has_history_summary_work(
+                    agent_id=self.agent_id,
+                    archive_key=str(getattr(self.archive, "archive_key", "")),
+                )
             except Exception:
                 has_work = True
             if not has_work:
@@ -1088,10 +1262,22 @@ class HistoryService:
         claim = getattr(self.db, "claim_history_summary", None)
         if not callable(claim) or self.archive is None:
             return False
-        row = claim(agent_id=self.agent_id)
+        archive_key = str(getattr(self.archive, "archive_key", ""))
+        row = claim(agent_id=self.agent_id, archive_key=archive_key)
         if not row:
             return False
         row_data: dict[str, Any] = row if isinstance(row, dict) else dict(row)
+        if str(row_data.get("archive_key") or "") != archive_key:
+            try:
+                self.db.fail_history_summary(
+                    int(row_data["id"]),
+                    error_code="archive_mismatch",
+                    claim_token=str(row_data.get("claim_token") or "") or None,
+                    archive_key=archive_key,
+                )
+            except Exception:
+                log.debug("history summary archive mismatch transition failed", exc_info=True)
+            return False
         started = time.perf_counter()
         outcome = "failure"
         try:
@@ -1106,14 +1292,20 @@ class HistoryService:
                 trusted_session_ids=self.trusted_session_ids,
             )
             source_version = self.archive.source_version(session_id) if session else None
-            messages = (
-                self.archive.get_messages(session_id, limit=MAX_RAW_MESSAGES) if session else []
-            )
+            if session:
+                sampler: Any = getattr(self.archive, "get_message_sample", None)
+                messages: list[dict[str, Any]] = (
+                    list(sampler(session_id, limit=MAX_RAW_MESSAGES))
+                    if callable(sampler)
+                    else self.archive.get_messages(session_id, limit=MAX_RAW_MESSAGES)
+                )
+            else:
+                messages = []
             if not session or source_version is None or not messages:
                 raise OSError("session has no authorized visible messages")
             if self.archive.source_version(session_id) != source_version:
                 raise OSError("archive session changed while preparing summary")
-            user = _summary_input(messages)
+            user, supplied_messages, input_truncated = _summary_input(messages)
             output = chat(
                 url=getattr(self.config, "extract_url", ""),
                 model=getattr(self.config, "extract_model", ""),
@@ -1128,7 +1320,7 @@ class HistoryService:
             parsed = _parse_summary_output(output)
             summary, references = _validate_summary(
                 parsed,
-                messages,
+                supplied_messages,
                 session_id=session_id,
                 archive=self.archive,
                 agent_id=self.agent_id,
@@ -1136,14 +1328,23 @@ class HistoryService:
                 runtime_identity_enabled=self.runtime_identity_enabled,
                 trusted_session_ids=self.trusted_session_ids,
             )
-            if not summary["statements"] and not summary["topics"]:
+            parsed_statements = parsed.get("statements")
+            if (
+                (
+                    isinstance(parsed_statements, list)
+                    and parsed_statements
+                    and not summary["statements"]
+                )
+                or (not summary["statements"] and not summary["topics"])
+            ):
                 raise LLMResponseError("summary contained no grounded statements")
             coverage = {
-                "messages_returned": len(messages),
+                "messages_returned": len(supplied_messages),
                 "input_tokens": conservative_token_count(user),
-                "content_truncated": len(messages) >= MAX_RAW_MESSAGES,
+                "content_truncated": input_truncated or len(messages) >= MAX_RAW_MESSAGES,
                 "source_version": source_version,
-                "sampled": len(messages) >= MAX_RAW_MESSAGES,
+                "sampled": len(messages) >= MAX_RAW_MESSAGES
+                or len(supplied_messages) < len(messages),
             }
             self.db.complete_history_summary(
                 int(row_data["id"]),
@@ -1151,6 +1352,7 @@ class HistoryService:
                 summary=summary,
                 coverage=coverage,
                 claim_token=str(row_data.get("claim_token") or "") or None,
+                archive_key=archive_key,
             )
             outcome = "success"
             return True
@@ -1160,6 +1362,7 @@ class HistoryService:
                     int(row_data["id"]),
                     error_code=_summary_error_code(exc),
                     claim_token=str(row_data.get("claim_token") or "") or None,
+                    archive_key=archive_key,
                 )
             except Exception:
                 log.debug("history summary failure transition failed", exc_info=True)
@@ -1178,6 +1381,21 @@ class HistoryService:
                 pass
 
     def recall(
+        self,
+        args: dict[str, Any] | HistoryRequest | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + HISTORY_QUERY_DEADLINE_S
+        with ExitStack() as stack:
+            archive_deadline = getattr(self.archive, "request_deadline", None)
+            if callable(archive_deadline):
+                stack.enter_context(archive_deadline(deadline))
+            db_deadline = getattr(self.db, "deadline", None)
+            if callable(db_deadline):
+                stack.enter_context(db_deadline(deadline))
+            return self._recall_impl(args, **kwargs)
+
+    def _recall_impl(
         self,
         args: dict[str, Any] | HistoryRequest | None = None,
         *,
@@ -1252,6 +1470,8 @@ class HistoryService:
         fingerprint = _fingerprint(request, self.agent_id)
         try:
             cursor_state = _decode_cursor(request.cursor, fingerprint) if request.cursor else None
+            if cursor_state is not None:
+                resolved = _resolved_from_cursor(cursor_state.get("resolved_range"), resolved)
         except HistoryRequestError as exc:
             return self._finish(
                 {
@@ -1423,7 +1643,7 @@ class HistoryService:
                 f"historical summary validation interrupted ({type(exc).__name__}); "
                 "raw coverage is partial"
             )
-        evidence = summary_evidence + [_evidence_from_message(row) for row in messages]
+        evidence = [_evidence_from_message(row) for row in messages] + summary_evidence
         evidence = _dedupe_evidence(evidence)
         if bool(getattr(self.config, "history_summary_enabled", True)):
             for sid in selected_ids:
@@ -1440,7 +1660,12 @@ class HistoryService:
         has_more = page.has_more
         next_cursor = None
         if has_more and page.cursor_state is not None:
-            state = {"v": 1, "fingerprint": fingerprint, **page.cursor_state}
+            state = {
+                "v": 1,
+                "fingerprint": fingerprint,
+                "resolved_range": resolved.as_dict(),
+                **page.cursor_state,
+            }
             try:
                 next_cursor = _encode_cursor(state)
             except HistoryRequestError:
@@ -1511,12 +1736,8 @@ class HistoryService:
                 else ""
             ),
         }
-        payload = self._finish(
-            payload,
-            started,
-            input_units=conservative_token_count(request.query),
-            output_units=conservative_token_count(_json(payload)),
-        )
+        payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        payload = _fit_output(payload)
         if int(payload.get("coverage", {}).get("omitted_due_to_budget", 0)):
             adjusted = _adjust_cursor_after_budget(
                 request,
@@ -1536,7 +1757,12 @@ class HistoryService:
                 payload["has_more"] = True
                 try:
                     payload["next_cursor"] = _encode_cursor(
-                        {"v": 1, "fingerprint": fingerprint, **adjusted}
+                        {
+                            "v": 1,
+                            "fingerprint": fingerprint,
+                            "resolved_range": resolved.as_dict(),
+                            **adjusted,
+                        }
                     )
                 except HistoryRequestError:
                     payload["next_cursor"] = None
@@ -1544,7 +1770,12 @@ class HistoryService:
             else:
                 payload["next_cursor"] = None
                 payload["has_more"] = False
-        return payload
+        return self._finish(
+            payload,
+            started,
+            input_units=conservative_token_count(request.query),
+            fitted=True,
+        )
 
     def _finish(
         self,
@@ -1556,18 +1787,16 @@ class HistoryService:
         fitted: bool = False,
     ) -> dict[str, Any]:
         payload["elapsed_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
+        payload["token_estimate"] = 0
         if not fitted:
             payload = _fit_output(payload)
-        payload["token_estimate"] = 0
-        payload = _fit_output(payload)
-        payload["token_estimate"] = conservative_token_count(_json(payload))
+        payload["token_estimate"] = _wire_token_count(payload)
+        # The estimate field itself is part of the wire budget. Re-fit once if
+        # changing its digit count crossed the boundary.
         if payload["token_estimate"] > MAX_SERIALIZED_TOKENS:
-            payload["evidence"] = []
-            payload["statements"] = []
-            payload["sessions"] = []
-            payload["synthesis"] = ""
-            payload["warnings"] = ["serialized output reached the hard budget"]
-            payload["token_estimate"] = conservative_token_count(_json(payload))
+            payload["token_estimate"] = 0
+            payload = _fit_output(payload)
+            payload["token_estimate"] = _wire_token_count(payload)
         try:
             self.db.record_operation(
                 "history_recall",
@@ -1605,7 +1834,7 @@ class HistoryService:
                 anchor = int(anchor)
             except (TypeError, ValueError) as exc:
                 raise HistoryRequestError("around_message_id must be a positive integer") from exc
-            if anchor <= 0 or sid is None:
+            if anchor <= 0 or anchor > MAX_MESSAGE_ID or sid is None:
                 raise HistoryRequestError("around_message_id requires a positive session_id")
         if sid is not None and len(sid) > MAX_SESSION_ID_CHARS:
             raise HistoryRequestError("session_id exceeds the bounded maximum length")
@@ -1787,7 +2016,7 @@ class HistoryService:
                 has_more=visible_more,
                 cursor_state=state,
                 scanned_candidates=len(raw_candidates),
-                discovery_complete=not visible_more,
+                discovery_complete=not visible_more and not incomplete,
                 index_incomplete=incomplete,
             )
         terms = _terms(request.query)
@@ -1796,38 +2025,17 @@ class HistoryService:
             # assert a lexical match. Returning no evidence is safer than scanning the archive.
             return _Page([], [], [], reason="query_has_no_search_terms")
         offset = int(cursor.get("offset", 0)) if cursor and cursor.get("mode") == "topic" else 0
+        cache_done = bool(cursor and cursor.get("mode") == "topic" and cursor.get("cache_done"))
         cache_offset = (
-            int(cursor["cache_offset"])
-            if cursor
-            and cursor.get("mode") == "topic"
-            and isinstance(cursor.get("cache_offset"), int)
-            and not cursor.get("cache_done")
-            else None
+            int(cursor.get("cache_offset", 0))
+            if cursor and cursor.get("mode") == "topic"
+            else 0
         )
-        if cache_offset is not None:
-            cached_rows, cached_more = self._cached_topic_sessions(request, offset=cache_offset)
-            if cached_rows:
-                next_state: dict[str, Any] | None
-                if cached_more:
-                    next_state = {
-                        "mode": "topic",
-                        "offset": offset,
-                        "cache_offset": cache_offset + MAX_SESSIONS_PER_PAGE,
-                    }
-                else:
-                    next_state = {"mode": "topic", "offset": offset, "cache_done": True}
-                return _Page(
-                    cached_rows[:MAX_SESSIONS_PER_PAGE],
-                    [],
-                    [str(row["id"]) for row in cached_rows[:MAX_SESSIONS_PER_PAGE]],
-                    has_more=True,
-                    cursor_state=next_state,
-                    discovery_complete=False,
-                    reason="summary_cache_supplement",
-                )
         hits, hit_more, incomplete = archive.search_messages(
             terms,
-            limit=MAX_TOPIC_HITS,
+            # Keep the raw batch bounded so advancing its offset cannot skip
+            # unreturned session groups when cache candidates are merged.
+            limit=MAX_SESSIONS_PER_PAGE,
             offset=offset,
         )
         grouped: dict[str, list[dict[str, Any]]] = {}
@@ -1843,48 +2051,47 @@ class HistoryService:
             ):
                 continue
             grouped.setdefault(sid, []).append(hit)
-        rows: list[dict[str, Any]] = []
+        raw_rows: list[dict[str, Any]] = []
         for sid in grouped:
             session = archive.get_session(sid)
             if session:
-                rows.append(session)
-            if len(rows) >= MAX_SESSIONS_PER_PAGE:
-                break
-        rows.sort(
-            key=lambda row: (
-                str(row.get("source") or "interactive").casefold() == "cron",
-                float(row.get("started_at") or 0),
-                str(row.get("id") or ""),
+                raw_rows.append(session)
+        cached_rows: list[dict[str, Any]] = []
+        cached_more = False
+        if not cache_done:
+            cached_rows, cached_more = self._cached_topic_sessions(
+                request, offset=cache_offset
             )
-        )
-        if not rows and not hit_more and offset == 0 and not (cursor and cursor.get("cache_done")):
-            cached_rows, cached_more = self._cached_topic_sessions(request)
-            if cached_rows:
-                return _Page(
-                    cached_rows[:MAX_SESSIONS_PER_PAGE],
-                    [],
-                    [str(row["id"]) for row in cached_rows[:MAX_SESSIONS_PER_PAGE]],
-                    cursor_state=(
-                        {
-                            "mode": "topic",
-                            "offset": 0,
-                            "cache_offset": MAX_SESSIONS_PER_PAGE,
-                        }
-                        if cached_more
-                        else {"mode": "topic", "offset": 0, "cache_done": True}
-                    ),
-                    has_more=True,
-                    discovery_complete=False,
-                    reason="summary_cache_supplement",
-                    index_incomplete=incomplete,
-                )
+        rows = [*raw_rows]
+        seen_ids = {str(row["id"]) for row in rows}
+        cache_capacity = max(0, MAX_SESSIONS_PER_PAGE - len(rows))
+        cache_selected = [
+            row for row in cached_rows if str(row["id"]) not in seen_ids
+        ][:cache_capacity]
+        rows.extend(cache_selected)
+        next_cache_offset = cache_offset + len(cache_selected)
+        cache_exhausted = not cached_more and len(cached_rows) <= len(cache_selected)
+        next_has_more = hit_more or (not cache_done and (cached_more or not cache_exhausted))
+        if len(rows) > MAX_SESSIONS_PER_PAGE:
+            rows = rows[:MAX_SESSIONS_PER_PAGE]
+        row_ids = [str(row["id"]) for row in rows]
+        selected_hits = [hit for hit in hits if str(hit["session_id"]) in row_ids]
+        state = None
+        if next_has_more or incomplete:
+            state = {
+                "mode": "topic",
+                "offset": offset + len(hits),
+                "cache_offset": next_cache_offset,
+                "cache_done": cache_done or cache_exhausted,
+            }
         return _Page(
             rows,
-            hits,
-            list(grouped),
-            has_more=hit_more,
-            cursor_state={"mode": "topic", "offset": offset + len(hits)} if hit_more else None,
-            discovery_complete=not hit_more,
+            selected_hits,
+            row_ids,
+            has_more=next_has_more,
+            cursor_state=state,
+            discovery_complete=not next_has_more and not incomplete,
+            reason="summary_cache_supplement" if not raw_rows and rows else None,
             index_incomplete=incomplete,
         )
 
@@ -2084,7 +2291,8 @@ class HistoryService:
                 if isinstance(cache_coverage, dict)
                 else False
             )
-            valid_count = 0
+            session_evidence: list[dict[str, Any]] = []
+            source_invalid = False
             for statement in statements[:MAX_SUMMARY_STATEMENTS]:
                 if not isinstance(statement, dict):
                     continue
@@ -2092,10 +2300,13 @@ class HistoryService:
                 if not isinstance(refs, list):
                     continue
                 valid_refs: list[dict[str, Any]] = []
+                statement_invalid = False
                 for ref in refs[:8]:
                     if not isinstance(ref, dict):
+                        statement_invalid = True
                         continue
                     if str(ref.get("session_id") or "") != sid:
+                        statement_invalid = True
                         continue
                     checked = self.archive.validate_reference(
                         ref,
@@ -2104,24 +2315,32 @@ class HistoryService:
                         runtime_identity_enabled=self.runtime_identity_enabled,
                         trusted_session_ids=self.trusted_session_ids,
                     )
-                    if (
-                        checked is not None
-                        and (
-                            resolved.start_epoch is None
-                            or float(checked.get("timestamp") or 0) >= resolved.start_epoch
-                        )
-                        and (
-                            resolved.end_epoch is None
-                            or float(checked.get("timestamp") or 0) < resolved.end_epoch
-                        )
-                    ):
-                        valid_refs.append(_reference_from_message(checked))
-                if not valid_refs:
+                    if checked is None:
+                        statement_invalid = True
+                        continue
+                    in_range = (
+                        (resolved.start_epoch is None
+                         or float(checked.get("timestamp") or 0) >= resolved.start_epoch)
+                        and (resolved.end_epoch is None
+                             or float(checked.get("timestamp") or 0) < resolved.end_epoch)
+                    )
+                    if not in_range:
+                        # A statement cannot be transplanted onto a subset of
+                        # its citations. Raw range evidence remains available.
+                        statement_invalid = True
+                        continue
+                    valid_refs.append(_reference_from_message(checked))
+                if statement_invalid or not valid_refs:
+                    source_invalid = source_invalid or any(
+                        isinstance(ref, dict)
+                        and str(ref.get("session_id") or "") == sid
+                        for ref in refs[:8]
+                    )
                     continue
                 text = str(statement.get("text") or "").strip()
                 if not text:
                     continue
-                evidence.append(
+                session_evidence.append(
                     {
                         "excerpt": text[:MAX_EXCERPT_CHARS],
                         "source": valid_refs[0],
@@ -2131,10 +2350,10 @@ class HistoryService:
                         "outside_range": False,
                     }
                 )
-                valid_count += 1
-            if valid_count:
+            if session_evidence and not source_invalid:
+                evidence.extend(session_evidence)
                 used.add(sid)
-            else:
+            elif source_invalid:
                 stale[sid] = True
         return evidence, used, stale
 
@@ -2202,20 +2421,29 @@ _HISTORY_PROMPT = (
 )
 
 
-def _summary_input(messages: list[dict[str, Any]]) -> str:
-    lines = []
+def _summary_input(
+    messages: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], bool]:
+    """Fit complete reference-bearing records, never validate unseen rows."""
+    budget = max(1, MAX_MODEL_INPUT_TOKENS - conservative_token_count(_SUMMARY_PROMPT) - 16)
+    lines: list[str] = []
+    supplied: list[dict[str, Any]] = []
+    content_truncated = False
     for row in _bounded_message_sample(messages):
         reference = _reference_from_message(row)
-        lines.append(
+        prefix = (
             f"MESSAGE {row['id']} ({row.get('role')} at "
-            f"{_timestamp_iso(row.get('timestamp'))}) SOURCE_REF "
-            f"{_json(reference)}: {str(row.get('content') or '')}"
+            f"{_timestamp_iso(row.get('timestamp'))}) SOURCE_REF {_json(reference)}: "
         )
-    text = "\n".join(lines)
-    return _fit_text(
-        text,
-        max(1, MAX_MODEL_INPUT_TOKENS - conservative_token_count(_SUMMARY_PROMPT) - 16),
-    )
+        used = conservative_token_count("\n".join(lines))
+        remaining = budget - used - conservative_token_count(prefix)
+        content = _fit_text(str(row.get("content") or ""), remaining)
+        if not content:
+            continue
+        content_truncated = content_truncated or content.endswith("…")
+        lines.append(prefix + content)
+        supplied.append(row)
+    return "\n".join(lines), supplied, content_truncated
 
 
 def _bounded_message_sample(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2661,6 +2889,8 @@ def _archive_session_authorized(
                 is not None
             )
         return False
+    except TimeoutError:
+        raise
     except Exception:
         return False
 
@@ -2677,39 +2907,101 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _wire_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def _wire_token_count(value: Any) -> int:
+    return conservative_token_count(_wire_json(value))
+
+
 def _fit_output(payload: dict[str, Any]) -> dict[str, Any]:
-    """Drop whole evidence entries until serialized output fits the hard ceiling."""
+    """Fit the final provider serialization while preserving useful evidence."""
     payload = json.loads(_json(payload))
-    evidence = payload.get("evidence") if isinstance(payload.get("evidence"), list) else []
-    while conservative_token_count(_json(payload)) > MAX_SERIALIZED_TOKENS and evidence:
-        evidence.pop()
-        payload.setdefault("coverage", {})["omitted_due_to_budget"] = (
-            int(payload.setdefault("coverage", {}).get("omitted_due_to_budget", 0)) + 1
-        )
+    evidence_value = payload.get("evidence")
+    evidence: list[Any] = evidence_value if isinstance(evidence_value, list) else []
+    coverage = payload.setdefault("coverage", {})
+    if not isinstance(coverage, dict):
+        coverage = {}
+        payload["coverage"] = coverage
+    include_synthesis = bool(payload.get("synthesis"))
+
+    def key_for(ref: Any) -> tuple[str, int] | None:
+        if not isinstance(ref, dict):
+            return None
+        try:
+            return str(ref["session_id"]), int(ref["message_id"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def sync() -> None:
         valid = {
-            (
-                str((item.get("source") or {}).get("session_id")),
-                int((item.get("source") or {}).get("message_id", 0)),
-            )
+            key
             for item in evidence
-            if item.get("source")
+            if isinstance(item, dict)
+            for key in [key_for(item.get("source"))]
+            if key is not None
         }
-        payload["statements"] = [
-            statement
-            for statement in payload.get("statements", [])
-            if any(
-                (str(ref.get("session_id")), int(ref.get("message_id", 0))) in valid
-                for ref in statement.get("sources", [])
-                if isinstance(ref, dict)
-            )
-        ]
-    for key in ("statements", "sessions", "warnings"):
-        while conservative_token_count(_json(payload)) > MAX_SERIALIZED_TOKENS and payload.get(key):
-            payload[key].pop()
-    payload["synthesis"] = _render_synthesis(payload.get("statements", []))
-    if conservative_token_count(_json(payload)) > MAX_SERIALIZED_TOKENS:
-        payload["synthesis"] = ""
-        payload.get("warnings", []).append("serialized output reached the hard budget")
+        statements = payload.get("statements")
+        if isinstance(statements, list):
+            retained: list[dict[str, Any]] = []
+            for statement in statements:
+                if not isinstance(statement, dict):
+                    continue
+                refs = statement.get("sources")
+                refs_list = refs if isinstance(refs, list) else []
+                keys = {
+                    key_for(ref)
+                    for ref in refs_list
+                    for key in [key_for(ref)]
+                    if key is not None
+                }
+                if keys and keys <= valid:
+                    retained.append(statement)
+            payload["statements"] = retained
+        payload["synthesis"] = (
+            _render_synthesis(payload.get("statements", [])) if include_synthesis else ""
+        )
+        coverage["messages_returned"] = sum(
+            1 for item in evidence if isinstance(item, dict) and not item.get("summary")
+        )
+        coverage["content_truncated"] = any(
+            bool(item.get("truncated")) for item in evidence if isinstance(item, dict)
+        )
+        if isinstance(payload.get("sessions"), list):
+            coverage["sessions_matched_on_page"] = len(payload["sessions"])
+
+    payload["token_estimate"] = 0
+    sync()
+    fit_limit = max(1, MAX_SERIALIZED_TOKENS - 128)
+    while _wire_token_count(payload) > fit_limit:
+        if include_synthesis:
+            include_synthesis = False
+            sync()
+            continue
+        statements = payload.get("statements")
+        if isinstance(statements, list) and statements:
+            statements.pop()
+            sync()
+            continue
+        sessions = payload.get("sessions")
+        if isinstance(sessions, list) and sessions:
+            sessions.pop()
+            sync()
+            continue
+        warnings = payload.get("warnings")
+        if isinstance(warnings, list) and warnings:
+            warnings.pop()
+            sync()
+            continue
+        if evidence:
+            evidence.pop()
+            coverage["omitted_due_to_budget"] = int(
+                coverage.get("omitted_due_to_budget", 0)
+            ) + 1
+            sync()
+            continue
+        break
     return payload
 
 

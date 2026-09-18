@@ -1152,6 +1152,7 @@ class RemnantDB:
         self,
         *,
         agent_id: str,
+        archive_key: str | None = None,
         lease_s: float = HISTORY_SUMMARY_LEASE_S,
         daily_limit: int = HISTORY_SUMMARY_DAILY_CALL_CAP,
     ) -> dict[str, Any] | None:
@@ -1159,24 +1160,41 @@ class RemnantDB:
         agent_id = str(agent_id or "").strip()
         if not agent_id:
             return None
+        archive_key = str(archive_key or "").strip() or None
         now = time.time()
         day = time.strftime("%Y-%m-%d", time.gmtime(now))
         budget_key = f"history_calls:{day}"
+        archive_scope = " AND archive_key=?" if archive_key else ""
         with self.transaction() as cur:
             expired_before = now - max(1.0, float(lease_s))
+            scope_params = [agent_id]
+            if archive_key:
+                scope_params.append(archive_key)
+            scope_params.append(expired_before)
             cur.execute(
                 "UPDATE history_summaries SET status=CASE WHEN attempts>=? "
                 "THEN 'dead_letter' ELSE 'retry_wait' END, available_at=?, "
                 "claimed_at=NULL,claim_token=NULL,updated_at=?,error_code=? "
-                "WHERE agent_id=? AND status='running' "
+                "WHERE agent_id=?" + archive_scope + " AND status='running' "
                 "AND COALESCE(claimed_at,0) < ?",
-                (HISTORY_SUMMARY_MAX_ATTEMPTS, now, now, "lease_expired", agent_id, expired_before),
+                [
+                    HISTORY_SUMMARY_MAX_ATTEMPTS,
+                    now,
+                    now,
+                    "lease_expired",
+                    *scope_params,
+                ],
             )
+            row_params = [agent_id]
+            if archive_key:
+                row_params.append(archive_key)
+            row_params.extend((now, HISTORY_SUMMARY_MAX_ATTEMPTS))
             row = cur.execute(
-                "SELECT rowid,* FROM history_summaries WHERE agent_id=? "
-                "AND status IN ('pending','retry_wait') AND available_at<=? "
+                "SELECT rowid,* FROM history_summaries WHERE agent_id=?"
+                + archive_scope
+                + " AND status IN ('pending','retry_wait') AND available_at<=? "
                 "AND attempts<? ORDER BY updated_at ASC,rowid ASC LIMIT 1",
-                (agent_id, now, HISTORY_SUMMARY_MAX_ATTEMPTS),
+                row_params,
             ).fetchone()
             if row is None:
                 return None
@@ -1219,6 +1237,7 @@ class RemnantDB:
         summary: dict[str, Any] | str,
         coverage: dict[str, Any] | str,
         claim_token: str | None = None,
+        archive_key: str | None = None,
     ) -> bool:
         """Persist one bounded validated projection after a successful attempt."""
         summary_json = (
@@ -1252,17 +1271,27 @@ class RemnantDB:
             if claim_token:
                 sql += " AND claim_token=?"
                 params.append(str(claim_token))
+            if archive_key:
+                sql += " AND archive_key=?"
+                params.append(str(archive_key))
             cur.execute(sql, params)
             return cur.rowcount == 1
 
-    def has_history_summary_work(self, *, agent_id: str) -> bool:
+    def has_history_summary_work(
+        self, *, agent_id: str, archive_key: str | None = None
+    ) -> bool:
         """Check whether a summary callback should remain armed."""
+        scope = " AND archive_key=?" if archive_key else ""
+        params: list[Any] = [str(agent_id)]
+        if archive_key:
+            params.append(str(archive_key))
         with self.read() as cur:
             return (
                 cur.execute(
-                    "SELECT 1 FROM history_summaries WHERE agent_id=? "
-                    "AND status IN ('pending','retry_wait','running') LIMIT 1",
-                    (str(agent_id),),
+                    "SELECT 1 FROM history_summaries WHERE agent_id=?"
+                    + scope
+                    + " AND status IN ('pending','retry_wait','running') LIMIT 1",
+                    params,
                 ).fetchone()
                 is not None
             )
@@ -1273,6 +1302,7 @@ class RemnantDB:
         *,
         error_code: str = "summary_failed",
         claim_token: str | None = None,
+        archive_key: str | None = None,
     ) -> bool:
         """Retry with bounded backoff, then retain a dead-letter marker."""
         now = time.time()
@@ -1287,8 +1317,13 @@ class RemnantDB:
             if (
                 claim_token
                 and cur.execute(
-                    "SELECT 1 FROM history_summaries WHERE rowid=? AND claim_token=?",
-                    (int(row_id), str(claim_token)),
+                    "SELECT 1 FROM history_summaries WHERE rowid=? AND claim_token=?"
+                    + (" AND archive_key=?" if archive_key else ""),
+                    [
+                        int(row_id),
+                        str(claim_token),
+                        *([str(archive_key)] if archive_key else []),
+                    ],
                 ).fetchone()
                 is None
             ):
@@ -1299,11 +1334,15 @@ class RemnantDB:
             else:
                 status = "retry_wait"
                 available = now + min(300.0, 2.0 ** max(0, attempts - 1))
-            cur.execute(
+            sql = (
                 "UPDATE history_summaries SET status=?,available_at=?,claimed_at=NULL,"
-                "claim_token=NULL,updated_at=?,error_code=? WHERE rowid=? AND status='running'",
-                (status, available, now, error, int(row_id)),
+                "claim_token=NULL,updated_at=?,error_code=? WHERE rowid=? AND status='running'"
             )
+            params: list[Any] = [status, available, now, error, int(row_id)]
+            if archive_key:
+                sql += " AND archive_key=?"
+                params.append(str(archive_key))
+            cur.execute(sql, params)
             return cur.rowcount == 1
 
     def get_history_summary(

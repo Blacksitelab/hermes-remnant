@@ -1,15 +1,19 @@
 from __future__ import annotations
 
+import gc
 import json
 import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 from remnant.config import RemnantConfig
+from remnant.context import conservative_token_count
 from remnant.db import HISTORY_SUMMARY_DAILY_CALL_CAP, open_db
-from remnant.history import HistoryArchive, HistoryService, resolve_range
+from remnant.history import HistoryArchive, HistoryService, _reference_from_message, resolve_range
 
 UTC = timezone.utc
 
@@ -18,8 +22,10 @@ def epoch(value: str) -> float:
     return datetime.fromisoformat(value).replace(tzinfo=UTC).timestamp()
 
 
+BASE = epoch("2024-06-14T00:00:00")
+
 def make_archive(home: Path) -> Path:
-    home.mkdir()
+    home.mkdir(exist_ok=True)
     path = home / "state.db"
     conn = sqlite3.connect(path)
     conn.executescript(
@@ -390,3 +396,294 @@ def test_long_session_messages_continue_without_duplicates(
         assert pages[-1]["has_more"] is False
     finally:
         service.db.close()
+
+
+def _add_session_messages(path: Path, session_id: str, rows: list[tuple[int, str, float]]) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            "INSERT INTO sessions(id,source,started_at,profile_name) VALUES(?,?,?,?)",
+            (session_id, "interactive", rows[0][2] if rows else 0, None),
+        )
+        connection.executemany(
+            "INSERT INTO messages(id,session_id,role,content,timestamp) VALUES(?,?,?,?,?)",
+            [(mid, session_id, "user", content, timestamp) for mid, content, timestamp in rows],
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_review_regressions_keep_long_pages_and_wire_budget(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    rows = [(1000 + index, "x" * 1900, epoch("2024-06-14T00:00:00") + index) for index in range(24)]
+    _add_session_messages(archive.path, "large", rows)
+    service = service_for(archive, tmp_path)
+    try:
+        args: dict[str, object] = {"session_id": "large", "synthesize": False}
+        seen: list[int] = []
+        while True:
+            result = service.recall(args)
+            seen.extend(item["source"]["message_id"] for item in result["evidence"])
+            assert conservative_token_count(json.dumps(result, ensure_ascii=False)) <= 4000
+            if not result["has_more"]:
+                break
+            assert result["next_cursor"]
+            args = {"session_id": "large", "cursor": result["next_cursor"], "synthesize": False}
+        assert seen == list(range(1000, 1024))
+    finally:
+        service.db.close()
+
+
+def test_review_regressions_reject_unseen_and_invalidated_summary_sources(
+    archive: HistoryArchive, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _add_session_messages(
+        archive.path,
+        "summary",
+        [
+            (2000 + index, f"message {index}", epoch("2024-06-14T00:00:00") + index)
+            for index in range(60)
+        ],
+    )
+    _add_session_messages(
+        archive.path,
+        "edited",
+        [(3000, "We discussed options.", BASE), (3001, "Adopt option blue.", BASE + 1)],
+    )
+    service = service_for(archive, tmp_path, history_summary_enabled=True)
+    try:
+        unseen = _reference_from_message(service.archive.get_messages("summary")[29])
+        service.enqueue_session("summary")
+        calls: list[dict[str, object]] = []
+
+        def fake_chat(**kwargs: object) -> str:
+            calls.append(kwargs)
+            return json.dumps(
+                {
+                    "topics": ["alpha"],
+                    "statements": [
+                        {"text": "Discussed alpha", "sources": [unseen]}
+                    ],
+                }
+            )
+
+        monkeypatch.setattr("remnant.history.chat", fake_chat)
+        assert service.process_one_summary() is False
+        assert calls and json.dumps(unseen, separators=(",", ":")) not in str(calls[0]["user"])
+        cached = service.db.get_history_summary(
+            archive_key=archive.archive_key, agent_id="default", session_id="summary"
+        )
+        assert cached and cached["status"] == "retry_wait"
+
+        refs = [_reference_from_message(row) for row in service.archive.get_messages("edited")]
+        service.enqueue_session("edited")
+        claim = service.db.claim_history_summary(
+            agent_id="default", archive_key=archive.archive_key
+        )
+        assert claim
+        assert service.db.complete_history_summary(
+            claim["id"],
+            source_version=service.archive.source_version("edited") or "",
+            summary={"statements": [{"text": "Adopt option blue.", "sources": refs}]},
+            coverage={},
+            claim_token=claim["claim_token"],
+            archive_key=archive.archive_key,
+        )
+        connection = sqlite3.connect(archive.path)
+        connection.execute(
+            "UPDATE messages SET content=? WHERE id=3001",
+            ("Actually adopt option red.",),
+        )
+        connection.commit()
+        connection.close()
+        result = service.recall({"session_id": "edited", "synthesize": False})
+        assert result["coverage"]["summaries_used"] == 0
+        assert all(not item.get("summary") for item in result["evidence"])
+        assert any("Actually adopt option red." in item["excerpt"] for item in result["evidence"])
+    finally:
+        service.db.close()
+
+
+def test_review_regressions_partition_summary_claims_and_retry_missing_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home_a = tmp_path / "a"
+    home_b = tmp_path / "b"
+    archive_a = HistoryArchive(make_archive(home_a), profile_home=home_a)
+    archive_b = HistoryArchive(make_archive(home_b), profile_home=home_b)
+    db = open_db(tmp_path / "shared.db")
+    config = RemnantConfig(history_summary_enabled=True)
+    first = HistoryService(db, config, archive=archive_a)
+    second = HistoryService(db, config, archive=archive_b)
+    try:
+        assert first.enqueue_session("day")
+        with monkeypatch.context() as patcher:
+            patcher.setattr(
+                "remnant.history.chat",
+                lambda **_: (_ for _ in ()).throw(AssertionError()),
+            )
+            assert second.process_one_summary() is False
+        row = db.get_history_summary(
+            archive_key=archive_a.archive_key, agent_id="default", session_id="day"
+        )
+        assert row and row["status"] == "pending"
+    finally:
+        db.close()
+
+    late_home = tmp_path / "late"
+    late_db = open_db(tmp_path / "late-remnant.db")
+    late = HistoryService(
+        late_db,
+        RemnantConfig(history_summary_enabled=False),
+        profile_home=late_home,
+    )
+    try:
+        assert late.recall({"query": "project", "synthesize": False})["status"] == "unavailable"
+        make_archive(late_home)
+        assert late.recall({"query": "project", "synthesize": False})["status"] != "unavailable"
+    finally:
+        late_db.close()
+
+
+def test_review_regressions_fix_runtime_identity_topic_tail_and_relative_cursor(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(archive.path, "tail", [(4000, "x" * 2200 + " quasar", BASE)])
+    runtime_db = open_db(tmp_path / "runtime.db")
+    runtime_config = RemnantConfig(
+        agent_id="alice", runtime_identity_enabled=True, history_summary_enabled=False
+    )
+    runtime = HistoryService(runtime_db, runtime_config, archive=archive)
+    try:
+        runtime_db.insert_turn(
+            session_id="day", agent_id="alice", user_text="owned", assistant_text=""
+        )
+        runtime_db.insert_turn(
+            session_id="tail", agent_id="alice", user_text="owned", assistant_text=""
+        )
+        message = archive.get_messages("day")[0]
+        assert archive.validate_reference(
+            _reference_from_message(message),
+            agent_id="alice",
+            remnant_db=runtime_db,
+            runtime_identity_enabled=True,
+            trusted_session_ids=set(),
+        )
+        tail = runtime.recall({"query": "quasar", "synthesize": False})
+        assert any(item["source"]["message_id"] == 4000 for item in tail["evidence"])
+    finally:
+        runtime_db.close()
+
+    service = service_for(archive, tmp_path)
+    try:
+        _add_session_messages(
+            archive.path,
+            "relative-large",
+            [
+                (5000 + index, "relative", BASE + index)
+                for index in range(85)
+            ],
+        )
+        service._now = datetime(2024, 6, 15, tzinfo=UTC)
+        first = service.recall({"relative": "yesterday", "synthesize": False})
+        assert first["next_cursor"]
+        service._now = datetime(2024, 6, 16, tzinfo=UTC)
+        second = service.recall(
+            {"relative": "yesterday", "cursor": first["next_cursor"], "synthesize": False}
+        )
+        assert second["resolved_range"] == first["resolved_range"]
+        assert service.recall({"relative": "999999999999999999999d"})["status"] == "invalid_request"
+        assert service.recall({"start": "9999-12-31"})["status"] == "invalid_request"
+    finally:
+        service.db.close()
+
+
+def test_review_regressions_union_raw_and_summary_topic_matches(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    _add_session_messages(archive.path, "raw", [(6000, "quasar raw discussion", BASE)])
+    _add_session_messages(archive.path, "cached", [(6001, "a star discussion", BASE + 1)])
+    service = service_for(archive, tmp_path)
+    try:
+        row = service.archive.get_messages("cached")[0]
+        service.db.enqueue_history_summary(
+            archive_key=archive.archive_key,
+            agent_id="default",
+            session_id="cached",
+        )
+        claim = service.db.claim_history_summary(
+            agent_id="default", archive_key=archive.archive_key
+        )
+        assert claim
+        assert service.db.complete_history_summary(
+            claim["id"],
+            source_version=service.archive.source_version("cached") or "",
+            summary={
+                "topics": ["quasar"],
+                "statements": [
+                    {
+                        "text": "quasar discussion",
+                        "sources": [_reference_from_message(row)],
+                    }
+                ],
+            },
+            coverage={},
+            claim_token=claim["claim_token"],
+            archive_key=archive.archive_key,
+        )
+        result = service.recall({"query": "quasar", "synthesize": False})
+        ids = [item["source"]["message_id"] for item in result["evidence"]]
+        assert ids == [6000, 6001]
+    finally:
+        service.db.close()
+
+
+def test_review_regressions_close_archive_connections_and_honor_deadline(
+    archive: HistoryArchive, tmp_path: Path
+) -> None:
+    gc.disable()
+    try:
+        before = len(list(Path("/proc/self/fd").iterdir()))
+        for _ in range(25):
+            archive.get_session("day")
+        after = len(list(Path("/proc/self/fd").iterdir()))
+        assert after <= before + 1
+    finally:
+        gc.enable()
+        gc.collect()
+
+    db = open_db(tmp_path / "deadline.db")
+    service = HistoryService(
+        db,
+        RemnantConfig(
+            agent_id="deadline",
+            runtime_identity_enabled=True,
+            history_summary_enabled=False,
+        ),
+        archive=archive,
+    )
+    try:
+        db.insert_turn(
+            session_id="day", agent_id="deadline", user_text="owned", assistant_text=""
+        )
+        locked = threading.Event()
+
+        def hold_read_lock() -> None:
+            with db.read():
+                locked.set()
+                time.sleep(3.2)
+
+        thread = threading.Thread(target=hold_read_lock)
+        thread.start()
+        assert locked.wait(1)
+        started = time.perf_counter()
+        result = service.recall({"session_id": "day", "synthesize": False})
+        elapsed = time.perf_counter() - started
+        thread.join()
+        assert elapsed < 3.2
+        assert result["status"] == "partial"
+        assert result["coverage"]["discovery_complete"] is False
+    finally:
+        db.close()
