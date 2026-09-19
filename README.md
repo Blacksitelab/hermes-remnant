@@ -5,7 +5,20 @@ Remnant is the long-term memory engine for the [Hermes Agent](https://hermes-age
 This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite** that exercises every phase of the system.
 
 **Repository:** [https://github.com/Blacksitelab/hermes-remnant](https://github.com/Blacksitelab/hermes-remnant)  
-**Local path:** `/mnt/data/dev/hermes-remnant`  
+
+## What you need to run it
+
+- Python 3.10+ (httpx and pyyaml are installed automatically).
+- An embedding model: any Ollama or OpenAI-compatible endpoint serving
+  `nomic-embed-text` (768-dim) by default.
+- An extraction model: a cheap local LLM (qwen3:8b-class, or any
+  OpenAI-compatible endpoint). Remnant uses it to extract facts, reflect,
+  and summarize conversation history. If it is down, Remnant keeps working —
+  extraction just pauses and keyword search still functions.
+- Optional: an Obsidian vault to index as documents. Without a vault,
+  Remnant is fully functional for conversation memory.
+- Optional: GLiNER (`urchade/gliner_small_v2`) for better entity
+  extraction; a regex fallback is built in.
 
 
 ---
@@ -20,7 +33,7 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 - **Searches three ways** — BM25 keyword, cosine vector similarity, entity-graph traversal, plus a hybrid RRF fusion.
 - **Proactively injects context** via Hermes' `prefetch()` hook, with a hard deadline, token budget, and diff-based suppression.
 - **Recalls conversation history explicitly** with `memory_history`, using the profile-local Hermes archive for dated, relative, topic, decision, correction, and unresolved-work questions.
-- **Indexes the Obsidian vault** as `document` memories, respecting workspace exclusions, frontmatter, locked notes, and per-agent profile scopes.
+- **Indexes an Obsidian vault when configured** as `document` memories, respecting workspace exclusions, frontmatter, locked notes, and per-agent profile scopes.
 - **Extracts entities with GLiNER** — a lightweight NER model (`urchade/gliner_small_v2`) extracts named entities with typed labels (person, tool, service, project, place, organization, concept). Falls back to regex if GLiNER is unavailable.
 - **Classifies typed relations** — co-occurrence edges are classified into semantic types (owns, uses, created, depends_on, monitors, manages, interacts_with, references, part_of) using entity-type heuristics.
 - **Expands queries via the entity graph** — when a user says "the printer", the prefetch pipeline generates n-gram phrases, resolves them against the entity graph (including aliases), traverses 1 hop to related entities, and adds canonical entity names as additional search terms. This bridges the gap between colloquial references and canonical entity names without adding latency.
@@ -59,9 +72,9 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 | Component | Choice | Reason |
 |-----------|--------|--------|
 | Storage | SQLite + FTS5 | Zero dependency, single-file, WAL on fixed engines, DELETE fallback, fast |
-| Embeddings | `nomic-embed-text` via BSL1 Ollama (768-dim) | Already loaded, CPU/GPU-capable, simple HTTP API |
+| Embeddings | `nomic-embed-text` via local Ollama (768-dim) | Small, CPU/GPU-capable, simple HTTP API |
 | Entity extraction | `urchade/gliner_small_v2` via GLiNER (CPU) | Purpose-built NER, ~400 MB, millisecond inference, typed entities |
-| Extraction / rerank / reflect | `gemma4:12b` on BSL1 via Ollama OpenAI-compatible API | Proven for extraction, already running |
+| Extraction / rerank / reflect | A local LLM such as `qwen3:8b` via an OpenAI-compatible API | Cheap extraction and summarization |
 | Dream loop | Cloud model (`deepseek-v4-flash:cloud` by default) | Overnight quality, latency irrelevant |
 | Framework | Hermes memory-provider plugin | Registers `sync_turn`, `prefetch`, tool schemas |
 | Concurrency | `ThreadPoolExecutor` | Proper shutdown semantics |
@@ -73,8 +86,8 @@ This repo contains both the **Hermes plugin** (`remnant/`) and the **test suite*
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/Blacksitelab/hermes-remnant.git /mnt/data/dev/hermes-remnant
-cd /mnt/data/dev/hermes-remnant
+git clone https://github.com/Blacksitelab/hermes-remnant.git ~/hermes-remnant
+cd ~/hermes-remnant
 ```
 
 ### 2. Create a virtual environment and install
@@ -92,7 +105,7 @@ Hermes discovers plugins from `~/.hermes/plugins/`. Link the package:
 
 ```bash
 mkdir -p ~/.hermes/plugins
-ln -s /mnt/data/dev/hermes-remnant/remnant ~/.hermes/plugins/remnant
+ln -s ~/hermes-remnant/remnant ~/.hermes/plugins/remnant
 ```
 
 The plugin manifest is `remnant/plugin.yaml`.
@@ -193,8 +206,8 @@ from remnant import RemnantMemoryProvider
 provider = RemnantMemoryProvider()
 home = Path("/tmp/remnant-smoke")
 provider.initialize("session-1", hermes_home=str(home))
-provider.sync_turn("Sven prefers dark mode.", "Noted.", session_id="session-1")
-result = provider.handle_tool_call("memory_search", {"query": "Sven preference"}, session_id="session-1")
+provider.sync_turn("Sam prefers dark mode.", "Noted.", session_id="session-1")
+result = provider.handle_tool_call("memory_search", {"query": "Sam preference"}, session_id="session-1")
 print(result)
 provider.shutdown()
 ```
@@ -400,15 +413,15 @@ Relations between entities are classified into semantic types using entity-type 
 
 | Relation type | Example | How it's detected |
 |---------------|---------|-------------------|
-| `owns` | kris → remnant | person owns project/tool |
-| `uses` | sven → ollama | person uses tool/service |
-| `created` | sven → skill | person created project/service |
+| `owns` | alex → remnant | person owns project/tool |
+| `uses` | sam → ollama | person uses tool/service |
+| `created` | sam → skill | person created project/service |
 | `depends_on` | remnant → sqlite | project/service depends on tool |
-| `monitors` | claire → fleet | person monitors project/service |
-| `manages` | kris → bsl1 | person manages place/organization |
-| `interacts_with` | claire → sven | person interacts with person |
+| `monitors` | atlas → fleet | person monitors project/service |
+| `manages` | alex → server01 | person manages place/organization |
+| `interacts_with` | atlas → sam | person interacts with person |
 | `references` | vault → remnant | project/service references project |
-| `part_of` | hub → blacksitelab | entity is part of organization |
+| `part_of` | hub → examplecorp | entity is part of organization |
 | `co_occurs` | docker → ollama | entities co-occur in memories but no typed relation |
 | `related_to` | (fallback) | no heuristic matched |
 
@@ -448,7 +461,7 @@ Per-profile config lives at `hermes_home/remnant.json` (where `hermes_home` is t
 
 The SQLite database is **shared** across all profiles at `~/.hermes/remnant/remnant.db` (override with the `REMNANT_DB_HOME` env var). Config and memory access are profile-scoped; only the database file is shared.
 
-The default vault path can be overridden with the `REMNANT_VAULT_PATH` env var before constructing a `RemnantConfig`.
+Vault indexing is optional: set `vault_path` per profile (or with the `REMNANT_VAULT_PATH` env var before constructing a `RemnantConfig`) to index an Obsidian vault. Without it Remnant runs as conversation memory and vault import no-ops cleanly.
 
 ```yaml
 agent_id: default
@@ -544,17 +557,17 @@ modality fields, use the model-backed pass instead:
 
 ```bash
 # Shadow mode, no database writes
-python -m remnant.model_backfill --home ~/.hermes/profiles/claire --home ~/.hermes --limit 20
+python -m remnant.model_backfill --home ~/.hermes/profiles/myprofile --home ~/.hermes --limit 20
 
 # Apply validated projections, preserving memories and writing audit entries
-python -m remnant.model_backfill --home ~/.hermes/profiles/claire --home ~/.hermes --batch-size 8 --yes
+python -m remnant.model_backfill --home ~/.hermes/profiles/myprofile --home ~/.hermes --batch-size 8 --yes
 ```
 
 The model pass updates the unique claim projection in place, preserves claim
 status and reconciliation state, and records before/after claim rows under the
 `claim_model_backfill` audit action. It defaults to the configured extraction
-endpoint and model, so it can use the local Gemma deployment without changing
-Hermes configuration.
+endpoint and model, so it can use the configured local model deployment without
+changing Hermes configuration.
 
 **GLiNER entity extraction** is enabled by default when the `gliner` package is installed. No configuration needed — the model (`urchade/gliner_small_v2`) is downloaded automatically on first use from HuggingFace (no token required). If `gliner` is not installed, the regex extractor runs automatically.
 
@@ -576,50 +589,6 @@ Remnant was built in five implementation phases plus a migration phase and a pos
 | 7 | Entity-graph query expansion in prefetch (alias resolution + 1-hop traversal) | 315 |
 
 ---
-
-## Production stats
-
-The BlacksiteLab production database (as of July 2026):
-
-| Metric | Value |
-|--------|-------|
-| Active memories | 1,574 |
-| Entities | 2,971 |
-| Memory-entity links | 5,886 |
-| Relations | 6,399 |
-| Embeddings | 1,576 (100% coverage) |
-| DB size | 30.4 MB |
-| Tests | 315 passing |
-
-Relation type distribution:
-
-| Type | Count |
-|------|-------|
-| `related_to` | 3,208 |
-| `co_occurs` | 2,408 |
-| `owns` | 345 |
-| `uses` | 175 |
-| `created` | 118 |
-| `depends_on` | 49 |
-| `monitors` | 30 |
-| `references` | 30 |
-| `manages` | 17 |
-| `interacts_with` | 16 |
-| `part_of` | 3 |
-
-Entity type distribution:
-
-| Type | Count |
-|------|-------|
-| `concept` | 952 |
-| `tool` | 696 |
-| `service` | 553 |
-| `project` | 362 |
-| `place` | 185 |
-| `person` | 107 |
-| `organization` | 100 |
-
-Top entities by link count: `user` (510), `kris` (122), `sven` (92), `claire` (88), `project` (74), `assistant` (73), `system` (67), `yuki` (62), `remnant` (52), `klaus` (42), `sasha` (39), `margot` (36), `ai` (35), `bsl1` (31), `blacksitelab` (27).
 
 ---
 
@@ -646,8 +615,8 @@ agent scope) to measure recall@k, MRR, and latency without mutating memories:
 ```bash
 python -m remnant.evaluate --cases retrieval-cases.json
 python -m remnant.maintenance health
-python -m remnant.maintenance migrate-default-agent --agent claire  # dry run
-python -m remnant.maintenance migrate-default-agent --agent claire --yes
+python -m remnant.maintenance migrate-default-agent --agent myprofile  # dry run
+python -m remnant.maintenance migrate-default-agent --agent myprofile --yes
 ```
 
 Run the scale-envelope harness separately from unit CI before changing the
@@ -707,8 +676,8 @@ cover queued prefetch, built-in writes, context compression, delegation,
 session end, backup paths, and session switching.
 
 Explicit legacy overrides remain supported. Run the evaluation and health gates
-in [`docs/remnant-v0.2.1-leadership-plan.md`](docs/remnant-v0.2.1-leadership-plan.md)
-before changing a production deployment that has pinned any of these flags.
+described in [docs/evaluation.md](docs/evaluation.md) before changing a
+deployment that has pinned any of these flags.
 
 Named operational profiles are available for controlled rollout:
 
@@ -776,16 +745,15 @@ The shared SQLite database at `~/.hermes/remnant/remnant.db` is returned by the 
 
 ## Roadmap / not in scope
 
-- BSL Hub integration as a future data source.
 - Entity community detection (deferred until graph traversal needs it).
 - Email / feed / sensor indexing.
 - Web dashboard.
-- GLiNER model fine-tuning on fleet-specific vocabulary (fleet agent names, homelab services).
-- Self-tuning prefetch: use prefetch_stats data to adjust deadline/budget/expand depth based on observed hit rates. Deferred until sufficient stats are collected (~1 week of production data).
+- GLiNER model fine-tuning on deployment-specific vocabulary (agent names, homelab services).
+- Self-tuning prefetch: use prefetch_stats data to adjust deadline/budget/expand depth based on observed hit rates. Deferred until sufficient stats are collected (~1 week of real traffic).
 - Curation loop: surface never-seen memories proactively to keep the corpus fresh. Depends on a reward signal (implicit reuse detection).
 
 ---
 
 ## License
 
-Internal BlacksiteLab project. Not licensed for public distribution.
+MIT — see `pyproject.toml` (`license = MIT`).

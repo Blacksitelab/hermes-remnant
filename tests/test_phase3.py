@@ -149,9 +149,9 @@ def _store_simple(db, emb, cfg, *, fact, entity, agent_id="default", visibility=
 
 
 def test_extract_entities_finds_proper_nouns():
-    ents = extract_entities("Sven prefers dark mode for the Proxmox homelab")
+    ents = extract_entities("Sam prefers dark mode for the Proxmox homelab")
     names = {e["name"] for e in ents}
-    assert "Sven" in names
+    assert "Sam" in names
     assert "Proxmox" in names
     # Common stopwords are dropped.
     ents = extract_entities("The homelab runs Proxmox")
@@ -184,13 +184,13 @@ def test_resolve_and_link_creates_entity_and_links(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven prefers dark mode", agent="default")
+        mid = db.insert_memory(content="Sam prefers dark mode", agent="default")
         eid, display = resolve_and_link(
-            db, memory_id=mid, entity_name="Sven", agent_id="default",
-            entity_type="person", aliases=["svenny"],
+            db, memory_id=mid, entity_name="Sam", agent_id="default",
+            entity_type="person", aliases=["sammy"],
         )
         assert eid, "entity id should be returned"
-        assert display == "Sven"
+        assert display == "Sam"
         # memory_entities link exists.
         with db.read() as cur:
             cur.execute(
@@ -201,7 +201,7 @@ def test_resolve_and_link_creates_entity_and_links(hermes_home: Path):
         # Entity row has the type + alias.
         ent = db.get_entity(eid)
         assert ent is not None
-        assert ent["name"] == "sven"
+        assert ent["name"] == "sam"
         assert ent["type"] == "person"
     finally:
         db.close()
@@ -213,10 +213,10 @@ def test_resolve_and_link_is_idempotent_on_name(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven prefers dark mode", agent="default")
-        eid1, _ = resolve_and_link(db, memory_id=mid, entity_name="Sven", agent_id="default")
-        mid2 = db.insert_memory(content="Sven also likes vim", agent="default")
-        eid2, _ = resolve_and_link(db, memory_id=mid2, entity_name="Sven", agent_id="default")
+        mid = db.insert_memory(content="Sam prefers dark mode", agent="default")
+        eid1, _ = resolve_and_link(db, memory_id=mid, entity_name="Sam", agent_id="default")
+        mid2 = db.insert_memory(content="Sam also likes vim", agent="default")
+        eid2, _ = resolve_and_link(db, memory_id=mid2, entity_name="Sam", agent_id="default")
         assert eid1 == eid2
     finally:
         db.close()
@@ -224,9 +224,9 @@ def test_resolve_and_link_is_idempotent_on_name(hermes_home: Path):
 
 def test_aliases_normalized_and_resolve(hermes_home: Path):
     """Aliases are lowercased + punctuation-stripped and resolve back."""
-    raw = ["Svenny", "Sven E.", "sven!"]
+    raw = ["Sammy", "Sam E.", "sam!"]
     norm = normalize_aliases(raw)
-    assert norm == ["svenny", "sven e.", "sven"]
+    assert norm == ["sammy", "sam e.", "sam"]
     assert normalize_aliases([]) == []
     assert normalize_aliases(["", "  ", "???"]) == []
 
@@ -234,15 +234,15 @@ def test_aliases_normalized_and_resolve(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven prefers dark mode", agent="default")
+        mid = db.insert_memory(content="Sam prefers dark mode", agent="default")
         eid, _ = resolve_and_link(
-            db, memory_id=mid, entity_name="Sven", agent_id="default",
+            db, memory_id=mid, entity_name="Sam", agent_id="default",
             entity_type="person", aliases=norm,
         )
         # find_entity_by_name matches the alias.
-        assert db.find_entity_by_name("svenny", agent_id="default") == eid
-        assert db.find_entity_by_name("Sven E.", agent_id="default") == eid
-        assert db.find_entity_by_name("Sven", agent_id="default") == eid
+        assert db.find_entity_by_name("sammy", agent_id="default") == eid
+        assert db.find_entity_by_name("Sam E.", agent_id="default") == eid
+        assert db.find_entity_by_name("Sam", agent_id="default") == eid
     finally:
         db.close()
 
@@ -253,11 +253,11 @@ def test_link_memory_entities_seeds_relations(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven runs Proxmox on the homelab", agent="default")
+        mid = db.insert_memory(content="Sam runs Proxmox on the homelab", agent="default")
         ids = link_memory_entities(
             db, memory_id=mid,
             entities=[
-                {"name": "Sven", "type": "person", "aliases": []},
+                {"name": "Sam", "type": "person", "aliases": []},
                 {"name": "Proxmox", "type": "service", "aliases": []},
                 {"name": "homelab", "type": "place", "aliases": []},
             ],
@@ -277,10 +277,10 @@ def test_entity_resolution_scoped_per_agent(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid_a = db.insert_memory(content="Sven A fact", agent="agentA")
-        eid_a, _ = resolve_and_link(db, memory_id=mid_a, entity_name="Sven", agent_id="agentA")
-        mid_b = db.insert_memory(content="Sven B fact", agent="agentB")
-        eid_b, _ = resolve_and_link(db, memory_id=mid_b, entity_name="Sven", agent_id="agentB")
+        mid_a = db.insert_memory(content="Sam A fact", agent="agentA")
+        eid_a, _ = resolve_and_link(db, memory_id=mid_a, entity_name="Sam", agent_id="agentA")
+        mid_b = db.insert_memory(content="Sam B fact", agent="agentB")
+        eid_b, _ = resolve_and_link(db, memory_id=mid_b, entity_name="Sam", agent_id="agentB")
         assert eid_a != eid_b
     finally:
         db.close()
@@ -292,10 +292,10 @@ def test_entity_resolution_scoped_per_agent(hermes_home: Path):
 
 
 def _seed_graph(db, emb, cfg):
-    """Seed: Sven -- Proxmox -- homelab, with a memory linking all three."""
-    mid = _store(db, emb, cfg, fact="Sven runs Proxmox on the homelab",
+    """Seed: Sam -- Proxmox -- homelab, with a memory linking all three."""
+    mid = _store(db, emb, cfg, fact="Sam runs Proxmox on the homelab",
                  entities=[
-                     {"name": "Sven", "type": "person", "aliases": []},
+                     {"name": "Sam", "type": "person", "aliases": []},
                      {"name": "Proxmox", "type": "service", "aliases": []},
                      {"name": "homelab", "type": "place", "aliases": []},
                  ])
@@ -305,26 +305,26 @@ def _seed_graph(db, emb, cfg):
 def test_memory_graph_tool_returns_connected_entities(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven runs Proxmox on the homelab", "entity": "Sven"},
+        {"fact": "Sam runs Proxmox on the homelab", "entity": "Sam"},
         session_id="seed",
     )
-    # The single-entity path only links "Sven"; store a second memory that
-    # links Sven + Proxmox so a relation exists.
+    # The single-entity path only links "Sam"; store a second memory that
+    # links Sam + Proxmox so a relation exists.
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven uses Proxmox for virtualization", "entity": "Sven"},
+        {"fact": "Sam uses Proxmox for virtualization", "entity": "Sam"},
         session_id="seed",
     )
     res = provider.handle_tool_call(
-        "memory_graph", {"entity": "Sven", "depth": 2}, session_id="graph",
+        "memory_graph", {"entity": "Sam", "depth": 2}, session_id="graph",
     )
     parsed = json.loads(res)
     assert "entities" in parsed
     assert "memories" in parsed
-    # Sven resolves and is the seed at depth 0.
+    # Sam resolves and is the seed at depth 0.
     names = [e.get("name") for e in parsed["entities"]]
-    assert "sven" in names
-    # At least one memory linked to Sven is returned.
+    assert "sam" in names
+    # At least one memory linked to Sam is returned.
     assert parsed["count"] >= 1
 
 
@@ -346,10 +346,10 @@ def test_search_graph_strategy_finds_linked_memories(hermes_home: Path):
         _seed_graph(db, emb, cfg)
         # Query mentions a known entity by proper-noun name.
         results = hybrid_search(
-            db, cfg, "Sven", agent_id="default", limit=10, strategy="graph",
+            db, cfg, "Sam", agent_id="default", limit=10, strategy="graph",
         )
         assert results, "graph search should return linked memories"
-        assert any("Sven" in r["content"] or "sven" in r["content"].lower()
+        assert any("Sam" in r["content"] or "sam" in r["content"].lower()
                    for r in results)
     finally:
         db.close()
@@ -374,13 +374,13 @@ def test_graph_traverse_returns_entities_and_memories(hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         _seed_graph(db, emb, cfg)
-        res = graph_traverse(db, "Sven", agent_id="default", depth=2)
+        res = graph_traverse(db, "Sam", agent_id="default", depth=2)
         assert res["entity"] is not None
-        assert res["entity"]["name"] == "sven"
+        assert res["entity"]["name"] == "sam"
         assert len(res["entities"]) >= 1
         # Seed at depth 0.
         depths = {e["name"]: e["depth"] for e in res["entities"]}
-        assert depths.get("sven") == 0
+        assert depths.get("sam") == 0
         assert res["memories"], "should return linked active memories"
     finally:
         db.close()
@@ -437,8 +437,8 @@ def test_relation_strength_max_upsert(hermes_home: Path):
 # ===========================================================================
 
 
-def _store_one(db, emb, cfg, fact="Sven prefers dark mode", agent_id="default"):
-    mid = _store_simple(db, emb, cfg, fact=fact, entity="Sven", agent_id=agent_id)
+def _store_one(db, emb, cfg, fact="Sam prefers dark mode", agent_id="default"):
+    mid = _store_simple(db, emb, cfg, fact=fact, entity="Sam", agent_id=agent_id)
     assert mid is not None
     return mid
 
@@ -448,10 +448,10 @@ def test_edit_update_creates_new_and_supersedes_old(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        old = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        old = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         res = memory_edit(
             db, cfg, emb, action="update", actor="default", memory_id=old,
-            content="Sven prefers light mode",
+            content="Sam prefers light mode",
         )
         assert "error" not in res
         new = res["memory_id"]
@@ -460,7 +460,7 @@ def test_edit_update_creates_new_and_supersedes_old(hermes_home: Path):
         # Old is superseded; new is active.
         assert db.get_memory(old)["status"] == "superseded"
         assert db.get_memory(new)["status"] == "active"
-        assert db.get_memory(new)["content"] == "Sven prefers light mode"
+        assert db.get_memory(new)["content"] == "Sam prefers light mode"
     finally:
         db.close()
 
@@ -498,11 +498,11 @@ def test_edit_merge_combines_and_supersedes(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        m1 = _store_simple(db, emb, cfg, fact="Sven likes vim", entity="Sven")
-        m2 = _store_simple(db, emb, cfg, fact="Sven likes git", entity="Sven")
+        m1 = _store_simple(db, emb, cfg, fact="Sam likes vim", entity="Sam")
+        m2 = _store_simple(db, emb, cfg, fact="Sam likes git", entity="Sam")
         res = memory_edit(
             db, cfg, emb, action="merge", actor="default",
-            memory_ids=[m1, m2], content="Sven likes vim and git",
+            memory_ids=[m1, m2], content="Sam likes vim and git",
         )
         assert "error" not in res
         new = res["memory_id"]
@@ -510,7 +510,7 @@ def test_edit_merge_combines_and_supersedes(hermes_home: Path):
         assert set(res["superseded_ids"]) == {m1, m2}
         for old in (m1, m2):
             assert db.get_memory(old)["status"] == "superseded"
-        assert db.get_memory(new)["content"] == "Sven likes vim and git"
+        assert db.get_memory(new)["content"] == "Sam likes vim and git"
         assert db.get_memory(new)["status"] == "active"
     finally:
         db.close()
@@ -521,7 +521,7 @@ def test_edit_merge_requires_two_ids(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        m1 = _store_simple(db, emb, cfg, fact="Sven likes vim", entity="Sven")
+        m1 = _store_simple(db, emb, cfg, fact="Sam likes vim", entity="Sam")
         res = memory_edit(
             db, cfg, emb, action="merge", actor="default",
             memory_ids=[m1], content="x",
@@ -536,7 +536,7 @@ def test_edit_forget_marks_status_and_hides(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         res = memory_edit(db, cfg, emb, action="forget", actor="default", memory_id=mid)
         assert res["status"] == "forgotten"
         assert db.get_memory(mid)["status"] == "forgotten"
@@ -652,7 +652,7 @@ def test_edit_share_changes_visibility(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         assert db.get_memory(mid)["visibility"] == "private"
         res = memory_edit(db, cfg, emb, action="share", actor="default", memory_id=mid)
         assert res["visibility"] == "shared"
@@ -688,7 +688,7 @@ def test_edit_unknown_action(hermes_home: Path):
 def test_memory_edit_tool_dispatch(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="seed",
     )
     # Look it up to get the id.
@@ -719,7 +719,7 @@ def test_audit_log_row_written_for_each_action(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
 
         # forget
         memory_edit(db, cfg, emb, action="forget", actor="auditor", memory_id=mid)
@@ -728,7 +728,7 @@ def test_audit_log_row_written_for_each_action(hermes_home: Path):
         assert rows[0]["actor"] == "auditor"
 
         # feedback on a fresh memory
-        mid2 = _store_one(db, emb, cfg, fact="Sven likes vim")
+        mid2 = _store_one(db, emb, cfg, fact="Sam likes vim")
         memory_edit(db, cfg, emb, action="feedback", actor="auditor",
                     memory_id=mid2, feedback="useful")
         rows = db.list_audit(memory_id=mid2, action="feedback")
@@ -752,9 +752,9 @@ def test_audit_update_writes_supersede_and_update_rows(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        old = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        old = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         memory_edit(db, cfg, emb, action="update", actor="auditor",
-                    memory_id=old, content="Sven prefers light mode")
+                    memory_id=old, content="Sam prefers light mode")
         # supersede row points at the old memory.
         sup_rows = db.list_audit(memory_id=old, action="supersede")
         assert len(sup_rows) >= 1
@@ -770,10 +770,10 @@ def test_audit_merge_writes_supersede_and_merge_rows(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        m1 = _store_simple(db, emb, cfg, fact="Sven likes vim", entity="Sven")
-        m2 = _store_simple(db, emb, cfg, fact="Sven likes git", entity="Sven")
+        m1 = _store_simple(db, emb, cfg, fact="Sam likes vim", entity="Sam")
+        m2 = _store_simple(db, emb, cfg, fact="Sam likes git", entity="Sam")
         res = memory_edit(db, cfg, emb, action="merge", actor="auditor",
-                          memory_ids=[m1, m2], content="Sven likes vim and git")
+                          memory_ids=[m1, m2], content="Sam likes vim and git")
         new = res["memory_id"]
         # Two supersede rows (one per original).
         sup1 = db.list_audit(memory_id=m1, action="supersede")
@@ -792,7 +792,7 @@ def test_audit_details_contain_before_after(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         # forget: details has before snapshot + after_status.
         memory_edit(db, cfg, emb, action="forget", actor="auditor", memory_id=mid)
         row = db.list_audit(memory_id=mid, action="forget")[0]
@@ -800,10 +800,10 @@ def test_audit_details_contain_before_after(hermes_home: Path):
         assert isinstance(details, dict)
         assert details["after_status"] == "forgotten"
         assert "before" in details
-        assert details["before"]["content"] == "Sven prefers dark mode"
+        assert details["before"]["content"] == "Sam prefers dark mode"
 
         # feedback: details has before_score + after_score.
-        mid2 = _store_one(db, emb, cfg, fact="Sven likes vim")
+        mid2 = _store_one(db, emb, cfg, fact="Sam likes vim")
         memory_edit(db, cfg, emb, action="feedback", actor="auditor",
                     memory_id=mid2, feedback="useful")
         row = db.list_audit(memory_id=mid2, action="feedback")[0]
@@ -824,16 +824,16 @@ def test_audit_update_details_contain_before_snapshot(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        old = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        old = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         memory_edit(db, cfg, emb, action="update", actor="auditor",
-                    memory_id=old, content="Sven prefers light mode")
+                    memory_id=old, content="Sam prefers light mode")
         # Find the update audit row.
         all_update = db.list_audit(action="update", limit=50)
         row = next(r for r in all_update if r["actor"] == "auditor")
         details = row["details"]
         assert details["before_id"] == old
         assert "before" in details
-        assert details["before"]["content"] == "Sven prefers dark mode"
+        assert details["before"]["content"] == "Sam prefers dark mode"
         assert "after_id" in details
     finally:
         db.close()
@@ -845,17 +845,17 @@ def test_audit_update_details_contain_before_snapshot(hermes_home: Path):
 
 
 def test_detect_contradiction_antonym():
-    assert detect_contradiction("Sven prefers dark mode", "Sven prefers light mode")
+    assert detect_contradiction("Sam prefers dark mode", "Sam prefers light mode")
     assert detect_contradiction("The server is online", "The server is offline")
 
 
 def test_detect_contradiction_negation():
-    assert detect_contradiction("Sven likes dark mode", "Sven does not like dark mode")
+    assert detect_contradiction("Sam likes dark mode", "Sam does not like dark mode")
 
 
 def test_detect_contradiction_no_contradiction():
-    assert not detect_contradiction("Sven prefers dark mode", "Sven likes vim")
-    assert not detect_contradiction("Sven prefers dark mode", "Alice likes vim")
+    assert not detect_contradiction("Sam prefers dark mode", "Sam likes vim")
+    assert not detect_contradiction("Sam prefers dark mode", "Alice likes vim")
 
 
 def test_storing_conflicting_fact_flags_both(hermes_home: Path):
@@ -863,13 +863,13 @@ def test_storing_conflicting_fact_flags_both(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        # First fact: creates the Sven entity + links the memory.
-        mid1 = _store(db, emb, cfg, fact="Sven prefers dark mode",
-                      entities=[{"name": "Sven", "type": "person", "aliases": []}])
+        # First fact: creates the Sam entity + links the memory.
+        mid1 = _store(db, emb, cfg, fact="Sam prefers dark mode",
+                      entities=[{"name": "Sam", "type": "person", "aliases": []}])
         assert mid1 is not None
-        # Second conflicting fact shares the Sven entity.
-        mid2 = _store(db, emb, cfg, fact="Sven prefers light mode",
-                      entities=[{"name": "Sven", "type": "person", "aliases": []}])
+        # Second conflicting fact shares the Sam entity.
+        mid2 = _store(db, emb, cfg, fact="Sam prefers light mode",
+                      entities=[{"name": "Sam", "type": "person", "aliases": []}])
         assert mid2 is not None
         assert mid1 != mid2
         # Old memory's metadata.contradicts references the new fact.
@@ -891,10 +891,10 @@ def test_contradiction_not_flagged_for_unrelated_facts(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid1 = _store(db, emb, cfg, fact="Sven prefers dark mode",
-                      entities=[{"name": "Sven", "type": "person", "aliases": []}])
-        mid2 = _store(db, emb, cfg, fact="Sven likes vim",
-                      entities=[{"name": "Sven", "type": "person", "aliases": []}])
+        mid1 = _store(db, emb, cfg, fact="Sam prefers dark mode",
+                      entities=[{"name": "Sam", "type": "person", "aliases": []}])
+        mid2 = _store(db, emb, cfg, fact="Sam likes vim",
+                      entities=[{"name": "Sam", "type": "person", "aliases": []}])
         assert mid1 is not None and mid2 is not None
         m2 = db.get_memory(mid2)
         assert "contradicts" not in (m2.get("metadata") or {})
@@ -912,7 +912,7 @@ def test_forgotten_memory_excluded_from_search(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         # Visible before forget.
         before = hybrid_search(db, cfg, "dark mode", agent_id="default")
         assert any(r["id"] == mid for r in before)
@@ -928,9 +928,9 @@ def test_superseded_memory_excluded_from_search(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        old = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        old = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         memory_edit(db, cfg, emb, action="update", actor="default",
-                    memory_id=old, content="Sven prefers light mode")
+                    memory_id=old, content="Sam prefers light mode")
         # Old content should not appear.
         results = hybrid_search(db, cfg, "dark mode", agent_id="default")
         assert all(r["id"] != old for r in results)
@@ -946,7 +946,7 @@ def test_forgotten_excluded_from_semantic_search(hermes_home: Path):
     cfg = RemnantConfig()
     emb = _fake_embed(db, cfg)
     try:
-        mid = _store_one(db, emb, cfg, fact="Sven prefers dark mode")
+        mid = _store_one(db, emb, cfg, fact="Sam prefers dark mode")
         memory_edit(db, cfg, emb, action="forget", actor="default", memory_id=mid)
         results = hybrid_search(db, cfg, "dark mode", agent_id="default",
                                 strategy="semantic", embedder=emb)
@@ -963,7 +963,7 @@ def test_forgotten_excluded_from_graph_search(hermes_home: Path):
         mid = _seed_graph(db, emb, cfg)
         memory_edit(db, cfg, emb, action="forget", actor="default", memory_id=mid)
         # Graph search returns active memories only.
-        results = graph_search(db, "Sven", agent_id="default", depth=2)
+        results = graph_search(db, "Sam", agent_id="default", depth=2)
         assert all(r["id"] != mid for r in results)
     finally:
         db.close()
@@ -972,7 +972,7 @@ def test_forgotten_excluded_from_graph_search(hermes_home: Path):
 def test_memory_search_tool_excludes_forgotten(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="seed",
     )
     res = provider.handle_tool_call(
@@ -1024,23 +1024,22 @@ def test_cosine_phase3_helper():
 
 def test_extract_entities_drops_date_phrases():
     """Capitalized date/time terms are NOT extracted as entities."""
-    ents = extract_entities("Sven met the team on June 22 and again Monday morning")
+    ents = extract_entities("Sam met the team on June 22 and again Monday morning")
     names = {e["name"] for e in ents}
     assert "June" not in names, "month names should be stopped"
     assert "Monday" not in names, "weekday names should be stopped"
     # The real proper noun survives.
-    assert "Sven" in names
+    assert "Sam" in names
 
 
 def test_extract_entities_drops_country_region_names():
     """Country / region / state names used as location context are stopped."""
     ents = extract_entities(
-        "Sven visited New Zealand and drove through Hawke's Bay last week"
+        "Sam visited New Zealand and drove north last week"
     )
     names = {e["name"] for e in ents}
     assert "New Zealand" not in names
-    assert "Hawke's" not in names
-    assert "Sven" in names  # real entity survives
+    assert "Sam" in names  # real entity survives
 
 
 def test_extract_entities_drops_generic_tech_nouns():
@@ -1060,10 +1059,10 @@ def test_extract_entities_drops_generic_tech_nouns():
 def test_extract_entities_custom_stoplist_extends_default():
     """Callers can pass their own stoplist to extend suppression."""
     ents = extract_entities(
-        "Sven runs Proxmox", stoplist={"sven"}
+        "Sam runs Proxmox", stoplist={"sam"}
     )
     names = {e["name"] for e in ents}
-    assert "Sven" not in names
+    assert "Sam" not in names
     assert "Proxmox" in names
 
 
@@ -1073,22 +1072,22 @@ def test_entity_mentioned_once_is_not_persisted(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven runs Proxmox on the homelab", agent="default")
+        mid = db.insert_memory(content="Sam runs Proxmox on the homelab", agent="default")
         ids = link_memory_entities(
             db, memory_id=mid,
-            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            entities=[{"name": "Sam", "type": "person", "aliases": []}],
             agent_id="default", min_memories=2,
         )
         # No entity was created/linked on the first sighting.
         assert ids == []
-        assert db.find_entity_by_name("Sven", agent_id="default") is None
+        assert db.find_entity_by_name("Sam", agent_id="default") is None
         with db.read() as cur:
             cur.execute(
                 "SELECT COUNT(*) AS c FROM memory_entities WHERE memory_id=?", (mid,)
             )
             assert cur.fetchone()["c"] == 0
         # But a sighting was recorded so the second sighting can promote it.
-        assert db.entity_sighting_count("sven", agent_id="default") == 1
+        assert db.entity_sighting_count("sam", agent_id="default") == 1
     finally:
         db.close()
 
@@ -1100,18 +1099,18 @@ def test_entity_persisted_on_second_sighting(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid1 = db.insert_memory(content="Sven prefers dark mode", agent="default")
+        mid1 = db.insert_memory(content="Sam prefers dark mode", agent="default")
         ids1 = link_memory_entities(
             db, memory_id=mid1,
-            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            entities=[{"name": "Sam", "type": "person", "aliases": []}],
             agent_id="default", min_memories=2,
         )
         assert ids1 == [], "first sighting should not persist"
 
-        mid2 = db.insert_memory(content="Sven also likes vim", agent="default")
+        mid2 = db.insert_memory(content="Sam also likes vim", agent="default")
         ids2 = link_memory_entities(
             db, memory_id=mid2,
-            entities=[{"name": "Sven", "type": "person", "aliases": []}],
+            entities=[{"name": "Sam", "type": "person", "aliases": []}],
             agent_id="default", min_memories=2,
         )
         # Second sighting promotes the entity and links both memories.
@@ -1119,14 +1118,14 @@ def test_entity_persisted_on_second_sighting(hermes_home: Path):
         eid = ids2[0]
         ent = db.get_entity(eid)
         assert ent is not None
-        assert ent["name"] == "sven"
+        assert ent["name"] == "sam"
         assert ent["type"] == "person"
         # Both memories are linked (the sighting for mid1 was back-filled).
         linked = db.get_memories_for_entity(eid, agent_id="default")
         linked_ids = {m["id"] for m in linked}
         assert {mid1, mid2} <= linked_ids
         # Sighting rows are cleared after promotion.
-        assert db.entity_sighting_count("sven", agent_id="default") == 0
+        assert db.entity_sighting_count("sam", agent_id="default") == 0
     finally:
         db.close()
 
@@ -1180,22 +1179,22 @@ def test_typed_entities_skip_regex_fallback(monkeypatch, hermes_home: Path):
         monkeypatch.setattr(entity_mod, "extract_entities", spy)
 
         # Typed entities supplied: the regex path must not be invoked.
-        typed = [{"name": "Sven", "type": "person", "aliases": []}]
+        typed = [{"name": "Sam", "type": "person", "aliases": []}]
         ids = extract_and_link_entities(
-            db, memory_id=mid, text="Sven prefers dark mode on Monday",
+            db, memory_id=mid, text="Sam prefers dark mode on Monday",
             typed_entities=typed, agent_id="default", min_memories=1,
         )
         assert len(ids) == 1
         assert calls == [], "regex extract_entities should not run for typed path"
         # The typed entity was linked; the stoplisted "Monday" (which regex
         # would have dropped anyway) was never even considered.
-        assert db.find_entity_by_name("Sven", agent_id="default") is not None
+        assert db.find_entity_by_name("Sam", agent_id="default") is not None
 
         # Reset: with no typed entities, the regex path runs.
         calls.clear()
         mid2 = db.insert_memory(content="y", agent="default")
         extract_and_link_entities(
-            db, memory_id=mid2, text="Sven likes Proxmox",
+            db, memory_id=mid2, text="Sam likes Proxmox",
             typed_entities=None, agent_id="default", min_memories=1,
             use_gliner=False,
         )
@@ -1210,13 +1209,13 @@ def test_extract_and_link_applies_threshold_on_regex_path(hermes_home: Path):
     cfg = RemnantConfig()
     _fake_embed(db, cfg)
     try:
-        mid = db.insert_memory(content="Sven runs Proxmox", agent="default")
+        mid = db.insert_memory(content="Sam runs Proxmox", agent="default")
         ids = extract_and_link_entities(
-            db, memory_id=mid, text="Sven runs Proxmox",
+            db, memory_id=mid, text="Sam runs Proxmox",
             typed_entities=None, agent_id="default", min_memories=2,
             use_gliner=False,
         )
         assert ids == [], "single regex sighting should be deferred"
-        assert db.find_entity_by_name("Sven", agent_id="default") is None
+        assert db.find_entity_by_name("Sam", agent_id="default") is None
     finally:
         db.close()

@@ -177,8 +177,7 @@ _STOPWORDS = {
 # — they are temporal / geographic / generic-tech context rather than durable
 # subjects worth tracking. Matched on the lowercased extracted phrase (after
 # leading ``_STOPWORDS`` are stripped), so multi-word entries like "new zealand"
-# or "hawke's bay" match the full phrase while a proper noun such as "Proxmox"
-# never matches.
+# match the full phrase while a proper noun such as "Proxmox" never matches.
 #
 # Kept module-level (mirroring ``_STOPWORDS``) so callers and tests can extend
 # it without touching the regex. The extraction LLM path is unaffected: typed
@@ -198,8 +197,8 @@ _STOPLIST: set[str] = {
     # Listed when they are merely *where* something happens, not a project or
     # organisation. A proper-noun lab / project named after a place still wins
     # because it is a multi-word phrase that does not match these single /
-    # listed entries.
-    "new zealand", "hawke's bay", "hawkes bay", "hawke bay",
+    # listed entries. Extend via ``extract_entities(stoplist=...)``.
+    "new zealand",
     "pacific", "auckland", "wellington", "christchurch", "dunedin",
     "australia", "canada", "united states", "united kingdom", "europe",
     "asia", "africa", "americas",

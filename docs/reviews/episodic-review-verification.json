@@ -1,0 +1,238 @@
+{
+  "leadership": {
+    "cases": 240,
+    "recall_at_1": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0,
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "context_precision": 1.0,
+    "macro_score": 1.0,
+    "wrong_answer_rate": null,
+    "stale_claim_exposure": 0,
+    "duplicate_top_k_occupancy": 0,
+    "categories": {
+      "conditional_fact": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "distractor_entity": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "duplicate_paraphrase": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "dynamic_update": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "historical_query": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "immediate_next_turn": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "runtime_isolation": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "stable_long_time": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "static_false_contradiction": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "unresolved_conflict": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "vault_vs_conversation": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "visibility_scope": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      }
+    }
+  },
+  "heldout-adversarial": {
+    "cases": 120,
+    "recall_at_1": 1.0,
+    "recall_at_3": 1.0,
+    "recall_at_5": 1.0,
+    "mrr": 1.0,
+    "ndcg_at_5": 1.0,
+    "context_precision": 1.0,
+    "macro_score": 1.0,
+    "wrong_answer_rate": null,
+    "stale_claim_exposure": 0,
+    "duplicate_top_k_occupancy": 0,
+    "categories": {
+      "conditional_fact": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "distractor_entity": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "duplicate_paraphrase": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "dynamic_update": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "historical_query": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "immediate_next_turn": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "runtime_isolation": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "stable_long_time": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "static_false_contradiction": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "unresolved_conflict": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "vault_vs_conversation": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      },
+      "visibility_scope": {
+        "recall_at_1": 1.0,
+        "recall_at_3": 1.0,
+        "recall_at_5": 1.0,
+        "mrr": 1.0,
+        "ndcg_at_5": 1.0
+      }
+    }
+  },
+  "fresh_backup_restore": {
+    "health": "ok",
+    "version": 18,
+    "backup": "ok",
+    "restore": "ok"
+  },
+  "visibility_sql_path_archive_immutability": "passed: compacted allowed; rewind/hidden/tool/system/SQL injection/override/symlink rejected; archive SHA unchanged",
+  "model_failure_fallback": "passed malformed/foreign citations/timeout; one attempted call each",
+  "wire_output_max": {
+    "wire_tokens": 4154,
+    "compact_tokens": 3894,
+    "message_chars": 5
+  },
+  "ordinary_path_history_trap": "passed sync_turn/prefetch/queue_prefetch with date prose",
+  "request_lock_deadline": {
+    "elapsed_s": 3.4050825629383326,
+    "status": "ok"
+  },
+  "concurrent_daily_budget": {
+    "claimed": 20,
+    "unique": 20
+  },
+  "vault_symlink_escape": {
+    "indexed": 1,
+    "rows": [
+      {
+        "source_id": "allowed/linked.md",
+        "content": "Synthetic external document."
+      }
+    ]
+  },
+  "graph_scope_bypass": {
+    "returned_excluded_memory": true
+  },
+  "installed_hermes": {
+    "status": "ok",
+    "message_id": 1
+  }
+}

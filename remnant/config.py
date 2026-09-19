@@ -30,18 +30,16 @@ DEFAULT_EXTRACT_STRUCTURED_OUTPUT = True
 
 # Phase 4: Obsidian vault indexing. The vault is the single source of truth for
 # notes; we index it as type='document' memories. Excluded folders hold agent
-# scratch/workspace trees that must never be ingested. The vault path default
-# can be overridden via the REMNANT_VAULT_PATH env var (useful for tests and
-# deployments that store the vault elsewhere than the hardcoded BSL path).
-DEFAULT_VAULT_PATH = os.environ.get(
-    "REMNANT_VAULT_PATH", "/path/to/your/obsidian-vault"
-)
+# scratch/workspace trees that must never be ingested. Vault indexing is
+# optional: the default is None (no vault configured), and the path can be set
+# per profile in remnant.json or overridden via the REMNANT_VAULT_PATH env var.
+DEFAULT_VAULT_PATH = os.environ.get("REMNANT_VAULT_PATH")
 DEFAULT_VAULT_EXCLUDE = ["90_", "91_", "92_", "93_", "94_", "95_", "99_ARCHIVE"]
 DEFAULT_VAULT_REINDEX_INTERVAL_S = 600
 DEFAULT_VAULT_PASSAGE_CHARS = 1_200
 DEFAULT_VAULT_PASSAGE_OVERLAP = 150
 
-# Reflection reuses the extraction endpoint/model by default (gemma4:12b on BSL1).
+# Reflection reuses the extraction endpoint/model by default.
 DEFAULT_REFLECT_URL = DEFAULT_EXTRACT_URL
 DEFAULT_REFLECT_MODEL = DEFAULT_EXTRACT_MODEL
 
@@ -236,8 +234,9 @@ class RemnantConfig:
     trust_decay_enabled: bool = TRUST_DECAY_ENABLED
     trust_decay_half_life_days: float = TRUST_DECAY_HALF_LIFE_DAYS
     trust_decay_floor: float = TRUST_DECAY_FLOOR
-    # Phase 4: vault indexing + profile-scoped search.
-    vault_path: str = DEFAULT_VAULT_PATH
+    # Phase 4: vault indexing + profile-scoped search. Vault indexing is
+    # optional: leave ``vault_path`` unset (None) to run without a vault.
+    vault_path: str | None = DEFAULT_VAULT_PATH
     vault_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_VAULT_EXCLUDE))
     profile_scope: list[str] = field(default_factory=list)
     vault_reindex_interval_s: int = DEFAULT_VAULT_REINDEX_INTERVAL_S

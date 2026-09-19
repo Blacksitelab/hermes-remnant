@@ -18,17 +18,17 @@ def test_health_reports_operational_dimensions(tmp_path: Path):
     db = open_db(tmp_path / "health.db")
     try:
         memory_id = db.insert_memory(
-            content="Kris uses Remnant", agent="a", embedding=[1.0, 0.0], embed_model="e1"
+            content="Alex uses Remnant", agent="a", embedding=[1.0, 0.0], embed_model="e1"
         )
         db.create_claim(
             memory_id=memory_id,
-            subject="Kris",
+            subject="Alex",
             predicate="uses",
             object="Remnant",
             resolution_status="unresolved",
             extractor_version="claims-v2",
         )
-        first = db.resolve_entity("Kris", "a")
+        first = db.resolve_entity("Alex", "a")
         second = db.resolve_entity("Remnant", "a")
         db.add_relation(entity_a=first, entity_b=second, source_memory_id=memory_id)
         db.record_prefetch("s", "injected", elapsed_ms=12.0, result_count=1)

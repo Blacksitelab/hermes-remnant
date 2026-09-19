@@ -435,7 +435,12 @@ def index_vault(
 
     If ``force`` is True, every non-excluded markdown file is re-indexed
     regardless of hash.
+
+    Vault indexing is optional. When ``config.vault_path`` is unset (None)
+    there is nothing to walk, so this returns zero stats instead of raising.
     """
+    if not config.vault_path:
+        return {"indexed": 0, "skipped": 0, "forgotten": 0}
     vault_root = Path(config.vault_path)
     indexed = 0
     skipped = 0

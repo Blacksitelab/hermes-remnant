@@ -24,8 +24,8 @@ def test_default_recall_groups_ambiguous_claims_before_limit(tmp_path):
             db,
             embedder,
             config,
-            fact="Sven prefers dark mode",
-            entity="Sven",
+            fact="Sam prefers dark mode",
+            entity="Sam",
             session_id="s",
             agent_id="agent",
         )
@@ -33,14 +33,14 @@ def test_default_recall_groups_ambiguous_claims_before_limit(tmp_path):
             db,
             embedder,
             config,
-            fact="Sven prefers light mode",
-            entity="Sven",
+            fact="Sam prefers light mode",
+            entity="Sam",
             session_id="s",
             agent_id="agent",
         )
         response = RecallService(db, config).recall(
             RecallRequest(
-                query="Sven preference",
+                query="Sam preference",
                 agent_id="agent",
                 strategy="keyword",
                 limit=1,
@@ -60,21 +60,21 @@ def test_recall_context_skips_oversized_candidate_and_keeps_later_fact(tmp_path)
     db = open_db(tmp_path / "budget.db")
     config = RemnantConfig(injection_token_budget=80)
     long_id = db.insert_memory(content="x" * 2000, agent="default")
-    short_id = db.insert_memory(content="Sven likes tea", agent="default")
+    short_id = db.insert_memory(content="Sam likes tea", agent="default")
     try:
         response = RecallService(db, config).recall(
             RecallRequest(
-                query="remember Sven preference",
+                query="remember Sam preference",
                 agent_id="default",
                 limit=5,
                 output_mode="context",
             ),
             candidates=[
                 {"id": long_id, "content": "x" * 2_000, "visibility": "private"},
-                {"id": short_id, "content": "Sven likes tea", "visibility": "private"},
+                {"id": short_id, "content": "Sam likes tea", "visibility": "private"},
             ],
         )
-        assert "Sven likes tea" in response.context
+        assert "Sam likes tea" in response.context
         assert "x" * 100 not in response.context
         assert response.diagnostics["selected_count"] == 1
     finally:
@@ -83,22 +83,22 @@ def test_recall_context_skips_oversized_candidate_and_keeps_later_fact(tmp_path)
 
 def test_pending_turns_use_the_same_scoped_recall_path_in_tools_and_prefetch(tmp_path):
     db = open_db(tmp_path / "pending.db")
-    config = RemnantConfig(agent_id="claire", echo_enabled=False)
+    config = RemnantConfig(agent_id="atlas", echo_enabled=False)
     provider = RemnantMemoryProvider()
     provider._db, provider._config = db, config
     provider._embedder = _Embedder()
     try:
         for owner, session, text in (
-            ("claire", "s", "My project uses amber deployment gates."),
-            ("sasha", "s", "My project uses blue deployment gates."),
-            ("claire", "other", "My project uses green deployment gates."),
+            ("atlas", "s", "My project uses amber deployment gates."),
+            ("vega", "s", "My project uses blue deployment gates."),
+            ("atlas", "other", "My project uses green deployment gates."),
         ):
             db.insert_turn_with_extraction(
                 agent_id=owner, session_id=session, user_text=text, assistant_text="OK",
             )
         query = "What did I say about my project?"
         response = RecallService(db, config).recall(RecallRequest(
-            query=query, agent_id="claire", session_id="s", include_pending=True,
+            query=query, agent_id="atlas", session_id="s", include_pending=True,
             output_mode="context",
         ))
         context = provider.prefetch(query, session_id="s")
@@ -106,7 +106,7 @@ def test_pending_turns_use_the_same_scoped_recall_path_in_tools_and_prefetch(tmp
         assert "amber" in context and "unprocessed" in context.lower()
         assert "blue" not in context and "green" not in context
         assert len(response.results) == 1
-        assert response.results[0]["agent_id"] == "claire"
+        assert response.results[0]["agent_id"] == "atlas"
         assert provider.prefetch(query, session_id="s", messages=[{
             "role": "user", "content": "My project uses amber deployment gates.",
         }]) == ""
@@ -117,14 +117,14 @@ def test_pending_turns_use_the_same_scoped_recall_path_in_tools_and_prefetch(tmp
 def test_pending_queue_failure_retains_committed_recall(tmp_path, monkeypatch):
     db = open_db(tmp_path / "queue-failure.db")
     try:
-        mid = db.insert_memory(content="The project uses amber deployment gates.", agent="claire")
+        mid = db.insert_memory(content="The project uses amber deployment gates.", agent="atlas")
 
         def unavailable(**kwargs):
             raise RuntimeError("queue unavailable")
 
         monkeypatch.setattr(db, "get_pending_turns", unavailable)
-        response = RecallService(db, RemnantConfig(agent_id="claire")).recall(RecallRequest(
-            query="project deployment", agent_id="claire", include_pending=True,
+        response = RecallService(db, RemnantConfig(agent_id="atlas")).recall(RecallRequest(
+            query="project deployment", agent_id="atlas", include_pending=True,
             strategy="keyword", output_mode="context",
         ))
         assert response.rendered_ids == (mid,)

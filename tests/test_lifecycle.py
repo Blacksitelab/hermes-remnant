@@ -23,7 +23,7 @@ def test_replacement_rolls_back_every_projection_when_audit_fails(
     db = open_db(tmp_path / "rollback.db")
     try:
         old = db.insert_memory(content="old", agent="a", embedding=[0.0, 1.0])
-        entity = db.resolve_entity("Kris", "a")
+        entity = db.resolve_entity("Alex", "a")
         db.link_entity(memory_id=old, entity_id=entity, agent_id="a")
 
         def fail(*_args, **_kwargs):
@@ -49,11 +49,11 @@ def test_replacement_rolls_back_every_projection_when_audit_fails(
 def test_forget_deactivates_claim_and_relation_evidence_atomically(tmp_path: Path):
     db = open_db(tmp_path / "forget.db")
     try:
-        memory_id = db.insert_memory(content="Kris uses Remnant", agent="a")
+        memory_id = db.insert_memory(content="Alex uses Remnant", agent="a")
         claim_id = db.create_claim(
-            memory_id=memory_id, subject="Kris", predicate="uses", object="Remnant"
+            memory_id=memory_id, subject="Alex", predicate="uses", object="Remnant"
         )
-        first = db.resolve_entity("Kris", "a")
+        first = db.resolve_entity("Alex", "a")
         second = db.resolve_entity("Remnant", "a")
         db.add_relation(entity_a=first, entity_b=second, source_memory_id=memory_id)
         MemoryLifecycle(db, RemnantConfig(agent_id="a"), None).forget(
@@ -76,16 +76,16 @@ def test_forget_deactivates_claim_and_relation_evidence_atomically(tmp_path: Pat
 def test_replacement_creates_claim_and_transfers_relation_evidence(tmp_path: Path):
     db = open_db(tmp_path / "replace.db")
     try:
-        old = db.insert_memory(content="Kris uses Remnant", agent="a")
+        old = db.insert_memory(content="Alex uses Remnant", agent="a")
         old_claim = db.create_claim(
-            memory_id=old, subject="Kris", predicate="uses", object="Remnant"
+            memory_id=old, subject="Alex", predicate="uses", object="Remnant"
         )
-        first = db.resolve_entity("Kris", "a")
+        first = db.resolve_entity("Alex", "a")
         second = db.resolve_entity("Remnant", "a")
         db.add_relation(entity_a=first, entity_b=second, source_memory_id=old)
         result = MemoryLifecycle(db, RemnantConfig(agent_id="a"), _Embedder()).replace(
             original_ids=[old],
-            content="Kris uses Remnant daily",
+            content="Alex uses Remnant daily",
             actor="test",
             agent_id="a",
         )
@@ -113,8 +113,8 @@ def test_replacement_creates_claim_and_transfers_relation_evidence(tmp_path: Pat
 def test_relation_evidence_backfill_is_dry_run_and_idempotent(tmp_path: Path):
     db = open_db(tmp_path / "backfill.db")
     try:
-        memory_id = db.insert_memory(content="Kris uses Remnant", agent="a")
-        first = db.resolve_entity("Kris", "a")
+        memory_id = db.insert_memory(content="Alex uses Remnant", agent="a")
+        first = db.resolve_entity("Alex", "a")
         second = db.resolve_entity("Remnant", "a")
         # Simulate a legacy relation by inserting directly without evidence.
         with db.transaction() as cur:
@@ -135,7 +135,7 @@ def test_evidence_traversal_drops_relation_only_after_last_evidence_is_forgotten
 ):
     db = open_db(tmp_path / "traversal.db")
     try:
-        first = db.resolve_entity("Kris", "a")
+        first = db.resolve_entity("Alex", "a")
         second = db.resolve_entity("Remnant", "a")
         memories = [
             db.insert_memory(content=f"evidence {index}", agent="a") for index in range(2)

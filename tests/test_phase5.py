@@ -348,9 +348,9 @@ def test_candidate_selection_bounded_and_cross_agent(hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         # Two agents store the same fact → cross_agent candidate.
-        _store_fact(db, emb, cfg, "Sven prefers dark mode in the editor",
+        _store_fact(db, emb, cfg, "Sam prefers dark mode in the editor",
                     agent="alice", visibility="shared")
-        _store_fact(db, emb, cfg, "Sven prefers dark mode editor theme",
+        _store_fact(db, emb, cfg, "Sam prefers dark mode editor theme",
                     agent="bob", visibility="shared")
         recent = db.get_recent_memories(since_ts=time.time() - 3600)
         pairs = dream_mod._select_candidate_pairs(db, recent, mode="night")
@@ -469,9 +469,9 @@ def test_day_dream_merges_cross_agent_duplicates(monkeypatch, hermes_home: Path)
     cfg = RemnantConfig(agent_id="alice", dream_day_budget=3)
     emb = _fake_embed(db, cfg)
     try:
-        mid_a = _store_fact(db, emb, cfg, "Sven owns the BlacksiteLab homelab",
+        mid_a = _store_fact(db, emb, cfg, "Sam owns the ExampleCorp homelab",
                             agent="alice", visibility="shared")
-        mid_b = _store_fact(db, emb, cfg, "Sven owns the BlacksiteLab homelab",
+        mid_b = _store_fact(db, emb, cfg, "Sam owns the ExampleCorp homelab",
                             agent="bob", visibility="shared")
         assert mid_a and mid_b
         # Force the cloud judgment to say same_fact for the cross pair.

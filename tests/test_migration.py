@@ -156,12 +156,12 @@ def test_parse_memory_file_strips_bullet_markers():
 
 def test_parse_memory_file_strips_inline_markdown():
     text = (
-        "- User **name** is Sven.\n"
+        "- User **name** is Sam.\n"
         "- See [the docs](https://x/y) for details.\n"
         "- Use `python` to run it.\n"
     )
     entries = parse_memory_file(text)
-    assert "User name is Sven." in entries
+    assert "User name is Sam." in entries
     assert "See the docs for details." in entries
     assert "Use python to run it." in entries
 
@@ -202,7 +202,7 @@ def test_parse_memory_file_empty_text_returns_empty():
 
 def test_classify_visibility_fleet_keywords():
     assert classify_visibility("User timezone is Europe/Stockholm.") == "fleet"
-    assert classify_visibility("My name is Sven.") == "fleet"
+    assert classify_visibility("My name is Sam.") == "fleet"
     assert classify_visibility("Prefers terse answers.") == "fleet"
 
 
@@ -223,7 +223,7 @@ def test_classify_visibility_defaults_to_private():
 
 def test_classify_visibility_fleet_wins_over_shared():
     # A line with both fleet + shared keywords resolves to fleet.
-    assert classify_visibility("User name for the project is Sven.") == "fleet"
+    assert classify_visibility("User name for the project is Sam.") == "fleet"
 
 
 # ===========================================================================
@@ -347,7 +347,7 @@ def test_import_memory_store_dedups_by_content_hash(hermes_home: Path):
 
 
 def test_import_memory_store_dry_run_writes_nothing(hermes_home: Path):
-    _seed_profile(hermes_home, "alpha", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "alpha", "- My name is Sam.\n")
     db = _open_db(hermes_home)
     cfg = RemnantConfig(agent_id="alpha")
     emb = _fake_embed(db, cfg)
@@ -410,7 +410,7 @@ def test_import_memory_store_profile_filter(hermes_home: Path):
 
 def test_import_memory_store_shadow_dry_run_writes_no_log(hermes_home: Path):
     # dry_run wins over shadow: nothing is written at all.
-    _seed_profile(hermes_home, "alpha", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "alpha", "- My name is Sam.\n")
     db = _open_db(hermes_home)
     cfg = RemnantConfig(agent_id="alpha")
     emb = _fake_embed(db, cfg)
@@ -522,7 +522,7 @@ def patch_hindsight(monkeypatch):
                 {"text": "Project Alpha build is green."},  # dup of row 0
             ]
         if query == "person":
-            return [{"content": "Sven prefers terse answers."}]
+            return [{"content": "Sam prefers terse answers."}]
         return []
 
     monkeypatch.setattr(isrc, "_hindsight_recall", fake_recall)
@@ -668,7 +668,7 @@ def test_import_hindsight_total_cap_stops_early(hermes_home: Path, monkeypatch):
 
 
 def test_memory_import_tool_memory_store(provider: RemnantMemoryProvider, hermes_home: Path):
-    _seed_profile(hermes_home, "default", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "default", "- My name is Sam.\n")
     res = provider.handle_tool_call(
         "memory_import", {"source": "memory_store"}, session_id="imp",
     )
@@ -682,7 +682,7 @@ def test_memory_import_tool_memory_store(provider: RemnantMemoryProvider, hermes
 def test_memory_import_tool_memory_store_dry_run(
     provider: RemnantMemoryProvider, hermes_home: Path
 ):
-    _seed_profile(hermes_home, "alpha", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "alpha", "- My name is Sam.\n")
     res = provider.handle_tool_call(
         "memory_import", {"source": "memory_store", "dry_run": True}, session_id="imp",
     )
@@ -725,7 +725,7 @@ def test_memory_import_tool_schema_has_new_params(provider: RemnantMemoryProvide
 def test_provider_import_memory_helper_memory_store(
     provider: RemnantMemoryProvider, hermes_home: Path
 ):
-    _seed_profile(hermes_home, "default", "- My name is Sven.\n")
+    _seed_profile(hermes_home, "default", "- My name is Sam.\n")
     stats = provider.import_memory("memory_store")
     assert stats["source"] == "memory_store"
     assert stats["imported"] == 1
@@ -754,8 +754,8 @@ def test_provider_system_prompt_mentions_memory_store_and_hindsight(
 def test_import_memory_store_semantic_dedup_role_label(hermes_home: Path):
     """Similar sentences naming different roles must preserve both facts."""
     body = (
-        "- Kris manages the BlacksiteLab vault and serves as the Research commissioner.\n"
-        "- Kris manages the BlacksiteLab vault and serves as the Vault owner.\n"
+        "- Alex manages the ExampleCorp vault and serves as the Research commissioner.\n"
+        "- Alex manages the ExampleCorp vault and serves as the Vault owner.\n"
     )
     _seed_profile(hermes_home, "alpha", body)
     db = _open_db(hermes_home)
@@ -847,8 +847,8 @@ def test_import_hindsight_semantic_dedup_role_label(
 
     def recall(query: str, *, limit: int, bank_id: str):
         return [
-            {"content": "Kris manages the BlacksiteLab vault and serves as the curator."},
-            {"content": "Kris manages the BlacksiteLab vault and serves as the archivist."},
+            {"content": "Alex manages the ExampleCorp vault and serves as the curator."},
+            {"content": "Alex manages the ExampleCorp vault and serves as the archivist."},
         ]
 
     monkeypatch.setattr(isrc, "_hindsight_recall", recall)
@@ -888,20 +888,20 @@ def test_find_semantic_duplicate_preserves_uncertain_paraphrases(hermes_home: Pa
     emb = _fake_embed(db, cfg)
     try:
         db.insert_memory(
-            content="Sven prefers terse answers.",
+            content="Sam prefers terse answers.",
             source="manual", agent="alpha", visibility="private",
-            embedding=emb.embed("Sven prefers terse answers."),
+            embedding=emb.embed("Sam prefers terse answers."),
             embed_model=cfg.embed_model,
         )
         # 'concise' vs 'terse' -> cosine ~0.816 < 0.85 -> not a duplicate.
         res = find_semantic_duplicate(
-            db, emb, "Sven prefers concise answers.",
+            db, emb, "Sam prefers concise answers.",
             agent_id="alpha", visibility="private",
         )
         assert res is None
         # Even a zero legacy threshold cannot discard different evidence.
         res_low = find_semantic_duplicate(
-            db, emb, "Sven prefers concise answers.",
+            db, emb, "Sam prefers concise answers.",
             agent_id="alpha", visibility="private",
             threshold=0.0,
         )

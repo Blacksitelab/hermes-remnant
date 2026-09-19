@@ -1,0 +1,173 @@
+{
+  "large_excerpts": {
+    "expected_messages": 24,
+    "returned": 0,
+    "page_counts": [
+      0
+    ],
+    "has_more": false,
+    "coverage": {
+      "discovery_complete": false,
+      "summaries_used": 0,
+      "summaries_missing_or_stale": 1,
+      "sessions_matched_on_page": 1,
+      "sessions_expanded": 1,
+      "sessions_scanned": 1,
+      "topic_hits_returned": 24,
+      "messages_available_on_page": 24,
+      "messages_returned": 24,
+      "content_truncated": false,
+      "omitted_due_to_budget": 24,
+      "index_incomplete": false,
+      "reason": "output_budget"
+    }
+  },
+  "relative_cursor": {
+    "first": {
+      "timezone": "UTC",
+      "start_utc": "2024-06-14T00:00:00Z",
+      "end_utc": "2024-06-15T00:00:00Z",
+      "reference_now": "2024-06-15T00:00:00Z"
+    },
+    "second": {
+      "timezone": "UTC",
+      "start_utc": "2024-06-15T00:00:00Z",
+      "end_utc": "2024-06-16T00:00:00Z",
+      "reference_now": "2024-06-16T00:00:00Z"
+    },
+    "second_status": "no_evidence",
+    "second_messages": 0
+  },
+  "invalid_bounds": [
+    {
+      "input": {
+        "relative": "999999999999999999999d"
+      },
+      "exception": "OverflowError"
+    },
+    {
+      "input": {
+        "start": "9999-12-31"
+      },
+      "exception": "OverflowError"
+    }
+  ],
+  "match_after_projection": {
+    "status": "no_evidence",
+    "evidence": 0,
+    "has_more": false,
+    "coverage": {
+      "discovery_complete": true,
+      "summaries_used": 0,
+      "summaries_missing_or_stale": 1,
+      "sessions_matched_on_page": 1,
+      "sessions_expanded": 0,
+      "sessions_scanned": 1,
+      "topic_hits_returned": 1,
+      "messages_available_on_page": 0,
+      "messages_returned": 0,
+      "content_truncated": false,
+      "omitted_due_to_budget": 0,
+      "index_incomplete": false,
+      "reason": "searched_accessible_coverage"
+    }
+  },
+  "runtime_reference": {
+    "session_valid": true,
+    "reference_valid": false
+  },
+  "unsupplied_summary_reference": {
+    "completed": true,
+    "reference_in_prompt": false,
+    "cache_status": "ready",
+    "coverage": {
+      "messages_returned": 60,
+      "input_tokens": 3471,
+      "content_truncated": false,
+      "source_version": "140105a1ae82b65fcd329244c5f0d2fd5843b72ac0dbd639040abda727f8bf7b",
+      "sampled": false
+    }
+  },
+  "partly_invalid_summary": {
+    "summaries_used": 1,
+    "evidence": [
+      [
+        "Adopt option blue.",
+        [
+          1
+        ]
+      ],
+      [
+        "Actually adopt option red.",
+        [
+          2
+        ]
+      ]
+    ]
+  },
+  "cache_raw_union": {
+    "ids": [
+      1
+    ],
+    "page_counts": [
+      1
+    ],
+    "has_more": false
+  },
+  "cross_archive_claim": {
+    "processed_by_b": true,
+    "a_cache_status": "ready",
+    "b_content_in_a_cache": true,
+    "b_content_returned_to_a": true
+  },
+  "late_archive": "unavailable",
+  "serialized_budget": {
+    "max_tokens": 3821,
+    "reported_tokens": [
+      3755,
+      3764,
+      3764,
+      3764,
+      1368
+    ],
+    "actual_tokens": [
+      3812,
+      3821,
+      3821,
+      3821,
+      1369
+    ]
+  },
+  "large_archive_no_hit": {
+    "messages": 30000,
+    "message_chars": 1120,
+    "runs_ms": [
+      85.53388249129057,
+      81.89464919269085,
+      82.58516993373632,
+      82.36690983176231,
+      83.05974490940571
+    ],
+    "status": "no_evidence",
+    "coverage": {
+      "discovery_complete": true,
+      "summaries_used": 0,
+      "summaries_missing_or_stale": 0,
+      "sessions_matched_on_page": 0,
+      "sessions_expanded": 0,
+      "sessions_scanned": 0,
+      "topic_hits_returned": 0,
+      "messages_available_on_page": null,
+      "messages_returned": 0,
+      "content_truncated": false,
+      "omitted_due_to_budget": 0,
+      "index_incomplete": false,
+      "reason": "searched_accessible_coverage"
+    }
+  },
+  "connection_lifecycle": {
+    "before_fds": 7,
+    "after_50_reads_before_gc": 57,
+    "after_gc": 7
+  }
+}

@@ -21,7 +21,7 @@ from remnant.extract import filter_typed_entities
 
 def test_filter_typed_entities_drops_noise_words():
     typed = [
-        {"name": "Sven", "type": "person", "aliases": []},
+        {"name": "Sam", "type": "person", "aliases": []},
         {"name": "the", "type": None, "aliases": []},  # article
         {"name": "And", "type": None, "aliases": []},  # function word
         {"name": "people", "type": "concept", "aliases": []},  # common noun
@@ -31,7 +31,7 @@ def test_filter_typed_entities_drops_noise_words():
     ]
     out = filter_typed_entities(typed)
     names = {e["name"] for e in out}
-    assert names == {"Sven"}
+    assert names == {"Sam"}
 
 
 def test_filter_typed_entities_keeps_explicit_remnant():
@@ -45,13 +45,13 @@ def test_filter_typed_entities_keeps_explicit_remnant():
 def test_filter_typed_entities_deduplicates_case_insensitive():
     out = filter_typed_entities(
         [
-            {"name": "Sven", "type": "person", "aliases": []},
-            {"name": "sven", "type": "person", "aliases": []},
-            {"name": "SVEN", "type": "person", "aliases": []},
+            {"name": "Sam", "type": "person", "aliases": []},
+            {"name": "sam", "type": "person", "aliases": []},
+            {"name": "SAM", "type": "person", "aliases": []},
         ]
     )
     assert len(out) == 1
-    assert out[0]["name"] == "Sven"
+    assert out[0]["name"] == "Sam"
 
 
 def test_filter_typed_entities_caps_at_15_and_keeps_salient():
@@ -62,13 +62,13 @@ def test_filter_typed_entities_caps_at_15_and_keeps_salient():
     # Give a couple of entries extra salience via multi-word names and aliases.
     typed[5]["name"] = "Project Alpha"
     typed[5]["aliases"] = ["Alpha Project"]
-    typed[12]["name"] = "BlacksiteLab Homelab"
-    typed[12]["aliases"] = ["BSL"]
+    typed[12]["name"] = "ExampleCorp Homelab"
+    typed[12]["aliases"] = ["ExampleCo"]
     out = filter_typed_entities(typed)
     assert len(out) == 15
     names = {e["name"] for e in out}
     assert "Project Alpha" in names
-    assert "BlacksiteLab Homelab" in names
+    assert "ExampleCorp Homelab" in names
 
 
 # ===========================================================================
@@ -77,9 +77,9 @@ def test_filter_typed_entities_caps_at_15_and_keeps_salient():
 
 
 def test_extract_entities_finds_expected_proper_nouns():
-    ents = extract_entities("Sven prefers dark mode for the Proxmox homelab")
+    ents = extract_entities("Sam prefers dark mode for the Proxmox homelab")
     names = {e["name"] for e in ents}
-    assert "Sven" in names
+    assert "Sam" in names
     assert "Proxmox" in names
 
 
@@ -100,9 +100,9 @@ def test_extract_entities_drops_capitalized_function_words():
 
 
 def test_extract_entities_drops_stoplist_items():
-    ents = extract_entities("Sven visited New Zealand on Monday morning")
+    ents = extract_entities("Sam visited New Zealand on Monday morning")
     names = {e["name"] for e in ents}
-    assert "Sven" in names
+    assert "Sam" in names
     assert "New Zealand" not in names
     assert "Monday" not in names
 
@@ -123,10 +123,10 @@ def test_extract_entities_suppresses_substring_entities():
 
 def test_extract_entities_ranks_by_salience():
     ents = extract_entities(
-        "Sven works with Proxmox. Sven also likes Proxmox. Alice visited once."
+        "Sam works with Proxmox. Sam also likes Proxmox. Alice visited once."
     )
     names = [e["name"] for e in ents]
-    assert "Sven" in names[:2]
+    assert "Sam" in names[:2]
     assert "Proxmox" in names[:2]
     assert "Alice" in names
 
@@ -177,7 +177,7 @@ def test_extract_entities_respects_custom_max_entities():
 def test_entity_stoplists_have_no_overlap_with_real_names():
     """Sanity check that our stoplists do not swallow the canonical test
     entities used throughout the suite."""
-    real_names = {"sven", "proxmox", "alice smith", "project alpha", "homelab"}
+    real_names = {"sam", "proxmox", "alice smith", "project alpha", "homelab"}
     for name in real_names:
         assert name not in _STOPLIST, f"{name!r} must not be in _STOPLIST"
         assert name not in _COMMON_NOUNS, f"{name!r} must not be in _COMMON_NOUNS"

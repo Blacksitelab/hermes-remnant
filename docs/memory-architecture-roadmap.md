@@ -43,6 +43,5 @@ or rebuilding indexes.
 
 The next measurement-gated research track is Remnant Echo: a bounded shadow
 system for learning whether recalled evidence actually helps or harms Hermes on
-a class of task. Its schema, lifecycle integration, resource limits, tests,
-rollout gates, and ordered pull-request work packages are specified in
-[`remnant-echo-implementation-plan.md`](remnant-echo-implementation-plan.md).
+a class of task. Its schema, lifecycle integration, resource limits, tests, and rollout
+gates are implemented behind the Echo flags in `remnant/config.py`.

@@ -53,11 +53,11 @@
     "schema": 16,
     "memories_preserved": 6223,
     "source_fingerprint_unchanged": true,
-    "claire_context_nonempty": true,
+    "profile_a_context_nonempty": true,
     "other_profiles_context_empty": [
-      "margaret",
-      "sasha",
-      "yuki",
+      "profile_c",
+      "profile_b",
+      "profile_d",
       "default"
     ],
     "real_model_correction_visible": true,

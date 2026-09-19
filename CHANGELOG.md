@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 - public release prep
+
+- Obsidian vault indexing is now optional. Without `vault_path` configured,
+  Remnant runs fully functional conversation memory with no vault sync;
+  vault import/re-index returns a clear not-configured result instead of
+  path warnings.
+- README gains a "What you need to run it" quickstart (embedding + cheap
+  extraction/summary model, optional vault, optional GLiNER).
+- Remove personal and lab-specific identifiers from source, docs, and test
+  fixtures; internal process documents move out of the public tree.
+- Replace the stale "internal, not for distribution" notice with the MIT
+  license.
+- Internal `__main__` scripts derive database/config paths from the
+  environment instead of a hardcoded home directory.
+
 ## 0.3.2 - simpler recall, unchanged capabilities
 
 - Route recent unprocessed turns and conversation deduplication through the
@@ -43,7 +58,7 @@ remain available with unchanged defaults. No schema or embedding migration.
   and suppress repeated context only after delivery.
 - Clear stale embeddings on content changes and retry missing derived vectors;
   periodically compact disposable caches, diagnostics, and Echo data.
-- Preserve and test the existing model-backfill utility from BSL-AI.
+- Preserve and test the existing model-backfill utility.
 - Isolate test diaries and correct scale benchmark dimensions and measurements.
 
 ## 0.2.2 - faster extraction

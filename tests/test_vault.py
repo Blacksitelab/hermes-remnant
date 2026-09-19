@@ -14,9 +14,11 @@ from pathlib import Path
 
 import pytest
 
+from remnant import RemnantMemoryProvider
 from remnant.config import RemnantConfig
 from remnant.db import default_db_path, open_db
 from remnant.embed import Embedder
+from remnant.tools import handle_tool_call
 from remnant.vault import index_file, index_vault
 
 
@@ -61,6 +63,12 @@ def hermes_home(tmp_path: Path) -> Path:
     home = tmp_path / "hermes"
     (home / "remnant").mkdir(parents=True, exist_ok=True)
     return home
+
+
+@pytest.fixture()
+def no_vault_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A default config means *no vault*, so pin the env override off."""
+    monkeypatch.delenv("REMNANT_VAULT_PATH", raising=False)
 
 
 @pytest.fixture()
@@ -227,7 +235,7 @@ def test_reindex_preserves_trust_score_and_entity_links(
     cfg = RemnantConfig(vault_path=str(vault), entity_min_memories=1)
     emb = _fake_embed(db, cfg)
     note = vault / "Projects" / "alpha.md"
-    _write_note(note, "# Project Alpha\nSven runs Project Alpha on Proxmox.")
+    _write_note(note, "# Project Alpha\nSam runs Project Alpha on Proxmox.")
     try:
         mid = index_file(db, cfg, emb, note)
         assert mid
@@ -248,7 +256,7 @@ def test_reindex_preserves_trust_score_and_entity_links(
             n_before = cur.fetchone()["c"]
         assert n_before >= 1
 
-        _write_note(note, "# Project Alpha\nSven expanded Project Alpha on Proxmox.")
+        _write_note(note, "# Project Alpha\nSam expanded Project Alpha on Proxmox.")
         new_mid = index_file(db, cfg, emb, note)
         assert new_mid == mid
 
@@ -286,3 +294,87 @@ def test_update_memory_content_writes_vault_update_audit(
         assert "content_hash" in details
     finally:
         db.close()
+
+
+# ===========================================================================
+# Vault-optional (0.4.0): an unset vault_path must no-op, not raise
+# ===========================================================================
+
+
+def test_index_vault_without_config_path_returns_zero_stats(
+    hermes_home: Path, vault: Path, no_vault_env: None
+):
+    """Guards the Path(None) TypeError: no vault_path => zero stats."""
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(vault_path=None)
+    emb = _fake_embed(db, cfg)
+    _write_note(vault / "Inbox" / "note.md", "# Note\nbody")
+    try:
+        stats = index_vault(db, cfg, emb)
+        assert stats == {"indexed": 0, "skipped": 0, "forgotten": 0}
+        # Nothing was indexed even though the directory exists.
+        assert db.get_vault_memory("Inbox/note.md") is None
+    finally:
+        db.close()
+
+
+def test_memory_import_vault_without_config_returns_clear_error(
+    hermes_home: Path, no_vault_env: None
+):
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig(vault_path=None)
+    emb = _fake_embed(db, cfg)
+    try:
+        result = handle_tool_call(
+            "memory_import", {"source": "vault"}, db=db, config=cfg, embedder=emb,
+            session_id="s",
+        )
+        assert "error" in result
+        assert "no vault configured" in result["error"]
+    finally:
+        db.close()
+
+
+def test_provider_reindex_vault_without_config_returns_zero_stats(
+    hermes_home: Path, no_vault_env: None
+):
+    provider = RemnantMemoryProvider()
+    provider.initialize(session_id="no-vault", hermes_home=str(hermes_home))
+    try:
+        assert provider._config is not None
+        assert provider._config.vault_path is None
+        stats = provider.reindex_vault()
+        assert stats == {"indexed": 0, "skipped": 0, "forgotten": 0}
+        # The vault import path delegates here and must not raise either.
+        assert provider.import_memory("vault") == stats
+    finally:
+        provider.shutdown()
+
+
+def test_system_prompt_omits_vault_instructions_without_a_vault(
+    hermes_home: Path, no_vault_env: None
+):
+    provider = RemnantMemoryProvider()
+    provider.initialize(session_id="no-vault", hermes_home=str(hermes_home))
+    try:
+        block = provider.system_prompt_block()
+        assert "source='vault'" not in block
+        assert "memory_import" in block  # other sources stay documented
+        assert "memory_store" in block
+    finally:
+        provider.shutdown()
+
+
+def test_system_prompt_includes_vault_instructions_when_configured(
+    hermes_home: Path,
+):
+    (hermes_home / "remnant.json").write_text(
+        json.dumps({"vault_path": str(hermes_home / "vault")}), encoding="utf-8"
+    )
+    provider = RemnantMemoryProvider()
+    provider.initialize(session_id="with-vault", hermes_home=str(hermes_home))
+    try:
+        block = provider.system_prompt_block()
+        assert "source='vault'" in block
+    finally:
+        provider.shutdown()

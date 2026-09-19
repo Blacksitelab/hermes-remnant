@@ -1,0 +1,23 @@
+{
+  "baseline": {
+    "rows": 5000,
+    "dimensions": 768,
+    "semantic_ms": 293.217,
+    "provider_prefetch_ms": 311.642,
+    "provider_delivered": 7,
+    "probes": 7,
+    "python_scoring_peak_mib": 0.54
+  },
+  "candidate": {
+    "rows": 5000,
+    "dimensions": 768,
+    "semantic_ms": 293.603,
+    "provider_prefetch_ms": 310.427,
+    "provider_delivered": 7,
+    "probes": 7,
+    "python_scoring_peak_mib": 0.54
+  },
+  "top100_and_scores_identical": true,
+  "prefetch_delta_percent": -0.38987042824778495,
+  "history_30000_no_hit_median_ms": 82.58516993373632
+}

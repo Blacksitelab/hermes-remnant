@@ -1,6 +1,6 @@
 """Ollama embedding client + cosine helper.
 
-- nomic-embed-text (768-dim) via the BSL1 Ollama `/api/embeddings` endpoint.
+- nomic-embed-text (768-dim) via the configured Ollama `/api/embeddings` endpoint.
 - SQLite-backed cache keyed on (model, sha256(text)) so repeated facts never
   re-hit the network.
 - `embed()` returns ``None`` on failure (never an empty list): callers must
@@ -70,7 +70,7 @@ class Embedder:
         empty vector as a usable zero vector.
         """
         # Truncate to stay within the embed model's context window.
-        # nomic-embed-text on BSL1 has ~3000 char context limit (empirically tested).
+        # nomic-embed-text has a ~3000 char context limit (empirically tested).
         # Use 2500 as a safe ceiling.
         if len(text) > 2500:
             text = text[:2500]

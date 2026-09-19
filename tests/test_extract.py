@@ -112,11 +112,11 @@ def test_extraction_schema_is_compact_and_bounded():
 def test_get_unextracted_turns_returns_unqueued_unextracted(hermes_home: Path):
     db = _open_db(hermes_home)
     try:
-        tid = _insert_turn(db, user="Sven prefers dark mode", assistant="ok")
+        tid = _insert_turn(db, user="Sam prefers dark mode", assistant="ok")
         rows = db.get_unextracted_turns()
         assert len(rows) == 1
         assert rows[0]["id"] == tid
-        assert rows[0]["user_text"] == "Sven prefers dark mode"
+        assert rows[0]["user_text"] == "Sam prefers dark mode"
     finally:
         db.close()
 
@@ -141,7 +141,7 @@ def test_get_unextracted_turns_excludes_already_extracted(hermes_home: Path):
         # Insert a conversation memory sourced from this turn; it counts as
         # already extracted even though there is no extraction_queue row.
         db.insert_memory(
-            content="Sven prefers dark mode",
+            content="Sam prefers dark mode",
             source="conversation",
             source_id=str(tid),
             agent="default",
@@ -308,7 +308,7 @@ def test_process_emits_timing_log(hermes_home: Path, caplog, monkeypatch):
         worker = ExtractionWorker(db, emb, cfg)
         # Stub _extract to return one fact and avoid any network call.
         monkeypatch.setattr(
-            worker, "_extract", lambda u, a: [{"fact": "Sven prefers dark mode", "entity": "Sven"}]
+            worker, "_extract", lambda u, a: [{"fact": "Sam prefers dark mode", "entity": "Sam"}]
         )
         # Stub store_memory so no DB writes happen beyond what we assert.
         from remnant import ingest as ingest_mod

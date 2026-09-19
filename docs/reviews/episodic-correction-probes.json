@@ -1,0 +1,477 @@
+{
+  "S-001-existing-archives": {
+    "result": "PASS",
+    "processed": false,
+    "model_calls": 0,
+    "foreign_job_status": "pending"
+  },
+  "S-001-missing-worker-partition": {
+    "result": "FAIL",
+    "foreign_job_status": "retry_wait",
+    "foreign_job_attempts": 1
+  },
+  "S-002-ascii": {
+    "result": "PASS",
+    "expected": 24,
+    "returned": 24,
+    "unique": 24,
+    "missing": [],
+    "pages": 6,
+    "max_wire_tokens": 3269,
+    "last_status": "ok",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "first_cursor_offset_total": 0,
+    "counts_accurate": true
+  },
+  "S-002-cjk": {
+    "result": "PASS",
+    "expected": 24,
+    "returned": 24,
+    "unique": 24,
+    "missing": [],
+    "pages": 6,
+    "max_wire_tokens": 3269,
+    "last_status": "ok",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "first_cursor_offset_total": 0,
+    "counts_accurate": true
+  },
+  "S-002-multi": {
+    "result": "PASS",
+    "expected": 189,
+    "returned": 189,
+    "unique": 189,
+    "missing": [],
+    "pages": 48,
+    "max_wire_tokens": 3446,
+    "last_status": "ok",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      10,
+      91,
+      100
+    ],
+    "first_cursor_offset_total": 4,
+    "counts_accurate": true
+  },
+  "S-002-ids-36": {
+    "result": "FAIL",
+    "expected": 180,
+    "returned": 136,
+    "unique": 136,
+    "missing": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88
+    ],
+    "pages": 45,
+    "max_wire_tokens": 3355,
+    "last_status": "ok",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      91,
+      100
+    ],
+    "first_cursor_offset_total": 4,
+    "counts_accurate": true
+  },
+  "S-002-ids-60": {
+    "result": "FAIL",
+    "expected": 180,
+    "returned": 136,
+    "unique": 136,
+    "missing": [
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      46,
+      47,
+      48,
+      49,
+      50,
+      51,
+      52,
+      53,
+      54,
+      82,
+      83,
+      84,
+      85,
+      86,
+      87,
+      88
+    ],
+    "pages": 45,
+    "max_wire_tokens": 3830,
+    "last_status": "ok",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      91,
+      100
+    ],
+    "first_cursor_offset_total": 4,
+    "counts_accurate": true
+  },
+  "S-002-long-ids": {
+    "result": "FAIL",
+    "expected": 180,
+    "returned": 4,
+    "unique": 4,
+    "missing": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26
+    ],
+    "pages": 1,
+    "max_wire_tokens": 3461,
+    "last_status": "partial",
+    "last_has_more": false,
+    "last_next_cursor": false,
+    "first_ids": [
+      1,
+      91,
+      100,
+      109
+    ],
+    "first_cursor_offset_total": 0,
+    "counts_accurate": true
+  },
+  "S-003-unseen-only": {
+    "result": "PASS",
+    "processed": false,
+    "status": "retry_wait",
+    "unseen_supplied": false,
+    "stored_summary": {}
+  },
+  "S-003-mixed-summary": {
+    "result": "FAIL",
+    "processed": true,
+    "status": "ready",
+    "unseen_supplied": false,
+    "stored_summary": {
+      "topics": [
+        "quasar"
+      ],
+      "statements": [
+        {
+          "topic": "general",
+          "text": "Claim depends on unseen message 30",
+          "kind": "discussion",
+          "uncertainty": "summary-derived",
+          "sources": [
+            {
+              "session_id": "s",
+              "message_id": 1,
+              "timestamp": "2024-06-14T00:00:01Z",
+              "role": "user",
+              "link": "@session:default/s",
+              "content_digest": "b526aef1a341cfe6e5c377ed4c222888eeb81f913a107110a867e009c1758f24"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "S-003-mixed-synthesis": {
+    "result": "FAIL",
+    "statements": [
+      {
+        "topic": "general",
+        "text": "Unsupported joint claim",
+        "kind": "discussion",
+        "uncertainty": "model-derived",
+        "sources": [
+          {
+            "session_id": "s",
+            "message_id": 1,
+            "timestamp": "2024-06-14T00:00:00Z",
+            "role": "user",
+            "link": "@session:default/s",
+            "content_digest": "2bcae25a498491e0b777044afa5416cfed622689d4a4b3cf633584e3a80ae441"
+          }
+        ]
+      }
+    ]
+  },
+  "S-003-invalidated-edit": {
+    "result": "PASS",
+    "summaries_used": 0,
+    "raw_ids": [
+      1,
+      2
+    ]
+  },
+  "S-003-invalidated-range": {
+    "result": "PASS",
+    "summaries_used": 0,
+    "raw_ids": [
+      1
+    ]
+  },
+  "S-003-invalidated-hidden": {
+    "result": "PASS",
+    "summaries_used": 0,
+    "raw_ids": [
+      1
+    ]
+  },
+  "S-003-invalidated-rewind": {
+    "result": "PASS",
+    "summaries_used": 0,
+    "raw_ids": [
+      1
+    ]
+  },
+  "S-003-invalidated-delete": {
+    "result": "PASS",
+    "summaries_used": 0,
+    "raw_ids": [
+      1
+    ]
+  },
+  "S-003-true-tail-sample": {
+    "result": "PASS",
+    "supplied_ids": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      181,
+      182,
+      183,
+      184,
+      185,
+      186,
+      187,
+      188,
+      189,
+      190,
+      191,
+      192,
+      193,
+      194,
+      195,
+      196,
+      197,
+      198,
+      199,
+      200
+    ]
+  },
+  "S-004-runtime": {
+    "result": "PASS",
+    "alice": true,
+    "bob": false,
+    "unknown": false,
+    "current": true
+  },
+  "S-005-yesterday": {
+    "result": "PASS",
+    "returned": 85,
+    "all_ranges_frozen": true
+  },
+  "S-005-2d": {
+    "result": "PASS",
+    "returned": 85,
+    "all_ranges_frozen": true
+  },
+  "S-006-match-local-evidence": {
+    "result": "FAIL",
+    "returned_ids": [
+      1
+    ],
+    "excerpt_contains_query": false
+  },
+  "S-006-union-1": {
+    "result": "PASS",
+    "expected": 2,
+    "returned": [
+      1,
+      2
+    ],
+    "pages": 1,
+    "last_has_more": false,
+    "page_ids": [
+      [
+        1,
+        2
+      ]
+    ]
+  },
+  "S-006-union-25": {
+    "result": "FAIL",
+    "expected": 26,
+    "returned": [
+      1,
+      26,
+      25,
+      24,
+      23,
+      22,
+      21,
+      20,
+      19,
+      18,
+      17,
+      16,
+      15,
+      14,
+      13,
+      12,
+      11,
+      10,
+      9
+    ],
+    "pages": 2,
+    "last_has_more": false,
+    "page_ids": [
+      [
+        1,
+        26,
+        25,
+        24,
+        23,
+        22,
+        21,
+        20,
+        19,
+        18,
+        17,
+        16,
+        15,
+        14,
+        13,
+        12,
+        11,
+        10,
+        9
+      ],
+      []
+    ]
+  },
+  "S-007-close": {
+    "result": "PASS",
+    "before": 8,
+    "after": 8
+  },
+  "S-007-initial-lock": {
+    "result": "PASS",
+    "elapsed_s": 3.00149277318269,
+    "status": "partial",
+    "complete": false
+  },
+  "S-007-reauthorization-lock": {
+    "result": "FAIL",
+    "escaped_exception": "TimeoutError",
+    "deadline_s": 3.0
+  },
+  "S-008-relative": {
+    "result": "PASS",
+    "status": "invalid_request"
+  },
+  "S-008-date": {
+    "result": "PASS",
+    "status": "invalid_request"
+  },
+  "S-008-anchor": {
+    "result": "PASS",
+    "status": "invalid_request"
+  },
+  "S-008-cursor-number": {
+    "result": "FAIL",
+    "escaped_exception": "OverflowError",
+    "cursor_bytes": 891
+  },
+  "S-009-recovery-containment": {
+    "result": "PASS",
+    "missing": "unavailable",
+    "created": "no_evidence",
+    "escaped_symlink": "unavailable"
+  }
+}

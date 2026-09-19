@@ -633,6 +633,11 @@ def handle_tool_call(
             return {"error": "imports are restricted to the current profile"}
         profile = source_profile
         if source == "vault":
+            if not config.vault_path:
+                return {
+                    "error": "no vault configured: set vault_path in remnant.json "
+                    "to enable vault indexing"
+                }
             force = bool(args.get("force", False))
             stats = index_vault(db, config, embedder, force=force)
             return {

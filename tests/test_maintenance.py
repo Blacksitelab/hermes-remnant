@@ -24,13 +24,13 @@ def test_legacy_agent_migration_is_dry_run_first_and_audited():
     db = open_db(default_db_path())
     try:
         mid = db.insert_memory(content="legacy fact", agent="default")
-        preview = migrate_legacy_default_agent(db, target_agent="claire", dry_run=True)
+        preview = migrate_legacy_default_agent(db, target_agent="atlas", dry_run=True)
         assert preview["would_migrate"] == 1
         assert db.get_memory(mid)["agent"] == "default"
 
-        applied = migrate_legacy_default_agent(db, target_agent="claire", dry_run=False)
+        applied = migrate_legacy_default_agent(db, target_agent="atlas", dry_run=False)
         assert applied["migrated"] == 1
-        assert db.get_memory(mid)["agent"] == "claire"
+        assert db.get_memory(mid)["agent"] == "atlas"
         assert db.list_audit(memory_id=mid, action="migrate_legacy_agent")
     finally:
         db.close()

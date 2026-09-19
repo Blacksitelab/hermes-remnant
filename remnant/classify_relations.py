@@ -273,7 +273,9 @@ def main():
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    db_path = "/home/jd/.hermes/remnant/remnant.db"
+    from .db import default_db_path
+
+    db_path = str(default_db_path())
     result = classify_all_relations(db_path, dry_run=not args.yes)
 
     print(f"\n{'DRY RUN' if result['dry_run'] else 'APPLIED'}: {result['updates']} relations would be{' ' if result['dry_run'] else ' '}typed")

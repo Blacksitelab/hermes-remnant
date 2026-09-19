@@ -180,10 +180,14 @@ def main():
     if args.db:
         db_path = args.db
     else:
+        # Mirror ``db.default_db_path()``: REMNANT_DB_HOME env override with the
+        # standard ``~/.hermes/remnant/remnant.db`` fallback. Config stays
+        # profile-scoped under the standard Hermes home.
         from remnant.config import load_config
-        load_config("/home/jd/.hermes")
-        # Try to find the DB path from config or default location
-        db_path = str(Path("/home/jd/.hermes/remnant/remnant.db"))
+        from remnant.db import default_db_path
+
+        load_config(Path("~/.hermes").expanduser())
+        db_path = str(default_db_path())
 
     result = reextract(db_path, dry_run=args.dry_run, batch=args.batch)
     print(f"\nResult: {result}")

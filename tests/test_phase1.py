@@ -240,9 +240,9 @@ def test_is_transient_rejects_times_and_today():
 
 
 def test_is_transient_accepts_durable_facts():
-    assert not is_transient("Sven prefers dark mode")
+    assert not is_transient("Sam prefers dark mode")
     assert not is_transient("The homelab has 4 nodes")
-    assert not is_transient("Alice is Sven's sister")
+    assert not is_transient("Alice is Sam's sister")
 
 
 # --- store + dedup ---------------------------------------------------------
@@ -255,7 +255,7 @@ def test_handle_tool_call_returns_string(provider: RemnantMemoryProvider):
     rejects non-string content with HTTP 400."""
     res = provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="strcheck",
     )
     assert isinstance(res, str), "handle_tool_call must return a str for the wire"
@@ -268,7 +268,7 @@ def test_handle_tool_call_returns_string(provider: RemnantMemoryProvider):
 def test_memory_store_stores_durable_fact(provider: RemnantMemoryProvider):
     res = provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="s2",
     )
     assert isinstance(res, str)
@@ -289,12 +289,12 @@ def test_memory_store_rejects_transient(provider: RemnantMemoryProvider):
 def test_memory_store_dedup_identical(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="s2",
     )
     res = provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="s2",
     )
     assert json.loads(res)["stored"] is False
@@ -323,13 +323,13 @@ def test_store_memory_direct(hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         mid = store_memory(
-            db, emb, cfg, fact="Alice is Sven's sister", entity="Alice",
+            db, emb, cfg, fact="Alice is Sam's sister", entity="Alice",
             session_id="s", agent_id="default",
         )
         assert mid is not None
         # Storing again should dedup.
         mid2 = store_memory(
-            db, emb, cfg, fact="Alice is Sven's sister", entity="Alice",
+            db, emb, cfg, fact="Alice is Sam's sister", entity="Alice",
             session_id="s", agent_id="default",
         )
         assert mid2 is None
@@ -343,7 +343,7 @@ def test_store_memory_direct(hermes_home: Path):
 def test_memory_search_returns_results(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="s4",
     )
     provider.handle_tool_call(

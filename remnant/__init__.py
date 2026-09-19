@@ -53,7 +53,7 @@ from .tools import TOOL_SCHEMAS, handle_tool_call
 from .vault import index_vault as _index_vault
 
 log = logging.getLogger("remnant")
-__version__ = "0.3.2"
+__version__ = "0.4.0"
 
 
 class _SessionEmbedder:
@@ -145,7 +145,7 @@ except Exception:  # pragma: no cover - fallback for standalone/test envs
 # Static, byte-stable block describing the provider to the agent. It never
 # includes live data, so it is safe to return the same constant every call
 # for the lifetime of a conversation.
-_SYSTEM_PROMPT_BLOCK = (
+_SYSTEM_PROMPT_HEAD = (
     "## Remnant Memory Provider\n"
     "You have durable long-term memory via the Remnant provider.\n"
     "Memory access is restricted to this profile; shared/fleet labels do not grant "
@@ -162,10 +162,18 @@ _SYSTEM_PROMPT_BLOCK = (
     "Use the `memory_edit` tool to update, merge, forget, score, or share memories. "
     "Nothing is ever deleted: forgotten memories stay in the DB but are hidden from "
     "search; updates supersede the old version while preserving it.\n"
+)
+
+# Vault instructions are only advertised when a vault is configured, so the
+# prompt stays honest about available capabilities.
+_SYSTEM_PROMPT_VAULT = (
     "Use the `memory_import` tool with `source='vault'` to re-index the Obsidian "
     "vault: new and changed notes become document memories, deleted notes are "
     "forgotten. Excluded vault folders (90_*-95_*, 99_ARCHIVE) are skipped. Locked "
     "notes are indexed but their content is hidden from other agents in search.\n"
+)
+
+_SYSTEM_PROMPT_TAIL = (
     "Use `memory_import` with `source='memory_store'` to import MEMORY.md / "
     "USER.md bullets for the current Hermes profile as facts "
     "(confidence=0.9, trust_score=0.9) with fleet/shared/private visibility "
@@ -187,8 +195,20 @@ _SYSTEM_PROMPT_BLOCK = (
     "bounded list to the cloud model.\n"
 )
 
+def _system_prompt_block(vault_enabled: bool) -> str:
+    """Compose the byte-stable provider prompt.
+
+    Byte-stability is per configuration, not global: the same provider config
+    always yields the same string, so the block is safe to cache for the
+    lifetime of a conversation. The vault sentence is omitted entirely when no
+    vault is configured.
+    """
+    vault = _SYSTEM_PROMPT_VAULT if vault_enabled else ""
+    return _SYSTEM_PROMPT_HEAD + vault + _SYSTEM_PROMPT_TAIL
+
+
 # Config schema exposed to `hermes memory setup`. Kept minimal: only fields a
-# user must configure. Endpoints/models default to the BSL1 Ollama setup.
+# user must configure. Endpoints/models default to a local Ollama setup.
 _CONFIG_SCHEMA: list[dict[str, Any]] = [
     {
         "key": "embed_url",
@@ -254,7 +274,11 @@ _CONFIG_SCHEMA: list[dict[str, Any]] = [
     },
     {
         "key": "vault_path",
-        "description": "Path to the Obsidian vault to index as document memories",
+        "description": (
+            "Optional: path to an Obsidian vault. Leave unset to run without "
+            "vault indexing."
+        ),
+        "placeholder": "/path/to/your/obsidian-vault",
         "default": DEFAULT_VAULT_PATH,
         "required": False,
     },
@@ -626,7 +650,9 @@ class RemnantMemoryProvider(MemoryProvider):
     # -- prompts --------------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        return _SYSTEM_PROMPT_BLOCK
+        return _system_prompt_block(
+            vault_enabled=bool(self._config is not None and self._config.vault_path)
+        )
 
     # -- turns ----------------------------------------------------------------
 
@@ -1010,8 +1036,13 @@ class RemnantMemoryProvider(MemoryProvider):
         Safe to call from an external cron/timer. Uses the provider's
         configured ``vault_path`` / ``vault_exclude``. See
         ``remnant.vault.index_vault`` for the underlying implementation.
+
+        When no vault is configured, logs and returns zero stats.
         """
         if self._db is None or self._config is None or self._embedder is None:
+            return {"indexed": 0, "skipped": 0, "forgotten": 0}
+        if not self._config.vault_path:
+            log.info("vault not configured; skipping")
             return {"indexed": 0, "skipped": 0, "forgotten": 0}
         return _index_vault(
             self._db, self._config, self._embedder, force=force

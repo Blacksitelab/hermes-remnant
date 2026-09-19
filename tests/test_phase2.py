@@ -139,10 +139,10 @@ def _seed_memories(db, emb, cfg, items, agent_id="default"):
         ("thanks!", False),
         ("ok", False),
         ("what did we decide about the homelab", True),
-        ("remember Sven's preference", True),
+        ("remember Sam's preference", True),
         ("status of the proxmox node", True),
         ("who is Alice", True),
-        ("Sven", True),  # short proper-noun lookup
+        ("Sam", True),  # short proper-noun lookup
         ("presence sensors", True),
         ("docker", True),
         ("", False),
@@ -282,9 +282,9 @@ def test_semantic_search_ranks_relevant(hermes_home: Path):
     emb = _fake_embed(db, cfg, dim=64)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode for all editors", "Sven", "private"),
+            ("Sam prefers dark mode for all editors", "Sam", "private"),
             ("The homelab runs Proxmox on four nodes", "homelab", "private"),
-            ("Alice is Sven's sister", "Alice", "private"),
+            ("Alice is Sam's sister", "Alice", "private"),
         ])
         results = hybrid_search(
             db, cfg, "editor dark mode",
@@ -348,7 +348,7 @@ def test_auto_strategy_fuses(hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode", "Sven", "private"),
+            ("Sam prefers dark mode", "Sam", "private"),
             ("The homelab runs Proxmox", "homelab", "private"),
         ])
         results = hybrid_search(
@@ -388,7 +388,7 @@ def test_prefetch_injects_relevant_facts(provider: RemnantMemoryProvider):
     # Seed a fact via the tool path.
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     provider.handle_tool_call(
@@ -396,7 +396,7 @@ def test_prefetch_injects_relevant_facts(provider: RemnantMemoryProvider):
         {"fact": "The homelab runs Proxmox on four nodes", "entity": "homelab"},
         session_id="seed",
     )
-    res = provider.prefetch("what did Sven decide about dark mode", session_id="ask")
+    res = provider.prefetch("what did Sam decide about dark mode", session_id="ask")
     assert res, "prefetch should inject relevant context"
     assert isinstance(res, str)
     assert "dark mode" in res.lower()
@@ -405,11 +405,11 @@ def test_prefetch_injects_relevant_facts(provider: RemnantMemoryProvider):
 def test_prefetch_within_deadline(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     t0 = time.perf_counter()
-    res = provider.prefetch("remember Sven dark mode preference", session_id="t")
+    res = provider.prefetch("remember Sam dark mode preference", session_id="t")
     elapsed_ms = (time.perf_counter() - t0) * 1000
     assert elapsed_ms < provider._config.injection_prefetch_deadline_ms
     assert res  # and it injected something
@@ -421,7 +421,7 @@ def test_prefetch_keeps_keyword_context_when_embedding_is_unavailable(
     """A stalled/unavailable embedding service must not erase BM25 recall."""
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
 
@@ -433,7 +433,7 @@ def test_prefetch_keeps_keyword_context_when_embedding_is_unavailable(
 
     provider._embedder.embed = unavailable  # type: ignore[union-attr]
     t0 = time.perf_counter()
-    res = provider.prefetch("what did Sven decide about dark mode", session_id="fallback")
+    res = provider.prefetch("what did Sam decide about dark mode", session_id="fallback")
     elapsed_ms = (time.perf_counter() - t0) * 1000
 
     assert "dark mode" in res.lower()
@@ -465,10 +465,10 @@ def test_prefetch_skips_oversized_result_and_keeps_later_fact(
     provider._config.injection_token_budget = 80
     long_note = "x" * 2_000
     long_id = provider._db.insert_memory(content=long_note, agent="default")
-    short_id = provider._db.insert_memory(content="Sven likes tea", agent="default")
+    short_id = provider._db.insert_memory(content="Sam likes tea", agent="default")
     results = [
         {"id": long_id, "content": long_note, "visibility": "private"},
-        {"id": short_id, "content": "Sven likes tea", "visibility": "private"},
+        {"id": short_id, "content": "Sam likes tea", "visibility": "private"},
     ]
 
     monkeypatch.setattr(
@@ -476,8 +476,8 @@ def test_prefetch_skips_oversized_result_and_keeps_later_fact(
         "hybrid_search",
         lambda *args, **kwargs: list(results),
     )
-    res = provider.prefetch("remember Sven preference", session_id="budget-later")
-    assert "Sven likes tea" in res
+    res = provider.prefetch("remember Sam preference", session_id="budget-later")
+    assert "Sam likes tea" in res
     assert long_note not in res
 
 
@@ -487,10 +487,10 @@ def test_prefetch_token_budget_enforced(provider: RemnantMemoryProvider):
     for i in range(20):
         provider.handle_tool_call(
             "memory_store",
-            {"fact": f"Sven preference number {i} is about topic {i}", "entity": "Sven"},
+            {"fact": f"Sam preference number {i} is about topic {i}", "entity": "Sam"},
             session_id="seed",
         )
-    res = provider.prefetch("what are Sven preferences", session_id="bud")
+    res = provider.prefetch("what are Sam preferences", session_id="bud")
     if res:
         assert len(res) // 4 <= 30
 
@@ -498,10 +498,10 @@ def test_prefetch_token_budget_enforced(provider: RemnantMemoryProvider):
 def test_prefetch_diff_based_dedup(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
-    q = "remember Sven dark mode preference"
+    q = "remember Sam dark mode preference"
     r1 = provider.prefetch(q, session_id="dup")
     assert r1, "first call should inject"
     # Same query + same memories => same context hash => suppressed.
@@ -513,21 +513,21 @@ def test_prefetch_diff_based_dedup(provider: RemnantMemoryProvider):
 def test_prefetch_dedup_against_messages(provider: RemnantMemoryProvider):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     # The fact text is already in the conversation => should be deduped away.
     messages = [
-        {"role": "user", "content": "Sven prefers dark mode for editors"},
+        {"role": "user", "content": "Sam prefers dark mode for editors"},
         {"role": "assistant", "content": "got it"},
     ]
     res = provider.prefetch(
-        "remember Sven dark mode preference",
+        "remember Sam dark mode preference",
         session_id="msgdedup",
         messages=messages,  # type: ignore[arg-type]
     )
     if res:
-        assert "Sven prefers dark mode for editors" not in res
+        assert "Sam prefers dark mode for editors" not in res
 
 
 def test_prefetch_disabled(provider: RemnantMemoryProvider):
@@ -556,7 +556,7 @@ def test_backup_paths_includes_shared_database(provider: RemnantMemoryProvider):
 def test_memory_reflect_tool_mock(provider: RemnantMemoryProvider, monkeypatch):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     provider.handle_tool_call(
@@ -568,12 +568,12 @@ def test_memory_reflect_tool_mock(provider: RemnantMemoryProvider, monkeypatch):
     from remnant import reflect as reflect_mod
 
     def fake_call_llm(config, user_content):
-        return "Sven prefers dark mode; the homelab runs Proxmox on four nodes."
+        return "Sam prefers dark mode; the homelab runs Proxmox on four nodes."
 
     monkeypatch.setattr(reflect_mod, "_call_llm", fake_call_llm)
     res = provider.handle_tool_call(
         "memory_reflect",
-        {"question": "What do we know about Sven and the homelab?"},
+        {"question": "What do we know about Sam and the homelab?"},
         session_id="reflect",
     )
     parsed = json.loads(res)
@@ -637,7 +637,7 @@ def test_default_search_strategy_is_auto():
     emb = _fake_embed(db, cfg)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode for editors", "Sven", "private"),
+            ("Sam prefers dark mode for editors", "Sam", "private"),
         ])
         # No strategy arg => uses config.default_search_strategy == "auto".
         # Force the embedder so the semantic arm ranks the relevant memory first.
@@ -664,7 +664,7 @@ def test_semantic_below_threshold_returns_empty():
     emb = _fake_embed(db, cfg)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode for all editors", "Sven", "private"),
+            ("Sam prefers dark mode for all editors", "Sam", "private"),
             ("The homelab runs Proxmox on four nodes", "homelab", "private"),
         ])
         # A relevant query: the fake embedder yields a cosine well below 1.0
@@ -694,11 +694,11 @@ def test_semantic_above_threshold_returns_results():
     emb = _fake_embed(db, cfg)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode for all editors", "Sven", "private"),
+            ("Sam prefers dark mode for all editors", "Sam", "private"),
         ])
         # Default threshold (0.5) is met for a highly overlapping query.
         res = hybrid_search(
-            db, cfg, "Sven prefers dark mode for all editors", agent_id="default",
+            db, cfg, "Sam prefers dark mode for all editors", agent_id="default",
             strategy="semantic", embedder=emb,
         )
         assert res, "exact-overlap query should clear the default threshold"
@@ -715,7 +715,7 @@ def test_semantic_threshold_configurable():
     emb = _fake_embed(db, cfg)
     try:
         _seed_memories(db, emb, cfg, [
-            ("Sven prefers dark mode for all editors", "Sven", "private"),
+            ("Sam prefers dark mode for all editors", "Sam", "private"),
         ])
         # The fake embedder shares tokens "dark","mode","for" with the query,
         # giving a partial cosine (~0.55). A threshold of 0.9 should drop it.
@@ -740,7 +740,7 @@ def test_search_tool_accepts_strategy_argument(provider: RemnantMemoryProvider):
     """The memory_search tool must accept and honor a ``strategy`` argument."""
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     # Force keyword strategy explicitly via the tool path.
@@ -773,7 +773,7 @@ def test_search_tool_accepts_strategy_argument(provider: RemnantMemoryProvider):
     # be accepted and return a well-formed result).
     out_graph = provider.handle_tool_call(
         "memory_search",
-        {"query": "Sven", "strategy": "graph"},
+        {"query": "Sam", "strategy": "graph"},
         session_id="s",
     )
     parsed_graph = json.loads(out_graph)
@@ -784,7 +784,7 @@ def test_search_tool_default_strategy_is_auto(provider: RemnantMemoryProvider):
     """The memory_search tool must default to 'auto' when no strategy is given."""
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode for editors", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode for editors", "entity": "Sam"},
         session_id="seed",
     )
     import json
@@ -801,18 +801,18 @@ def test_search_tool_uses_claim_resolution_and_reports_competing_evidence(
 ):
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers dark mode", "entity": "Sven"},
+        {"fact": "Sam prefers dark mode", "entity": "Sam"},
         session_id="claims",
     )
     provider.handle_tool_call(
         "memory_store",
-        {"fact": "Sven prefers light mode", "entity": "Sven"},
+        {"fact": "Sam prefers light mode", "entity": "Sam"},
         session_id="claims",
     )
     parsed = json.loads(
         provider.handle_tool_call(
             "memory_search",
-            {"query": "Sven preference", "strategy": "keyword", "limit": 1},
+            {"query": "Sam preference", "strategy": "keyword", "limit": 1},
             session_id="claims",
         )
     )

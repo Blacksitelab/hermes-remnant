@@ -68,22 +68,22 @@ def test_named_config_profiles_preserve_unrelated_settings():
 def test_claim_metadata_migrates_and_resolves_without_losing_history():
     db = open_db(default_db_path())
     try:
-        first = db.insert_memory(content="Sven prefers light mode", agent="default")
+        first = db.insert_memory(content="Sam prefers light mode", agent="default")
         record_claim_from_memory(
             db,
             memory_id=first,
-            subject="Sven",
-            fact="Sven prefers light mode",
+            subject="Sam",
+            fact="Sam prefers light mode",
             claim_data={"confidence": 0.9, "extractor_version": "claims-v2"},
             reconciliation_enabled=True,
             source_turn_id=11,
         )
-        second = db.insert_memory(content="Sven now prefers dark mode", agent="default")
+        second = db.insert_memory(content="Sam now prefers dark mode", agent="default")
         record_claim_from_memory(
             db,
             memory_id=second,
-            subject="Sven",
-            fact="Sven now prefers dark mode",
+            subject="Sam",
+            fact="Sam now prefers dark mode",
             claim_data={
                 "confidence": 0.9,
                 "conflict_type": "update",
@@ -104,10 +104,10 @@ def test_claim_metadata_migrates_and_resolves_without_losing_history():
         resolved = resolve_results(
             db,
             [
-                {"id": first, "content": "Sven prefers light mode", "score": 0.8},
-                {"id": second, "content": "Sven now prefers dark mode", "score": 0.7},
+                {"id": first, "content": "Sam prefers light mode", "score": 0.8},
+                {"id": second, "content": "Sam now prefers dark mode", "score": 0.7},
             ],
-            query="Sven preference",
+            query="Sam preference",
         )
         assert [row["id"] for row in resolved] == [second]
         context = compile_context(resolved)

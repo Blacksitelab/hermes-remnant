@@ -158,14 +158,20 @@ def _write_note(path: Path, body: str, frontmatter: dict | None = None) -> None:
 
 def test_phase4_config_defaults():
     cfg = RemnantConfig()
-    assert cfg.vault_path == DEFAULT_VAULT_PATH
+    # Vault indexing is opt-in: with no REMNANT_VAULT_PATH env var set, the
+    # default is None (no vault configured).
+    if "REMNANT_VAULT_PATH" in os.environ:
+        assert cfg.vault_path == os.environ["REMNANT_VAULT_PATH"]
+    else:
+        assert cfg.vault_path is None
+    assert DEFAULT_VAULT_PATH == os.environ.get("REMNANT_VAULT_PATH")
     assert cfg.vault_exclude == DEFAULT_VAULT_EXCLUDE
     assert "90_" in cfg.vault_exclude and "99_ARCHIVE" in cfg.vault_exclude
     assert cfg.profile_scope == []
     assert cfg.vault_reindex_interval_s == DEFAULT_VAULT_REINDEX_INTERVAL_S
     # A fresh config still works with from_dict/to_dict round-trip.
     d = cfg.to_dict()
-    assert d["vault_path"] == DEFAULT_VAULT_PATH
+    assert d["vault_path"] == cfg.vault_path
     assert d["vault_exclude"] == list(DEFAULT_VAULT_EXCLUDE)
 
 
@@ -269,7 +275,7 @@ def test_parse_frontmatter_carries_spec_keys():
         "status: active\n"
         "created: 2024-01-01\n"
         "updated: 2024-06-01\n"
-        "author: Sven\n"
+        "author: Sam\n"
         "locked: true\n"
         "custom: extra\n"
         "---\n"
@@ -318,7 +324,7 @@ def test_index_file_stores_frontmatter_metadata(hermes_home: Path, vault: Path):
         frontmatter={
             "type": "spec", "tags": ["alpha"], "status": "active",
             "created": "2024-01-01", "updated": "2024-06-01",
-            "author": "Sven", "locked": True,
+            "author": "Sam", "locked": True,
         },
     )
     try:
@@ -329,7 +335,7 @@ def test_index_file_stores_frontmatter_metadata(hermes_home: Path, vault: Path):
         assert meta["type"] == "spec"
         assert meta["tags"] == ["alpha"]
         assert meta["status"] == "active"
-        assert meta["author"] == "Sven"
+        assert meta["author"] == "Sam"
         assert meta["locked"] is True
         # tags column also populated from frontmatter.
         assert mem["tags"] == ["alpha"]
@@ -367,7 +373,7 @@ def test_index_file_has_embedding_and_entity_links(hermes_home: Path, vault: Pat
     cfg = RemnantConfig(vault_path=str(vault), entity_min_memories=1)
     emb = _fake_embed(db, cfg)
     note = vault / "Projects" / "alpha.md"
-    _write_note(note, "# Project Alpha\nSven runs Project Alpha on Proxmox.")
+    _write_note(note, "# Project Alpha\nSam runs Project Alpha on Proxmox.")
     try:
         mid = index_file(db, cfg, emb, note)
         assert mid
@@ -623,7 +629,7 @@ def test_profile_scope_does_not_affect_non_vault_memories(
     from remnant.ingest import store_memory
 
     store_memory(
-        db, emb, cfg, fact="Sven prefers dark mode with alpha colors", entity="Sven",
+        db, emb, cfg, fact="Sam prefers dark mode with alpha colors", entity="Sam",
         session_id="s", agent_id="default",
     )
     try:
@@ -699,7 +705,7 @@ def test_locked_note_content_hidden_from_other_agent(
     secret = vault / "Personal" / "secret.md"
     _write_note(
         secret,
-        "# Secret\nREDACTED_EXAMPLE is the passphrase for BlacksiteLab.",
+        "# Secret\nREDACTED_EXAMPLE is the passphrase for ExampleCorp.",
         frontmatter={"locked": True},
     )
     public = vault / "Projects" / "public.md"

@@ -318,31 +318,31 @@ def test_s011_final_claim_group_contains_only_authorized_inputs(tmp_path):
     cfg = RemnantConfig(agent_id="a", claim_aware_ranking_enabled=True)
     ids: dict[str, str] = {}
     for owner, text in (
-        ("a", "Sven prefers dark mode"),
-        ("a", "Sven prefers light mode"),
-        ("alice", "Sven prefers purple mode"),
+        ("a", "Sam prefers dark mode"),
+        ("a", "Sam prefers light mode"),
+        ("alice", "Sam prefers purple mode"),
     ):
         mid = db.insert_memory(content=text, agent=owner, type="fact")
         ids[text] = mid
         db._conn.execute(
             "INSERT OR REPLACE INTO claims(memory_id, subject, predicate, object, status, "
             "confidence, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?)",
-            (mid, "sven", "prefers", text.rsplit(" ", 1)[-1], "active", 0.9,
+            (mid, "sam", "prefers", text.rsplit(" ", 1)[-1], "active", 0.9,
              "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z"),
         )
     db._conn.commit()
     try:
         resp = RecallService(db, cfg).recall(
-            RecallRequest(query="Sven preference", agent_id="a", strategy="keyword", limit=5),
+            RecallRequest(query="Sam preference", agent_id="a", strategy="keyword", limit=5),
         )
         rendered = json.dumps(resp.results)
         assert "purple" not in rendered
-        assert ids["Sven prefers purple mode"] not in rendered
-        assert ids["Sven prefers dark mode"] in rendered
+        assert ids["Sam prefers purple mode"] not in rendered
+        assert ids["Sam prefers dark mode"] in rendered
         # Every nested claim-group member is an authorized (owner-a) input.
         grouped = [g["id"] for r in resp.results for g in (r.get("claim_group") or [])]
         assert grouped
-        assert set(grouped) <= {ids["Sven prefers dark mode"], ids["Sven prefers light mode"]}
+        assert set(grouped) <= {ids["Sam prefers dark mode"], ids["Sam prefers light mode"]}
     finally:
         db.close()
 
@@ -577,7 +577,7 @@ def test_s012_direct_writer_entry_points_are_covered(tmp_path):
 
     path = tmp_path / "writers.db"
     db = open_db(path)
-    db.insert_memory(content="Sven uses Proxmox", agent="a")
+    db.insert_memory(content="Sam uses Proxmox", agent="a")
     db.close()
 
     # Dry runs inspect without changing the mode.
@@ -593,7 +593,7 @@ def test_s012_direct_writer_entry_points_are_covered(tmp_path):
     # Unsafe existing WAL is refused before their first write.
     wal = tmp_path / "writers-wal.db"
     db = open_db(wal)
-    db.insert_memory(content="Sven uses Proxmox", agent="a")
+    db.insert_memory(content="Sam uses Proxmox", agent="a")
     db.close()
     raw = sqlite3.connect(wal)
     raw.execute("PRAGMA journal_mode=wal")

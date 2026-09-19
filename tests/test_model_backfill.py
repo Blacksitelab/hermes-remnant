@@ -26,7 +26,7 @@ def test_parse_claim_batch_accepts_only_requested_memory_ids():
                 {
                     "memory_id": "m-1",
                     "claim": {
-                        "subject": "Kris",
+                        "subject": "Alex",
                         "predicate": "prefers",
                         "object": "dark mode",
                         "confidence": 0.91,
@@ -55,9 +55,9 @@ def test_parse_single_claim_has_no_id_assignment_surface():
     text = json.dumps(
         {
             "claim": {
-                "subject": "Kris",
+                "subject": "Alex",
                 "predicate": "uses",
-                "object": "Gitea",
+                "object": "GitLab",
                 "confidence": 0.8,
                 "observed_at": None,
                 "event_at": None,
@@ -73,8 +73,8 @@ def test_parse_single_claim_has_no_id_assignment_surface():
 
     parsed = parse_single_claim(text)
 
-    assert parsed["subject"] == "Kris"
-    assert parsed["object"] == "Gitea"
+    assert parsed["subject"] == "Alex"
+    assert parsed["object"] == "GitLab"
 
 
 def test_parse_single_claim_recovers_id_typo_and_invalid_timestamp():
@@ -84,9 +84,9 @@ def test_parse_single_claim_recovers_id_typo_and_invalid_timestamp():
                 {
                     "memory_id": "m-typo",
                     "claim": {
-                        "subject": "Kris",
+                        "subject": "Alex",
                         "predicate": "uses",
-                        "object": "Gitea",
+                        "object": "GitLab",
                         "confidence": 0.8,
                         "observed_at": "not-a-date",
                         "event_at": None,
@@ -108,15 +108,15 @@ def test_parse_single_claim_recovers_id_typo_and_invalid_timestamp():
         recover_single_id=True,
     )
 
-    assert parsed["m-1"]["object"] == "Gitea"
+    assert parsed["m-1"]["object"] == "GitLab"
     assert parsed["m-1"]["observed_at"] is None
 
 
 def test_parse_single_claim_accepts_exact_duplicate_entries():
     claim = {
-        "subject": "Kris",
+        "subject": "Alex",
         "predicate": "uses",
-        "object": "Gitea",
+        "object": "GitLab",
         "confidence": 0.8,
         "observed_at": None,
         "event_at": None,
@@ -142,12 +142,12 @@ def test_parse_single_claim_accepts_exact_duplicate_entries():
         recover_single_id=True,
     )
 
-    assert parsed["m-1"]["object"] == "Gitea"
+    assert parsed["m-1"]["object"] == "GitLab"
 
 
 def test_parse_claim_batch_rejects_unknown_and_duplicate_ids():
     unknown = json.dumps(
-        {"claims": [{"memory_id": "not-requested", "claim": {"subject": "Kris"}}]}
+        {"claims": [{"memory_id": "not-requested", "claim": {"subject": "Alex"}}]}
     )
     with pytest.raises(LLMResponseError, match="unknown memory_id"):
         parse_claim_batch(unknown, allowed_ids={"m-1"})
@@ -168,7 +168,7 @@ def test_apply_claim_projection_preserves_memory_and_audits_replacement(tmp_path
     db = open_db(tmp_path / "remnant.db")
     try:
         memory_id = db.insert_memory(
-            content="Kris prefers dark mode",
+            content="Alex prefers dark mode",
             source="conversation",
             agent="default",
             type="fact",
@@ -176,8 +176,8 @@ def test_apply_claim_projection_preserves_memory_and_audits_replacement(tmp_path
         record_claim_from_memory(
             db,
             memory_id=memory_id,
-            subject="Kris",
-            fact="Kris prefers dark mode",
+            subject="Alex",
+            fact="Alex prefers dark mode",
             claim_data={"extractor_version": "legacy"},
             agent_id="default",
         )
@@ -186,7 +186,7 @@ def test_apply_claim_projection_preserves_memory_and_audits_replacement(tmp_path
             db,
             memory_id=memory_id,
             claim={
-                "subject": "Kris",
+                "subject": "Alex",
                 "predicate": "prefers",
                 "object": "dark mode",
                 "confidence": 0.94,
@@ -203,7 +203,7 @@ def test_apply_claim_projection_preserves_memory_and_audits_replacement(tmp_path
         )
 
         assert result["updated"] is True
-        assert db.get_memory(memory_id)["content"] == "Kris prefers dark mode"
+        assert db.get_memory(memory_id)["content"] == "Alex prefers dark mode"
         stored = db.get_claim_for_memory(memory_id)
         assert stored["object"] == "dark mode"
         assert stored["confidence"] == pytest.approx(0.94)
@@ -219,26 +219,26 @@ def test_apply_claim_projection_preserves_memory_and_audits_replacement(tmp_path
 def test_target_selection_leaves_current_structured_claims_alone(tmp_path: Path):
     db = open_db(tmp_path / "remnant.db")
     try:
-        legacy = db.insert_memory(content="Kris uses Gitea", agent="default", type="fact")
+        legacy = db.insert_memory(content="Alex uses GitLab", agent="default", type="fact")
         record_claim_from_memory(
             db,
             memory_id=legacy,
-            subject="Kris",
-            fact="Kris uses Gitea",
+            subject="Alex",
+            fact="Alex uses GitLab",
             claim_data={"extractor_version": "legacy"},
             agent_id="default",
         )
-        current = db.insert_memory(content="Kris uses GitHub", agent="default", type="fact")
+        current = db.insert_memory(content="Alex uses GitHub", agent="default", type="fact")
         record_claim_from_memory(
             db,
             memory_id=current,
-            subject="Kris",
-            fact="Kris uses GitHub",
+            subject="Alex",
+            fact="Alex uses GitHub",
             claim_data={"extractor_version": "claims-v2"},
             agent_id="default",
         )
         unclaimed = db.insert_memory(
-            content="Kris reviews pull requests", agent="default", type="fact"
+            content="Alex reviews pull requests", agent="default", type="fact"
         )
 
         targets = _target_memories(db, extractor_version=MODEL_BACKFILL_VERSION, limit=None)
@@ -255,7 +255,7 @@ def test_apply_claim_projection_creates_missing_claim_row(tmp_path: Path):
     db = open_db(tmp_path / "remnant.db")
     try:
         memory_id = db.insert_memory(
-            content="Kris reviews pull requests",
+            content="Alex reviews pull requests",
             source="conversation",
             agent="default",
             type="fact",
@@ -264,7 +264,7 @@ def test_apply_claim_projection_creates_missing_claim_row(tmp_path: Path):
             db,
             memory_id=memory_id,
             claim={
-                "subject": "Kris",
+                "subject": "Alex",
                 "predicate": "reviews",
                 "object": "pull requests",
                 "confidence": 0.8,
@@ -281,6 +281,6 @@ def test_apply_claim_projection_creates_missing_claim_row(tmp_path: Path):
         assert result["created"] is True
         stored = db.get_claim_for_memory(memory_id)
         assert stored is not None
-        assert stored["subject"] == "Kris"
+        assert stored["subject"] == "Alex"
     finally:
         db.close()

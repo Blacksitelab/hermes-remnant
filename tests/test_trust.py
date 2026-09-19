@@ -138,8 +138,8 @@ def test_source_manual_trust_09(hermes_home: Path):
         # entity so no corroborating memory shares it (keeps the boost off).
         mid = store_memory(
             db, emb, cfg,
-            fact="Sven owns the BlacksiteLab homelab",
-            entity="BlacksiteLab",
+            fact="Sam owns the ExampleCorp homelab",
+            entity="ExampleCorp",
             session_id="s",
             agent_id="default",
         )

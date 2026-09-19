@@ -23,7 +23,7 @@ def _context(memory_id: str = "m1"):
         [
             {
                 "id": memory_id,
-                "content": "Sven prefers dark mode",
+                "content": "Sam prefers dark mode",
                 "score": 0.9,
                 "evidence_class": "current_claim",
                 "claim_status": "active",
@@ -35,7 +35,7 @@ def _context(memory_id: str = "m1"):
 
 def _draft(service: EchoService, memory_id: str = "m1"):
     return service.build_receipt_draft(
-        query="What is Sven's preference?",
+        query="What is Sam's preference?",
         session_id="s1",
         agent_id="agent",
         viewer_key="viewer",
@@ -60,15 +60,15 @@ def test_echo_receipt_is_exact_and_closes_to_persisted_turn(tmp_path):
         assert [item["memory_id"] for item in receipt["items"]] == ["m1"]
         turn_id = ingest_turn(
             db,
-            user_text="What is Sven's preference?",
-            assistant_text="Sven prefers dark mode.",
+            user_text="What is Sam's preference?",
+            assistant_text="Sam prefers dark mode.",
             session_id="s1",
             agent_id="agent",
         )
         assert service.close_receipt(
             session_id="s1",
             viewer_key="viewer",
-            query="What is Sven's preference?",
+            query="What is Sam's preference?",
             turn_id=turn_id,
         ) == receipt_id
         assert service.store.get_receipt(receipt_id)["status"] == "closed"
@@ -113,12 +113,12 @@ def test_echo_feedback_aggregates_and_influences_only_after_threshold(tmp_path):
                 feedback="useful",
                 agent_id="agent",
                 viewer_key="viewer",
-                query="What is Sven's preference?",
+                query="What is Sam's preference?",
             )
         assert service.aggregate(limit=20) == 6
         results, diagnostics = service.adjust_results(
             [{"id": "m1", "score": 0.5}],
-            query="What is Sven's preference?",
+            query="What is Sam's preference?",
             agent_id="agent",
             viewer_key="viewer",
         )
@@ -139,8 +139,8 @@ def test_echo_worker_persists_inferred_signal_with_retry_safe_job(tmp_path):
             db,
             embedder,
             config,
-            fact="Sven prefers dark mode",
-            entity="Sven",
+            fact="Sam prefers dark mode",
+            entity="Sam",
             session_id="s1",
             agent_id="agent",
         )
@@ -166,15 +166,15 @@ def test_echo_worker_persists_inferred_signal_with_retry_safe_job(tmp_path):
         assert worker.run_once() is False
         turn_id = ingest_turn(
             db,
-            user_text="What is Sven's preference?",
-            assistant_text="Sven prefers dark mode.",
+            user_text="What is Sam's preference?",
+            assistant_text="Sam prefers dark mode.",
             session_id="s1",
             agent_id="agent",
         )
         service.close_receipt(
             session_id="s1",
             viewer_key="viewer",
-            query="What is Sven's preference?",
+            query="What is Sam's preference?",
             turn_id=turn_id,
         )
         assert worker.run_once() is True

@@ -20,12 +20,12 @@ def test_evaluate_cases_reports_retrieval_metrics():
     emb = _Embedder()
     try:
         mid = store_memory(
-            db, emb, cfg, fact="Sven prefers dark mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers dark mode", entity="Sam",
             session_id="seed", agent_id="default", source="manual",
         )
         result = evaluate_cases(
             db, cfg, emb,
-            [{"query": "Sven dark mode", "expected_ids": [mid], "strategy": "keyword"}],
+            [{"query": "Sam dark mode", "expected_ids": [mid], "strategy": "keyword"}],
         )
         assert result["cases"] == 1
         assert result["recall_at_k"] == 1.0

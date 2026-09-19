@@ -22,11 +22,11 @@ def test_legacy_new_fact_creates_source_backed_claim_and_versions_prior_value(tm
     emb = _Embedder()
     try:
         first = store_memory(
-            db, emb, cfg, fact="Sven prefers dark mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers dark mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         second = store_memory(
-            db, emb, cfg, fact="Sven prefers light mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers light mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         first_claim = db.get_claim_for_memory(first)
@@ -46,11 +46,11 @@ def test_default_profile_keeps_ambiguous_competing_fact_unresolved(tmp_path: Pat
     emb = _Embedder()
     try:
         first = store_memory(
-            db, emb, cfg, fact="Sven prefers dark mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers dark mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         second = store_memory(
-            db, emb, cfg, fact="Sven prefers light mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers light mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         first_claim = db.get_claim_for_memory(first)
@@ -68,12 +68,12 @@ def test_verified_claim_requires_explicit_correction_or_corroboration(tmp_path: 
     emb = _Embedder()
     try:
         first = store_memory(
-            db, emb, cfg, fact="Sven prefers dark mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers dark mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         db.set_memory_field(first, "verified", 1, actor="test", action="verify")
         second = store_memory(
-            db, emb, cfg, fact="Sven prefers light mode", entity="Sven",
+            db, emb, cfg, fact="Sam prefers light mode", entity="Sam",
             session_id="s", agent_id="agent",
         )
         assert db.get_claim_for_memory(first)["status"] == "active"

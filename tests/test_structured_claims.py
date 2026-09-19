@@ -11,7 +11,7 @@ from remnant.reextract_claims import backfill_claims
 
 def test_structured_parser_preserves_fields_and_nulls_invalid_timestamp():
     facts = _parse_facts(
-        '{"facts":[{"fact":"Kris now prefers dark mode","subject":"Kris",'
+        '{"facts":[{"fact":"Alex now prefers dark mode","subject":"Alex",'
         '"predicate":"prefers","object":"dark mode","durability":"durable",'
         '"modality":"asserted","valid_from":"not-a-date","conditions":["at home"]}]}'
     )
@@ -24,12 +24,12 @@ def test_structured_parser_preserves_fields_and_nulls_invalid_timestamp():
 def test_claim_uses_structured_spo_and_reconciliation_is_audited(tmp_path: Path):
     db = open_db(tmp_path / "claims.db")
     try:
-        memory_id = db.insert_memory(content="Kris uses Signal", agent="a")
+        memory_id = db.insert_memory(content="Alex uses Signal", agent="a")
         claim_id = record_claim_from_memory(
             db,
             memory_id=memory_id,
-            subject="Kris",
-            fact="Kris uses Signal",
+            subject="Alex",
+            fact="Alex uses Signal",
             claim_data={
                 "predicate": "contact method",
                 "object": "Signal",
@@ -51,13 +51,13 @@ def test_claim_uses_structured_spo_and_reconciliation_is_audited(tmp_path: Path)
 def test_claim_competitors_never_cross_agent_scope(tmp_path: Path):
     db = open_db(tmp_path / "scope.db")
     try:
-        first = db.insert_memory(content="Kris prefers dark", agent="agent-a")
-        second = db.insert_memory(content="Kris prefers light", agent="agent-b")
+        first = db.insert_memory(content="Alex prefers dark", agent="agent-a")
+        second = db.insert_memory(content="Alex prefers light", agent="agent-b")
         record_claim_from_memory(
-            db, memory_id=first, subject="Kris", fact="Kris prefers dark", agent_id="agent-a"
+            db, memory_id=first, subject="Alex", fact="Alex prefers dark", agent_id="agent-a"
         )
         record_claim_from_memory(
-            db, memory_id=second, subject="Kris", fact="Kris prefers light", agent_id="agent-b"
+            db, memory_id=second, subject="Alex", fact="Alex prefers light", agent_id="agent-b"
         )
         assert db.get_claim_for_memory(first)["status"] == "active"
         assert db.get_claim_for_memory(second)["status"] == "active"
@@ -69,10 +69,10 @@ def test_claim_backfill_is_dry_run_restartable_and_non_mutating(tmp_path: Path):
     db = open_db(tmp_path / "backfill.db")
     try:
         memory_id = db.insert_memory(
-            content="Kris owns a printer",
+            content="Alex owns a printer",
             agent="a",
-            tags=["Kris"],
-            metadata={"entity": "Kris"},
+            tags=["Alex"],
+            metadata={"entity": "Alex"},
         )
         before = db.get_memory(memory_id)
         dry = backfill_claims(db, dry_run=True)
@@ -108,16 +108,16 @@ def test_worker_uses_durable_source_timestamp_and_drops_hypothetical(
             "_extract",
             lambda _u, _a: [
                 {
-                    "fact": "Kris prefers dark mode",
-                    "subject": "Kris",
+                    "fact": "Alex prefers dark mode",
+                    "subject": "Alex",
                     "predicate": "prefers",
                     "object": "dark mode",
                     "durability": "durable",
                     "modality": "asserted",
                 },
                 {
-                    "fact": "Kris might move to Mars",
-                    "subject": "Kris",
+                    "fact": "Alex might move to Mars",
+                    "subject": "Alex",
                     "durability": "durable",
                     "modality": "hypothetical",
                 },

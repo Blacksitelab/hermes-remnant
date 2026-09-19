@@ -16,9 +16,9 @@ one destination. For example:
 ```json
 {
   "sources": [
-    {"path": "/private/snapshots/claire.db",
-     "owners": {"claire": "claire", "sasha": "sasha"}},
-    {"path": "/private/snapshots/sasha.db", "owners": {"sasha": "sasha"}}
+    {"path": "/snapshots/profile-a.db",
+     "owners": {"profile-a": "profile-a", "profile-b": "profile-b"}},
+    {"path": "/snapshots/profile-b.db", "owners": {"profile-b": "profile-b"}}
   ]
 }
 ```
@@ -26,8 +26,8 @@ one destination. For example:
 Run against snapshots, with a new output path:
 
 ```bash
-python -m remnant.recover --manifest /private/manifest.json \
-  --output /private/recovered.db --report /private/recovery-report.json
+python -m remnant.recover --manifest /snapshots/manifest.json \
+  --output /snapshots/recovered.db --report /snapshots/recovery-report.json
 ```
 
 The command never changes an input or overwrites an existing output. It retains

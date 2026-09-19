@@ -33,7 +33,7 @@ Key points:
 - `memory_search` tool (BM25 / FTS5 only)
 - `memory_store` tool (manual storage with dedup)
 - `sync_turn()` writes raw turns and enqueues async extraction
-- Async extraction via `gemma4:12b` on BSL1
+- Async extraction via `gemma4:12b` on the local Ollama host
 - Entity extraction and resolution
 - Deduplication (BM25 + cosine similarity)
 - Transient-state filter

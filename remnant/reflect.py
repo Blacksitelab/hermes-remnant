@@ -1,5 +1,5 @@
 """Memory reflection: synthesize an answer across the top-N memories via a
-local LLM (gemma4:12b on BSL1).
+local LLM (the configured extraction model).
 
 Input is bounded (top 20 memories) and output capped at max_tokens 512 to keep
 the call cheap and predictable. Source memory ids are returned for attribution.

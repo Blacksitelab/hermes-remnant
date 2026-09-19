@@ -25,7 +25,7 @@ def test_gateway_users_have_distinct_non_secret_storage_keys():
         configured_agent="default",
         session_id="s1",
         runtime_identity_enabled=True,
-        agent_identity="claire",
+        agent_identity="atlas",
         agent_workspace="hermes",
         platform="telegram",
         user_id="raw-user-1",
@@ -34,7 +34,7 @@ def test_gateway_users_have_distinct_non_secret_storage_keys():
         configured_agent="default",
         session_id="s2",
         runtime_identity_enabled=True,
-        agent_identity="claire",
+        agent_identity="atlas",
         agent_workspace="hermes",
         platform="telegram",
         user_id="raw-user-2",
@@ -60,7 +60,7 @@ def test_missing_gateway_identity_is_session_isolated():
 
 
 def test_explicit_alias_merges_platform_identifiers():
-    aliases = {"telegram:111": "kris", "discord:222": "kris"}
+    aliases = {"telegram:111": "alex", "discord:222": "alex"}
     telegram = effective_identity(
         configured_agent="default",
         session_id="s1",
@@ -110,7 +110,7 @@ def test_prefetch_cache_key_is_scoped_bounded_ttl_and_write_invalidated(
     provider.initialize(
         "s1",
         hermes_home=str(home),
-        agent_identity="claire",
+        agent_identity="atlas",
         agent_workspace="hermes",
         platform="telegram",
         user_id="111",

@@ -42,8 +42,8 @@ git diff --check
 
 No behavior flag becomes a default solely because this synthetic suite passes.
 Before deployment-wide enablement, run shadow extraction/reconciliation against
-a representative private corpus and apply the thresholds in the leadership
-implementation plan. Keep raw private cases and model prompts out of Git.
+a representative private corpus and apply the recorded thresholds in
+`evaluation/baselines/`. Keep raw private cases and model prompts out of Git.
 
 The scenario runner seeds prepared memories and claim projections; its scores
 measure retrieval/resolution, not extraction-model quality. The regression suites

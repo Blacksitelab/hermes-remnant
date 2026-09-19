@@ -10,14 +10,14 @@ from remnant.ranking import rank_results
 def test_verified_quality_breaks_equal_relevance_tie(tmp_path: Path):
     db = open_db(tmp_path / "rank.db")
     try:
-        weak = db.insert_memory(content="Kris prefers dark", confidence=0.2, trust_score=0.2)
-        strong = db.insert_memory(content="Kris prefers dark mode", confidence=0.9, trust_score=0.9)
+        weak = db.insert_memory(content="Alex prefers dark", confidence=0.2, trust_score=0.2)
+        strong = db.insert_memory(content="Alex prefers dark mode", confidence=0.9, trust_score=0.9)
         db.set_memory_field(strong, "verified", 1, actor="test", action="verify")
         ranked = rank_results(
             db,
             [
-                {"id": weak, "content": "Kris prefers dark", "score": 1.0},
-                {"id": strong, "content": "Kris prefers dark mode", "score": 1.0},
+                {"id": weak, "content": "Alex prefers dark", "score": 1.0},
+                {"id": strong, "content": "Alex prefers dark mode", "score": 1.0},
             ],
         )
         assert ranked[0]["id"] == strong
@@ -79,15 +79,15 @@ def test_historical_keyword_search_can_load_superseded_evidence(tmp_path: Path):
 
     db = open_db(tmp_path / "history.db")
     try:
-        old = db.insert_memory(content="Kris preferred light mode", agent="a")
-        new = db.insert_memory(content="Kris prefers dark mode", agent="a")
+        old = db.insert_memory(content="Alex preferred light mode", agent="a")
+        new = db.insert_memory(content="Alex prefers dark mode", agent="a")
         db.supersede(old, new)
         config = RemnantConfig(agent_id="a", claim_aware_ranking_enabled=True)
-        current = search(db, config, "Kris light mode", agent_id="a", strategy="keyword")
+        current = search(db, config, "Alex light mode", agent_id="a", strategy="keyword")
         history = search(
             db,
             config,
-            "Previously Kris light mode",
+            "Previously Alex light mode",
             agent_id="a",
             strategy="keyword",
         )

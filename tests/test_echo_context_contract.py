@@ -6,7 +6,7 @@ from remnant.context import compile_context_details
 def test_compiled_context_reports_exact_rendered_and_omitted_ids():
     compiled = compile_context_details(
         [
-            {"id": "m-current", "content": "Sven likes tea", "visibility": "private"},
+            {"id": "m-current", "content": "Sam likes tea", "visibility": "private"},
             {"id": "m-long", "content": "x" * 1000, "visibility": "private"},
         ],
         token_budget=80,

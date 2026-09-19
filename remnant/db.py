@@ -3866,7 +3866,7 @@ def _append_profile_scope_sql(
 def _normalize_entity_name(name: str) -> str:
     """Lowercase, strip surrounding punctuation/whitespace for entity matching.
 
-    Periods are preserved (internal initials/abbreviations like "Sven E." are
+    Periods are preserved (internal initials/abbreviations like "Sam E." are
     semantically meaningful); other surrounding punctuation is stripped.
     """
     if not name:

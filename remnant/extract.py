@@ -4,7 +4,7 @@
   stays non-blocking.
 - Pulls jobs from the persisted `extraction_queue` table; restarts don't lose
   turns.
-- Calls gemma4:12b on the BSL1 OpenAI-compatible endpoint and parses facts +
+- Calls the configured extraction model via an OpenAI-compatible endpoint and parses facts +
   entities from the JSON response.
 - Runs each extracted fact through the transient-state filter and dedup before
   storing.

@@ -144,8 +144,8 @@ def test_store_memory_default_source_conversation_with_turn(hermes_home: Path):
         )
         mid = store_memory(
             db, emb, cfg,
-            fact="Sven prefers dark mode for the editor",
-            entity="Sven",
+            fact="Sam prefers dark mode for the editor",
+            entity="Sam",
             session_id="s",
             agent_id="default",
             source_turn_id=turn_id,
@@ -163,8 +163,8 @@ def test_store_memory_default_source_manual_without_turn(hermes_home: Path):
     try:
         mid = store_memory(
             db, emb, cfg,
-            fact="Sven owns the BlacksiteLab homelab",
-            entity="Sven",
+            fact="Sam owns the ExampleCorp homelab",
+            entity="Sam",
             session_id="s",
             agent_id="default",
         )
@@ -268,11 +268,11 @@ def test_dream_merge_uses_source_dream(monkeypatch, hermes_home: Path):
     emb = _fake_embed(db, cfg)
     try:
         mid_a = _store_fact(
-            db, emb, cfg, "Sven owns the BlacksiteLab homelab",
+            db, emb, cfg, "Sam owns the ExampleCorp homelab",
             agent="alice", visibility="shared",
         )
         mid_b = _store_fact(
-            db, emb, cfg, "Sven owns the BlacksiteLab homelab",
+            db, emb, cfg, "Sam owns the ExampleCorp homelab",
             agent="bob", visibility="shared",
         )
         assert mid_a and mid_b
@@ -336,9 +336,9 @@ def test_filter_typed_entities_drops_empties_and_duplicates():
         {"name": "  ", "type": None, "aliases": []},
         {"name": "", "type": None, "aliases": []},
         {"name": "proxmox", "type": None, "aliases": []},  # dup of Proxmox
-        {"name": "Sven", "type": "person", "aliases": ["svenny"]},
+        {"name": "Sam", "type": "person", "aliases": ["sammy"]},
     ]
     out = filter_typed_entities(ents)
     names = [e["name"] for e in out]
-    assert names == ["Proxmox", "Sven"]
-    assert out[1]["aliases"] == ["svenny"]
+    assert names == ["Proxmox", "Sam"]
+    assert out[1]["aliases"] == ["sammy"]

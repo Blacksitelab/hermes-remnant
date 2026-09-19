@@ -81,14 +81,14 @@ def test_issue_31_auto_falls_back_to_bm25_when_semantic_weak():
         # embedder gives it a weak cosine score (partial token overlap).
         mid = _store(
             db, emb, cfg,
-            "Kris Hastings Hawke's Bay job at Pak-Line",
+            "Alex logistics coordinator job at Northline",
             source="conversation",
         )
         assert mid is not None
 
         # Set an aggressive threshold so the weak semantic score is rejected.
         cfg.min_semantic_score = 0.95
-        res = search(db, cfg, "Kris Hastings Hawke's Bay", agent_id="default", embedder=emb)
+        res = search(db, cfg, "Alex Northline", agent_id="default", embedder=emb)
         # Before the fix this returned [].
         assert res, "auto should fall back to BM25 when semantic is weak"
         assert any(r["id"] == mid for r in res)
@@ -104,7 +104,7 @@ def test_issue_31_semantic_still_returns_empty_below_threshold():
     try:
         # Use a fact and query that share no tokens so BM25 does not pre-filter
         # it into the candidate list.
-        _store(db, emb, cfg, "Sven prefers dark mode for all editors", source="conversation")
+        _store(db, emb, cfg, "Sam prefers dark mode for all editors", source="conversation")
         cfg.min_semantic_score = 0.95
         res = search(
             db, cfg, "completely unrelated query",
@@ -125,14 +125,14 @@ def test_issue_32_conversation_fact_outranks_vault_document():
         # Conversation fact that shares query tokens.
         conv_mid = _store(
             db, emb, cfg,
-            "Kris Hastings Hawke's Bay job at Pak-Line",
+            "Alex logistics coordinator job at Northline",
             source="conversation",
         )
         # Vault document that also shares the same tokens, but is much longer.
         vault_body = "\n".join([
             "# Operation Find A New Job",
             "This is a log of job searching.",
-        ] + ["Kris Hastings Hawke's Bay job"] * 50)
+        ] + ["Alex Northline job"] * 50)
         vault_mid = _store(
             db, emb, cfg, vault_body, source="vault", visibility="shared",
         )
@@ -140,7 +140,7 @@ def test_issue_32_conversation_fact_outranks_vault_document():
         assert vault_mid is not None
 
         res = search(
-            db, cfg, "Kris Hastings Hawke's Bay",
+            db, cfg, "Alex Northline",
             agent_id="default", strategy="auto", embedder=emb,
         )
         ids = [r["id"] for r in res]
@@ -163,12 +163,12 @@ def test_issue_32_vault_still_ranks_first_when_genuinely_better():
     try:
         vault_mid = _store(
             db, emb, cfg,
-            "The BlacksiteLab homelab architecture overview",
+            "The ExampleCorp homelab architecture overview",
             source="vault",
         )
         assert vault_mid is not None
         res = search(
-            db, cfg, "BlacksiteLab homelab architecture",
+            db, cfg, "ExampleCorp homelab architecture",
             agent_id="default", strategy="auto", embedder=emb,
         )
         assert any(r["id"] == vault_mid for r in res)
