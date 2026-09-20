@@ -95,6 +95,20 @@ def test_pure_classifier_redacts_literals_but_keeps_pointer_class():
     assert "field=metadata.api_key" in redacted
 
 
+def test_classifier_allows_memory_paths_but_not_slash_tokens_or_credentials():
+    for value in (
+        "/home/alice/Project2026/notes/MEMORY.md",
+        "/tmp/pytest-of-alice/pytest-123/TestProfile42/MEMORY.md",
+    ):
+        assert not any(item.kind == "literal" for item in classify_text(value))
+    assert any(item.kind == "literal" for item in classify_text(
+        "AbCdEfGhIjKlMnOp12/ZaYbXcWd34/QrStUvWx56"
+    ))
+    assert any(item.kind == "literal" for item in classify_text(
+        "https://user:password123@example.test/path"
+    ))
+
+
 def test_structured_keys_and_executable_identities_do_not_leak(tmp_path: Path):
     structured = {TOKEN: TOKEN}
     redacted = redact_text(TOKEN, field=f"metadata.{TOKEN}") or ""

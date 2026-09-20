@@ -193,6 +193,12 @@ def store_memory(
     reject_literal(metadata, field="metadata")
     reject_literal(source_text, field="source_text")
     reject_literal(claim_data, field="claim_data")
+    meta: dict[str, Any] = {"session_id": session_id}
+    if entity:
+        meta["entity"] = entity
+    if metadata:
+        meta.update(metadata)
+    reject_literal(meta, field="metadata")
     allow_temporal = bool((metadata or {}).get("structured_claim_v2"))
     if not fact or is_transient(fact, allow_temporal=allow_temporal):
         return None
@@ -239,13 +245,8 @@ def store_memory(
     embedding = embedder.embed(fact) if embedder else None
     # embed() returns None on remote failure; pass None through so no embedding
     # row is stored (insert_memory only writes a row when embedding is truthy).
-    meta: dict[str, Any] = {"session_id": session_id}
-    if entity:
-        meta["entity"] = entity
     if contradiction_targets:
         meta["contradicts"] = contradiction_targets
-    if metadata:
-        meta.update(metadata)
     resolved_source = source if source is not None else (
         "conversation" if source_turn_id is not None else "manual"
     )

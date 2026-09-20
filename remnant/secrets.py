@@ -122,6 +122,11 @@ _POINTER_RE = re.compile(
     re.IGNORECASE,
 )
 
+_ORDINARY_MEMORY_PATH_RE = re.compile(
+    r"/(?:home/[A-Za-z0-9._-]+|tmp/pytest-of-[A-Za-z0-9._-]+/pytest-\d+)"
+    r"(?:/[A-Za-z0-9._-]+)+/MEMORY\.md"
+)
+
 
 def _normalise_subclass(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", value.casefold()).strip("_") or "credential"
@@ -136,9 +141,12 @@ def _literal_findings(text: str) -> list[SecretFinding]:
             # Ignore a token-shaped path component, not slash-bearing tokens.
             # The detector's alphabet includes '/', so checking the whole
             # surrounding window would silently disable a supported literal.
-            if subclass == "high_entropy_token" and "/" not in match.group(0) and (
-                (match.start() > 0 and text[match.start() - 1] == "/")
-                or (match.end() < len(text) and text[match.end()] == "/")
+            if subclass == "high_entropy_token" and (
+                _ORDINARY_MEMORY_PATH_RE.fullmatch(text)
+                or ("/" not in match.group(0) and (
+                    (match.start() > 0 and text[match.start() - 1] == "/")
+                    or (match.end() < len(text) and text[match.end()] == "/")
+                ))
             ):
                 continue
             actual_subclass = subclass
