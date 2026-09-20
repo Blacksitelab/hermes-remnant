@@ -152,6 +152,27 @@ def test_unsafe_identity_diagnostics_are_generic(tmp_path: Path, capsys):
     assert not output.exists()
 
 
+def test_multiline_secret_location_redacts_before_escaping():
+    payload = "a" * 30
+    value = redact_text(f"Bearer {payload}", field=f"metadata.Bearer\n{payload}") or ""
+    assert payload not in value
+    assert "\\n" not in value
+    assert "[REDACTED]" in value
+
+
+def test_invalid_cli_arguments_are_generic(capsys):
+    payload = "a" * 30
+    assert main(
+        ["report", "--db", "x", "--agent", f"Bearer {payload}", "--output", "x", "--format", "bad"]
+    ) == 2
+    assert main(
+        ["report", "--db", "x", "--agent", f"Bearer {payload}", "--output", "x", "--unknown"]
+    ) == 2
+    captured = capsys.readouterr()
+    assert payload not in captured.out + captured.err
+    assert captured.err.count("hygiene: invalid arguments") == 2
+
+
 def test_report_is_read_only_redacted_and_secure(tmp_path: Path):
     db, owner, pointer, locked, _ = _seed(tmp_path / "store.db")
     try:
