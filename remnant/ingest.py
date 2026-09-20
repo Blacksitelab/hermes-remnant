@@ -246,7 +246,8 @@ def store_memory(
     # embed() returns None on remote failure; pass None through so no embedding
     # row is stored (insert_memory only writes a row when embedding is truthy).
     if contradiction_targets:
-        meta["contradicts"] = contradiction_targets
+        # Caller metadata has documented precedence over generated fields.
+        meta.setdefault("contradicts", contradiction_targets)
     resolved_source = source if source is not None else (
         "conversation" if source_turn_id is not None else "manual"
     )

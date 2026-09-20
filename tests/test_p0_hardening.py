@@ -289,3 +289,25 @@ def test_llm_adapter_adds_extraction_controls_per_protocol():
     assert "options" not in openai
     assert "format" not in openai
     assert "num_ctx" not in openai
+
+
+def test_derived_session_rejection_preserves_duplicate_state(tmp_path):
+    db = open_db(tmp_path / "ingest.db")
+    embedder = _CountingEmbedder()
+    try:
+        mid = store_memory(
+            db, embedder, RemnantConfig(), fact="stable fact", entity="stable",
+            session_id="safe-session", agent_id="agent",
+        )
+        before = db.get_memory(mid)
+        with pytest.raises(ValueError):
+            store_memory(
+                db, embedder, RemnantConfig(), fact="stable fact", entity="stable",
+                session_id="AbCdEfGhIjKlMnOp12/ZaYbXcWd34/QrStUvWx56",
+                agent_id="agent",
+            )
+        after = db.get_memory(mid)
+        assert after["seen_count"] == before["seen_count"]
+        assert embedder.calls == 1
+    finally:
+        db.close()

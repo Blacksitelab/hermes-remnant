@@ -197,6 +197,32 @@ def test_contradiction_penalty_lowers_trust(hermes_home: Path):
         db.close()
 
 
+def test_caller_contradiction_metadata_wins(hermes_home: Path):
+    db = _open_db(hermes_home)
+    cfg = RemnantConfig()
+    emb = _fake_embed(db, cfg)
+    try:
+        store_memory(
+            db, emb, cfg,
+            fact="The metadata test server is online",
+            entity="metadata test server",
+            entities=[{"name": "metadata test server", "type": None, "aliases": []}],
+            session_id="s", agent_id="default",
+        )
+        mid = store_memory(
+            db, emb, cfg,
+            fact="The metadata test server is offline",
+            entity="metadata test server",
+            entities=[{"name": "metadata test server", "type": None, "aliases": []}],
+            metadata={"contradicts": ["caller-value"]},
+            session_id="s", agent_id="default",
+        )
+        assert mid is not None
+        assert db.get_memory(mid)["metadata"]["contradicts"] == ["caller-value"]
+    finally:
+        db.close()
+
+
 # ===========================================================================
 # 3. Corroboration boost
 # ===========================================================================
