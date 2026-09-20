@@ -338,6 +338,13 @@ def import_memory_store(
             vis = classify_visibility(entry, agent=prof)
             stats["visibility"][vis] += 1
             chash = _content_hash(entry)
+            meta: dict[str, Any] = {
+                "imported_from": fpath,
+                "profile": prof,
+                "content_hash": chash,
+            }
+            reject_literal(entry, field="import.content")
+            reject_literal(meta, field="import.metadata")
             existing = db.get_memory_by_content_hash(chash, agent_id=actor)
             duplicate = existing is not None
             if not duplicate and not dry_run and not shadow:
@@ -380,14 +387,8 @@ def import_memory_store(
                 db.increment_seen_count(existing["id"])
                 continue
 
-            reject_literal(entry, field="import.content")
             embedding = embedder.embed(entry) if embedder else None
             embed_model = getattr(embedder, "_model", None) if embedder else None
-            meta: dict[str, Any] = {
-                "imported_from": fpath,
-                "profile": prof,
-                "content_hash": chash,
-            }
             mid = db.insert_memory(
                 content=entry,
                 source="import",
@@ -531,6 +532,9 @@ def import_hindsight(
                 stats["skipped"] += 1
                 continue
             chash = _content_hash(content)
+            meta: dict[str, Any] = {"hindsight_query": q, "content_hash": chash}
+            reject_literal(content, field="import.content")
+            reject_literal(meta, field="import.metadata")
             if chash in seen_hashes:
                 stats["duplicates"] += 1
                 continue
@@ -575,13 +579,8 @@ def import_hindsight(
             elif duplicate:
                 db.increment_seen_count(existing["id"])
             else:
-                reject_literal(content, field="import.content")
                 embedding = embedder.embed(content) if embedder else None
                 embed_model = getattr(embedder, "_model", None) if embedder else None
-                meta: dict[str, Any] = {
-                    "hindsight_query": q,
-                    "content_hash": chash,
-                }
                 mid = db.insert_memory(
                     content=content,
                     source="hindsight",

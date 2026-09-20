@@ -357,6 +357,22 @@ def index_file(
     if locked:
         metadata["locked"] = True
 
+    # Validate the complete note before touching embeddings or any index rows.
+    reject_literal(tags, field="vault.tags")
+    reject_literal(metadata, field="vault.metadata")
+    for ordinal, passage in enumerate(passages):
+        passage_metadata = {
+            **metadata,
+            "title": title,
+            "parent_vault_path": rel,
+            "passage_ordinal": ordinal,
+            "heading_path": passage["heading_path"],
+            "start_offset": passage["start"],
+            "end_offset": passage["end"],
+        }
+        reject_literal(passage["content"], field="vault.content")
+        reject_literal(passage_metadata, field="vault.metadata")
+
     embed_model = getattr(embedder, "_model", None) if embedder else None
     existing_passages = {p["ordinal"]: p["memory_id"] for p in db.get_vault_passages(
         rel, agent_id=config.agent_id,
@@ -377,8 +393,6 @@ def index_file(
             "start_offset": passage["start"],
             "end_offset": passage["end"],
         }
-        reject_literal(content, field="vault.content")
-        reject_literal(metadata, field="vault.metadata")
         embedding = embedder.embed(content) if embedder else None
         existing_passage_id = existing_passages.get(ordinal)
         if existing_passage_id:

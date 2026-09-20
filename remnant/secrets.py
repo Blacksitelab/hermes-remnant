@@ -136,12 +136,9 @@ def _literal_findings(text: str) -> list[SecretFinding]:
             # Ignore a token-shaped path component, not slash-bearing tokens.
             # The detector's alphabet includes '/', so checking the whole
             # surrounding window would silently disable a supported literal.
-            if subclass == "high_entropy_token" and (
-                ("/" not in match.group(0) and (
-                    (match.start() > 0 and text[match.start() - 1] == "/")
-                    or (match.end() < len(text) and text[match.end()] == "/")
-                ))
-                or (match.group(0).count("/") >= 2 and "/" in match.group(0))
+            if subclass == "high_entropy_token" and "/" not in match.group(0) and (
+                (match.start() > 0 and text[match.start() - 1] == "/")
+                or (match.end() < len(text) and text[match.end()] == "/")
             ):
                 continue
             actual_subclass = subclass
