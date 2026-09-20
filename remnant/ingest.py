@@ -20,6 +20,7 @@ from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
 from .entity import link_memory_entities
+from .secrets import reject_literal
 
 log = logging.getLogger("remnant.ingest")
 
@@ -185,6 +186,13 @@ def store_memory(
     sentence/paragraph.
     """
     fact = fact.strip()
+    reject_literal(fact, field="fact")
+    reject_literal(entity, field="entity")
+    reject_literal(entities, field="entities")
+    reject_literal(tags, field="tags")
+    reject_literal(metadata, field="metadata")
+    reject_literal(source_text, field="source_text")
+    reject_literal(claim_data, field="claim_data")
     allow_temporal = bool((metadata or {}).get("structured_claim_v2"))
     if not fact or is_transient(fact, allow_temporal=allow_temporal):
         return None

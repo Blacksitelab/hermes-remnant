@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .scope import VISIBILITY_ORDER, normalize_profile_scope, path_in_profile_scope
-from .secrets import is_locked_memory, memory_fingerprint
+from .secrets import is_locked_memory, memory_fingerprint, redact_value, reject_literal
 
 SCHEMA_VERSION = 18
 HISTORY_SUMMARY_ROW_CAP = 1_000
@@ -1813,6 +1813,9 @@ class RemnantDB:
         embedding: list[float] | None = None,
         embed_model: str | None = None,
     ) -> str:
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
         now = _now_iso()
         mid = _uuid()
         tags_json = json.dumps(tags) if tags else None
@@ -1861,6 +1864,9 @@ class RemnantDB:
         operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a replacement and supersede originals in one transaction."""
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
         if not original_ids:
             raise ValueError("at least one original memory is required")
         now = _now_iso()
@@ -3130,6 +3136,9 @@ class RemnantDB:
         """
         import hashlib
 
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
         before = self.get_memory(memory_id)
         if before is None:
             raise KeyError(memory_id)
@@ -3193,6 +3202,8 @@ class RemnantDB:
         }
         if field not in allowed:
             raise ValueError(f"field not mutable: {field}")
+        if field in {"content", "tags", "metadata"}:
+            reject_literal(value, field=field)
         before = self.get_memory(memory_id)
         if before is None:
             raise KeyError(memory_id)
@@ -3234,7 +3245,7 @@ class RemnantDB:
         cur.execute(
             "INSERT INTO audit_log(actor, action, memory_id, details, created_at) "
             "VALUES(?,?,?,?,?)",
-            (actor, action, memory_id, json.dumps(details, default=str), _now_iso()),
+            (actor, action, memory_id, json.dumps(redact_value(details), default=str), _now_iso()),
         )
         return int(cur.lastrowid)
 

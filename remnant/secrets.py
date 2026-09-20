@@ -25,6 +25,30 @@ class SecretFinding:
     location: str = ""
 
 
+class SecretLikeContentError(ValueError):
+    """Stable, value-free rejection for high-confidence literal credentials."""
+
+    reason_code = "secret_like_content"
+
+    def __init__(self, field: str = "value") -> None:
+        super().__init__(self.reason_code)
+        self.field = field
+
+
+def reject_literal(value: Any, *, field: str = "value") -> None:
+    """Reject literals recursively, without ever including the rejected value."""
+    if isinstance(value, str):
+        if any(item.kind == "literal" for item in classify_text(value, location=field)):
+            raise SecretLikeContentError(field)
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            reject_literal(key, field=f"{field}.key")
+            reject_literal(item, field=f"{field}.{key}")
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            reject_literal(item, field=f"{field}[{index}]")
+
+
 # Ordered from the most structurally specific forms to the generic assignment
 # form.  The replacement uses only the named subclass, never the match.
 _LITERAL_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
