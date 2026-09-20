@@ -42,7 +42,6 @@ class MemoryLifecycle:
             raise PermissionError("locked memory cannot be modified")
         first = rows[0]
         reject_literal(content, field="content")
-        embedding = self.embedder.embed(content) if self.embedder is not None else None
         tags: list[str] = []
         for row in rows:
             if isinstance(row.get("tags"), list):
@@ -73,6 +72,9 @@ class MemoryLifecycle:
                 "source_turn_id": predecessor.get("source_turn_id"),
             }
         reject_literal(claim_projection, field="claim_projection")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
+        embedding = self.embedder.embed(content) if self.embedder is not None else None
         return self.db.replace_memories_atomic(
             original_ids=original_ids,
             content=content,

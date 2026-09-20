@@ -133,8 +133,15 @@ def _literal_findings(text: str) -> list[SecretFinding]:
         for match in pattern.finditer(text):
             # A long mixed-case pytest/profile path component is not a secret.
             # Keep explicit credential forms above active even inside paths.
+            # Ignore a token-shaped path component, not slash-bearing tokens.
+            # The detector's alphabet includes '/', so checking the whole
+            # surrounding window would silently disable a supported literal.
             if subclass == "high_entropy_token" and (
-                "/" in text[max(0, match.start() - 1):match.end() + 1]
+                ("/" not in match.group(0) and (
+                    (match.start() > 0 and text[match.start() - 1] == "/")
+                    or (match.end() < len(text) and text[match.end()] == "/")
+                ))
+                or (match.group(0).count("/") >= 2 and "/" in match.group(0))
             ):
                 continue
             actual_subclass = subclass
