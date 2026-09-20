@@ -7,6 +7,7 @@ import pytest
 from remnant.config import RemnantConfig
 from remnant.db import open_db
 from remnant.import_sources import import_hindsight, import_memory_store
+from remnant.secrets import SecretLikeContentError
 from remnant.vault import index_file
 
 
@@ -38,7 +39,7 @@ def test_memory_store_rejects_persisted_literal_before_output(tmp_path: Path, mo
     db = open_db(tmp_path / "db.sqlite")
     emb = Embedder()
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(SecretLikeContentError):
             import_memory_store(db, RemnantConfig(agent_id="alpha"), emb, tmp_path, **mode)
         assert db.list_memories(agent_id="alpha") == []
         assert db.list_audit(action="import") == []
@@ -63,7 +64,7 @@ def test_hindsight_rejects_credential_like_query_before_side_effects(
     db = open_db(tmp_path / "db.sqlite")
     emb = Embedder()
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(SecretLikeContentError):
             import_hindsight(db, RemnantConfig(agent_id="alpha"), emb,
                              queries=["safe query sk_live_12345678901234567890"], **mode)
         assert db.list_memories(agent_id="alpha") == []
@@ -78,7 +79,7 @@ def test_exempt_memory_path_still_rejects_explicit_credential(tmp_path: Path):
     _profile(tmp_path, "- /home/alice/project/MEMORY.md\n- password: 'secret-value'\n")
     db = open_db(tmp_path / "db.sqlite")
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(SecretLikeContentError):
             import_memory_store(db, RemnantConfig(agent_id="alpha"), Embedder(), tmp_path)
         assert db.list_memories(agent_id="alpha") == []
     finally:
@@ -93,10 +94,30 @@ def test_vault_rejection_leaves_index_unchanged_and_skips_embedding(tmp_path: Pa
     db = open_db(tmp_path / "db.sqlite")
     emb = Embedder()
     try:
-        with pytest.raises(ValueError):
+        with pytest.raises(SecretLikeContentError):
             index_file(db, RemnantConfig(vault_path=str(vault)), emb, note)
         assert db.get_vault_hash("Notes/bad.md") is None
         assert db.get_vault_memory("Notes/bad.md") is None
+        assert emb.calls == 0
+    finally:
+        db.close()
+
+
+def test_memory_store_rejects_late_batch_without_side_effects(tmp_path: Path, monkeypatch):
+    import remnant.import_sources as sources
+
+    monkeypatch.setattr(sources, "discover_memory_store_entries", lambda _home: iter([
+        ("alpha", "MEMORY.md", "- safe fact\n"),
+        ("alpha", "MEMORY.md", "- late password: 'secret-value'\n"),
+    ]))
+    db = open_db(tmp_path / "db.sqlite")
+    emb = Embedder()
+    try:
+        with pytest.raises(SecretLikeContentError):
+            import_memory_store(db, RemnantConfig(agent_id="alpha"), emb, tmp_path)
+        assert db.list_memories(agent_id="alpha") == []
+        assert db.list_audit(action="import") == []
+        assert not (tmp_path / "remnant" / "shadow.log").exists()
         assert emb.calls == 0
     finally:
         db.close()

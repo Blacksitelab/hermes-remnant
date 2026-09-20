@@ -533,6 +533,7 @@ def import_hindsight(
     # Preflight every recalled row before any write, including shadow output.
     for q, rows in recalled_batches:
         for row in rows:
+            reject_literal(row.get("metadata"), field="import.recalled_metadata")
             content = _extract_content(row)
             if content:
                 reject_literal(content, field="import.content")
