@@ -321,6 +321,15 @@ def import_memory_store(
     actor = config.agent_id
 
     source_profile = source_profile_name(hermes_home, config.agent_id)
+    # Preflight the complete batch so a late rejection cannot leave earlier
+    # entries persisted.  This also keeps dry-run/shadow rejection atomic.
+    for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
+        if prof != (profile or source_profile):
+            continue
+        for entry in parse_memory_file(raw_line):
+            if entry.strip():
+                reject_literal(entry, field="import.content")
+                reject_literal({"imported_from": fpath, "profile": prof}, field="import.metadata")
     for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
         if prof != (profile or source_profile):
             continue
