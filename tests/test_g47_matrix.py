@@ -75,32 +75,34 @@ def _db_digest(db) -> str:
     return hashlib.sha256(json.dumps(snapshot, default=str).encode()).hexdigest()
 
 
-@pytest.mark.parametrize("mode", ({}, {"dry_run": True}, {"shadow": True}))
-def test_memory_store_rejects_persisted_literal_before_output(tmp_path: Path, mode):
-    _profile(tmp_path, "- safe fact\n")
+def test_memory_store_rejects_persisted_literal_before_output(
+    tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
+):
+    _profile(tmp_path, f"- safe fact\n- {safe_literal}\n")
     import remnant.import_sources as sources
     original = sources.discover_memory_store_entries
-    sources.discover_memory_store_entries = lambda _home: iter([
-        ("alpha", "sk_live_derived.md", "- safe fact\n")
-    ])
-    db = open_db(tmp_path / "db.sqlite")
-    emb = Embedder()
-    try:
-        with pytest.raises(SecretLikeContentError):
-            import_memory_store(db, RemnantConfig(agent_id="alpha"), emb, tmp_path, **mode)
-        assert db.list_memories(agent_id="alpha") == []
-        assert db.list_audit(action="import") == []
-        log = tmp_path / "remnant" / "shadow.log"
-        assert not log.exists()
-        assert emb.calls == 0
-    finally:
-        sources.discover_memory_store_entries = original
-        db.close()
+    calls = 0
+
+    def discover(home):
+        nonlocal calls
+        calls += 1
+        yield from original(home)
+
+    monkeypatch.setattr(sources, "discover_memory_store_entries", discover)
+    db, emb = _rejecting_db(), Embedder()
+    with pytest.raises(SecretLikeContentError) as exc:
+        import_memory_store(
+            db, RemnantConfig(agent_id="alpha"), emb, tmp_path, **import_mode
+        )
+    _assert_rejection(exc, "import.content")
+    assert calls == 1
+    assert db.mock_calls == [] and emb.calls == 0
+    assert not (tmp_path / "remnant" / "shadow.log").exists()
+    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
 
 
-@pytest.mark.parametrize("mode", ({}, {"dry_run": True}, {"shadow": True}))
 def test_hindsight_rejects_credential_like_query_before_side_effects(
-    tmp_path: Path, mode, monkeypatch,
+    tmp_path: Path, import_mode, safe_literal, monkeypatch, caplog, capsys,
 ):
     import remnant.import_sources as sources
 
@@ -108,18 +110,17 @@ def test_hindsight_rejects_credential_like_query_before_side_effects(
         sources, "_hindsight_recall",
         lambda query, *, limit, bank_id: [{"content": "safe hindsight fact"}],
     )
-    db = open_db(tmp_path / "db.sqlite")
-    emb = Embedder()
-    try:
-        with pytest.raises(SecretLikeContentError):
-            import_hindsight(db, RemnantConfig(agent_id="alpha"), emb,
-                             queries=["safe query sk_live_12345678901234567890"], **mode)
-        assert db.list_memories(agent_id="alpha") == []
-        assert db.list_audit(action="import") == []
-        assert not (tmp_path / "remnant" / "shadow.log").exists()
-        assert emb.calls == 0
-    finally:
-        db.close()
+    db, emb = _rejecting_db(), Embedder()
+    with pytest.raises(SecretLikeContentError) as exc:
+        import_hindsight(
+            db, RemnantConfig(agent_id="alpha"), emb,
+            queries=["safe query", f"late {safe_literal}"],
+            hermes_home=tmp_path / "hermes", **import_mode,
+        )
+    _assert_rejection(exc, "import.query")
+    assert db.mock_calls == [] and emb.calls == 0
+    assert not (tmp_path / "hermes" / "remnant" / "shadow.log").exists()
+    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
 
 
 def test_exempt_memory_path_still_rejects_explicit_credential(tmp_path: Path):
@@ -150,27 +151,19 @@ def test_vault_rejection_leaves_index_unchanged_and_skips_embedding(tmp_path: Pa
         db.close()
 
 
-def test_memory_store_rejects_late_batch_without_side_effects(tmp_path: Path, monkeypatch):
-    import remnant.import_sources as sources
-    monkeypatch.setattr(
-        sources,
-        "discover_memory_store_entries",
-        lambda _home: iter([
-            ("alpha", "MEMORY.md", "- safe fact\n"),
-            ("alpha", "MEMORY.md", "- late password: 'secret-value'\n"),
-        ]),
-    )
-    db = open_db(tmp_path / "db.sqlite")
-    emb = Embedder()
-    try:
-        with pytest.raises(SecretLikeContentError):
-            import_memory_store(db, RemnantConfig(agent_id="alpha"), emb, tmp_path)
-        assert db.list_memories(agent_id="alpha") == []
-        assert db.list_audit(action="import") == []
-        assert not (tmp_path / "remnant" / "shadow.log").exists()
-        assert emb.calls == 0
-    finally:
-        db.close()
+def test_memory_store_rejects_late_batch_without_side_effects(
+    tmp_path: Path, import_mode, safe_literal, caplog, capsys
+):
+    _profile(tmp_path, f"- safe fact\n- late {safe_literal}\n")
+    db, emb = _rejecting_db(), Embedder()
+    with pytest.raises(SecretLikeContentError) as exc:
+        import_memory_store(
+            db, RemnantConfig(agent_id="alpha"), emb, tmp_path, **import_mode
+        )
+    _assert_rejection(exc, "import.content")
+    assert db.mock_calls == [] and emb.calls == 0
+    assert not (tmp_path / "remnant" / "shadow.log").exists()
+    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
 
 
 @pytest.mark.parametrize("bad_part", ("passage", "tags", "metadata", "title"))
