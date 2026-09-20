@@ -9,7 +9,7 @@ from .claims import _claim_parts
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
-from .secrets import is_locked_memory
+from .secrets import is_locked_memory, reject_literal
 
 
 class MemoryLifecycle:
@@ -41,6 +41,7 @@ class MemoryLifecycle:
         if any(is_locked_memory(row) for row in rows):
             raise PermissionError("locked memory cannot be modified")
         first = rows[0]
+        reject_literal(content, field="content")
         embedding = self.embedder.embed(content) if self.embedder is not None else None
         tags: list[str] = []
         for row in rows:
@@ -71,6 +72,7 @@ class MemoryLifecycle:
                 "modality": predecessor.get("modality"),
                 "source_turn_id": predecessor.get("source_turn_id"),
             }
+        reject_literal(claim_projection, field="claim_projection")
         return self.db.replace_memories_atomic(
             original_ids=original_ids,
             content=content,

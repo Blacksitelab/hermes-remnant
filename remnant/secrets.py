@@ -131,6 +131,12 @@ def _literal_findings(text: str) -> list[SecretFinding]:
     findings: list[SecretFinding] = []
     for subclass, pattern in _LITERAL_PATTERNS:
         for match in pattern.finditer(text):
+            # A long mixed-case pytest/profile path component is not a secret.
+            # Keep explicit credential forms above active even inside paths.
+            if subclass == "high_entropy_token" and (
+                "/" in text[max(0, match.start() - 1):match.end() + 1]
+            ):
+                continue
             actual_subclass = subclass
             if subclass == "credential_assignment":
                 actual_subclass = _normalise_subclass(match.group("key"))

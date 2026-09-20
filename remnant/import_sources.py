@@ -42,6 +42,7 @@ from .db import RemnantDB
 from .embed import Embedder
 from .entity import extract_and_link_entities
 from .ingest import is_transient
+from .secrets import reject_literal
 
 log = logging.getLogger("remnant.import_sources")
 
@@ -379,6 +380,7 @@ def import_memory_store(
                 db.increment_seen_count(existing["id"])
                 continue
 
+            reject_literal(entry, field="import.content")
             embedding = embedder.embed(entry) if embedder else None
             embed_model = getattr(embedder, "_model", None) if embedder else None
             meta: dict[str, Any] = {
@@ -573,6 +575,7 @@ def import_hindsight(
             elif duplicate:
                 db.increment_seen_count(existing["id"])
             else:
+                reject_literal(content, field="import.content")
                 embedding = embedder.embed(content) if embedder else None
                 embed_model = getattr(embedder, "_model", None) if embedder else None
                 meta: dict[str, Any] = {

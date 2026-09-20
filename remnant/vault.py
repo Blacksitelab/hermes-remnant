@@ -30,6 +30,7 @@ from .db import RemnantDB
 from .embed import Embedder
 from .entity import extract_and_link_entities
 from .scope import path_in_profile_scope
+from .secrets import reject_literal
 
 log = logging.getLogger("remnant.vault")
 
@@ -376,6 +377,8 @@ def index_file(
             "start_offset": passage["start"],
             "end_offset": passage["end"],
         }
+        reject_literal(content, field="vault.content")
+        reject_literal(metadata, field="vault.metadata")
         embedding = embedder.embed(content) if embedder else None
         existing_passage_id = existing_passages.get(ordinal)
         if existing_passage_id:

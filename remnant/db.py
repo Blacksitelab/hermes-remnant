@@ -1867,6 +1867,7 @@ class RemnantDB:
         reject_literal(content, field="content")
         reject_literal(tags, field="tags")
         reject_literal(metadata, field="metadata")
+        reject_literal(claim_projection, field="claim_projection")
         if not original_ids:
             raise ValueError("at least one original memory is required")
         now = _now_iso()
