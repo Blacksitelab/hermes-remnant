@@ -138,7 +138,41 @@ runtime identity v1 records remain preserved but require an explicit operator
 mapping before reuse. Configured-owner mode retains its existing keys.
 Keep a SQLite backup before updating: rolling back across schema 16 requires
 restoring that database backup along with the earlier code. Direct database
-access and operator maintenance commands remain administrative capabilities.
+Direct database access and operator maintenance commands remain administrative capabilities.
+
+### Hygiene report and reviewed apply
+
+The hygiene workflow is report-first and never chooses a disposition. Point it
+at an approved snapshot; it opens SQLite read-only, excludes locked notes, and
+writes a redacted CSV (or JSON) plus a hashed companion manifest:
+
+```bash
+python -m remnant.hygiene report --db SNAPSHOT --agent OWNER --output REPORT.csv
+```
+
+An operator may construct an explicit version-1 approval manifest from that
+persisted report and its companion manifest. Apply re-reads the report content
+and hash, verifies operation membership, and binds the report content hash,
+schema identity, store binding, owner, human approver, reason, and every
+operation's expected row fingerprint. Apply only to the same store, and use
+dry-run before applying. Operations stop at the first conflict; receipts
+contain IDs/statuses only and are kept in a 0700 directory with 0600 files.
+Locked, foreign, changed, or unknown rows are not mutated. A live WAL is read
+through a disposable private capture; closed WAL snapshots with no sidecars
+are opened immutably, and unsupported journal layouts fail without writes.
+
+```bash
+python -m remnant.hygiene apply --db APPROVED_DB --agent OWNER \
+  --manifest APPROVAL.json --dry-run
+python -m remnant.hygiene apply --db APPROVED_DB --agent OWNER \
+  --manifest APPROVAL.json --apply
+```
+
+The classifier recognises a finite set of high-confidence literal credential
+forms. Pointer prose is a review finding, not an automatic forget decision;
+credential revocation and human disposition remain separate operator actions.
+The historical private extractor mentioned in the clearance report is not part
+of this checkout; `remnant.hygiene` is the small reviewable replacement.
 
 ### SQLite journal mode and the WAL-reset race
 
