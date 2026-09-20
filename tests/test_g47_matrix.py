@@ -6,7 +6,7 @@ import pytest
 
 from remnant.config import RemnantConfig
 from remnant.db import open_db
-from remnant.import_sources import import_memory_store
+from remnant.import_sources import import_hindsight, import_memory_store
 from remnant.vault import index_file
 
 
@@ -29,7 +29,12 @@ def _profile(home: Path, text: str) -> None:
 
 @pytest.mark.parametrize("mode", ({}, {"dry_run": True}, {"shadow": True}))
 def test_memory_store_rejects_persisted_literal_before_output(tmp_path: Path, mode):
-    _profile(tmp_path, "- api_key: sk_live_12345678901234567890\n")
+    _profile(tmp_path, "- safe fact\n")
+    import remnant.import_sources as sources
+    original = sources.discover_memory_store_entries
+    sources.discover_memory_store_entries = lambda _home: iter([
+        ("alpha", "sk_live_derived.md", "- safe fact\n")
+    ])
     db = open_db(tmp_path / "db.sqlite")
     emb = Embedder()
     try:
@@ -38,7 +43,32 @@ def test_memory_store_rejects_persisted_literal_before_output(tmp_path: Path, mo
         assert db.list_memories(agent_id="alpha") == []
         assert db.list_audit(action="import") == []
         log = tmp_path / "remnant" / "shadow.log"
-        assert not log.exists() or "sk_live_" not in log.read_text()
+        assert not log.exists()
+        assert emb.calls == 0
+    finally:
+        sources.discover_memory_store_entries = original
+        db.close()
+
+
+@pytest.mark.parametrize("mode", ({}, {"dry_run": True}, {"shadow": True}))
+def test_hindsight_rejects_credential_like_query_before_side_effects(
+    tmp_path: Path, mode, monkeypatch,
+):
+    import remnant.import_sources as sources
+
+    monkeypatch.setattr(
+        sources, "_hindsight_recall",
+        lambda query, *, limit, bank_id: [{"content": "safe hindsight fact"}],
+    )
+    db = open_db(tmp_path / "db.sqlite")
+    emb = Embedder()
+    try:
+        with pytest.raises(ValueError):
+            import_hindsight(db, RemnantConfig(agent_id="alpha"), emb,
+                             queries=["safe query sk_live_12345678901234567890"], **mode)
+        assert db.list_memories(agent_id="alpha") == []
+        assert db.list_audit(action="import") == []
+        assert not (tmp_path / "remnant" / "shadow.log").exists()
         assert emb.calls == 0
     finally:
         db.close()

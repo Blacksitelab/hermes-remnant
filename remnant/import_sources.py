@@ -524,11 +524,25 @@ def import_hindsight(
     seen_hashes: set[str] = set()
     imported = 0
 
+    recalled_batches: list[tuple[str, list[dict[str, Any]]]] = []
     for q in qs:
-        stats["queries"] += 1
-        rows = _hindsight_recall(
+        reject_literal(q, field="import.query")
+        recalled_batches.append((q, _hindsight_recall(
             q, limit=HINDSIGHT_QUERY_LIMIT, bank_id=f"hermes-{actor}",
-        )
+        )))
+    # Preflight every recalled row before any write, including shadow output.
+    for q, rows in recalled_batches:
+        for row in rows:
+            content = _extract_content(row)
+            if content:
+                reject_literal(content, field="import.content")
+                reject_literal(
+                    {"hindsight_query": q, "content_hash": _content_hash(content)},
+                    field="import.metadata",
+                )
+
+    for q, rows in recalled_batches:
+        stats["queries"] += 1
         for row in rows:
             stats["recalled"] += 1
             content = _extract_content(row)
