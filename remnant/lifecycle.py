@@ -9,6 +9,7 @@ from .claims import _claim_parts
 from .config import RemnantConfig
 from .db import RemnantDB
 from .embed import Embedder
+from .secrets import is_locked_memory
 
 
 class MemoryLifecycle:
@@ -27,6 +28,8 @@ class MemoryLifecycle:
         visibility: str | None = None,
         session_id: str | None = None,
         action: str = "update",
+        expected_fingerprints: dict[str, str] | None = None,
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Prepare remote embedding, then atomically commit all local projections."""
         originals = [self.db.get_memory(memory_id) for memory_id in original_ids]
@@ -35,6 +38,8 @@ class MemoryLifecycle:
         rows = [memory for memory in originals if memory is not None]
         if agent_id is not None and any(row.get("agent") != agent_id for row in rows):
             raise PermissionError("memory is owned by another agent")
+        if any(is_locked_memory(row) for row in rows):
+            raise PermissionError("locked memory cannot be modified")
         first = rows[0]
         embedding = self.embedder.embed(content) if self.embedder is not None else None
         tags: list[str] = []
@@ -82,16 +87,34 @@ class MemoryLifecycle:
             claim_projection=claim_projection,
             actor=actor,
             action=action,
+            expected_fingerprints=expected_fingerprints,
+            operation_id=operation_id,
         )
 
-    def forget(self, memory_id: str, *, actor: str, agent_id: str | None) -> int:
+    def forget(
+        self,
+        memory_id: str,
+        *,
+        actor: str,
+        agent_id: str | None,
+        expected_fingerprint: str | None = None,
+        operation_id: str | None = None,
+    ) -> int:
         memory = self.db.get_memory(memory_id)
         if memory is None:
             raise KeyError(memory_id)
         if agent_id is not None and memory.get("agent") != agent_id:
             raise PermissionError("memory is owned by another agent")
+        if is_locked_memory(memory):
+            raise PermissionError("locked memory cannot be modified")
         return self.db.transition_memory_atomic(
-            memory_id, status="forgotten", actor=actor, action="forget"
+            memory_id,
+            status="forgotten",
+            actor=actor,
+            action="forget",
+            expected_fingerprint=expected_fingerprint,
+            operation_id=operation_id,
+            expected_agent=agent_id,
         )
 
     def visibility(
