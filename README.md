@@ -137,8 +137,7 @@ existing memory ownership. Runtime identity v2 also includes the profile. Older
 runtime identity v1 records remain preserved but require an explicit operator
 mapping before reuse. Configured-owner mode retains its existing keys.
 Keep a SQLite backup before updating: rolling back across schema 16 requires
-restoring that database backup along with the earlier code. Direct database
-Direct database access and operator maintenance commands remain administrative capabilities.
+restoring that database backup along with the earlier code. Direct database access and operator maintenance commands remain administrative capabilities.
 
 ### Hygiene report and reviewed apply
 

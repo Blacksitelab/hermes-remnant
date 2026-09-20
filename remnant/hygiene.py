@@ -1344,7 +1344,13 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+    try:
+        args = _parser().parse_args(argv)
+    except SystemExit as exc:
+        if exc.code == 0:
+            raise
+        print("hygiene: invalid arguments", file=sys.stderr)
+        return 2
     try:
         if args.command == "report":
             report = report_snapshot(args.db, args.agent)

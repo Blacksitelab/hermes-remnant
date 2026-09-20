@@ -156,10 +156,10 @@ def classify_text(text: str | None, *, location: str = "") -> list[SecretFinding
 
 def _safe_location(field: str) -> str:
     """Keep field hints useful without copying a literal into the hint."""
-    path = str(field or "value").replace("\r", "\\r").replace("\n", "\\n")
-    findings = [item for item in _literal_findings(path)]
+    path = str(field or "value")
+    findings = _literal_findings(path)
     if not findings:
-        return path
+        return path.replace("\r", "\\r").replace("\n", "\\n")
     parts: list[str] = []
     cursor = 0
     for finding in findings:
@@ -169,7 +169,7 @@ def _safe_location(field: str) -> str:
         parts.append("[REDACTED]")
         cursor = finding.end
     parts.append(path[cursor:])
-    return "".join(parts)
+    return "".join(parts).replace("\r", "\\r").replace("\n", "\\n")
 
 
 def _marker(finding: SecretFinding, field: str) -> str:
