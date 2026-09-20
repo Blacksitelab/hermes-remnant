@@ -20,7 +20,7 @@ import sqlite3
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 from .config import RemnantConfig
 from .db import SCHEMA_VERSION, MemoryConflictError, RemnantDB
@@ -1323,9 +1323,16 @@ apply_manifest = apply_hygiene
 write_hygiene_report = write_report
 
 
+class _SafeArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> NoReturn:
+        raise ValueError(message)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m remnant.hygiene")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = _SafeArgumentParser(prog="python -m remnant.hygiene")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=_SafeArgumentParser
+    )
     report = subparsers.add_parser("report")
     report.add_argument("--db", required=True)
     report.add_argument("--agent", required=True)
@@ -1346,6 +1353,9 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parser().parse_args(argv)
+    except ValueError:
+        print("hygiene: invalid arguments", file=sys.stderr)
+        return 2
     except SystemExit as exc:
         if exc.code == 0:
             raise

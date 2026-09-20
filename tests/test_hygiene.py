@@ -168,9 +168,11 @@ def test_invalid_cli_arguments_are_generic(capsys):
     assert main(
         ["report", "--db", "x", "--agent", f"Bearer {payload}", "--output", "x", "--unknown"]
     ) == 2
+    assert main(["report", "--db", "x", "--agent", "owner", "--output"]) == 2
+    assert main(["report"]) == 2
     captured = capsys.readouterr()
     assert payload not in captured.out + captured.err
-    assert captured.err.count("hygiene: invalid arguments") == 2
+    assert captured.err.count("hygiene: invalid arguments") == 4
 
 
 def test_report_is_read_only_redacted_and_secure(tmp_path: Path):
