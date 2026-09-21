@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -64,14 +65,20 @@ def _assert_rejection(exc, field):
 
 
 def _db_digest(db) -> str:
-    tables = db._conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' "
-        "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    conn = db._conn
+    objects = conn.execute(
+        "SELECT type, name, sql FROM sqlite_master "
+        "WHERE type IN ('table', 'index', 'trigger', 'view') ORDER BY type, name"
     ).fetchall()
-    snapshot = []
-    for (table,) in tables:
-        rows = db._conn.execute(f'SELECT * FROM "{table}"').fetchall()
-        snapshot.append((table, [tuple(row) for row in rows]))
+    snapshot = [tuple(row) for row in objects]
+    for (name,) in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+    ):
+        try:
+            rows = conn.execute(f'SELECT rowid, * FROM "{name}"').fetchall()
+        except sqlite3.OperationalError:
+            rows = conn.execute(f'SELECT * FROM "{name}"').fetchall()
+        snapshot.append((name, [tuple(row) for row in rows]))
     return hashlib.sha256(json.dumps(snapshot, default=str).encode()).hexdigest()
 
 
@@ -166,37 +173,58 @@ def test_memory_store_rejects_late_batch_without_side_effects(
     assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
 
 
-@pytest.mark.parametrize("bad_part", ("passage", "tags", "metadata", "title"))
+@pytest.mark.parametrize(
+    ("bad_part", "relative_path", "seed_index"),
+    (("passage", "Notes/late.md", 0), ("tags", "Tags/custom.md", 1),
+     ("metadata", "Nested/frontmatter.md", 2), ("title", "Titles/later.md", 3)),
+)
 def test_vault_rejects_late_content_without_mutating_seeded_state(
-    tmp_path: Path, bad_part: str, safe_literal: str
+    tmp_path: Path, bad_part: str, relative_path: str, seed_index: int,
+    safe_literal: str, monkeypatch
 ):
     vault = tmp_path / "vault"
-    note = vault / "Notes" / "seed.md"
+    note = vault / relative_path
     note.parent.mkdir(parents=True)
-    note.write_text("---\ntags: [safe]\n---\n# Seed\nordinary note", encoding="utf-8")
+    note.write_text("---\ntags: [safe, seeded]\ncustom:\n  nested: [one, two]\n---\n"
+                    "safe first passage\n\n## Second\nsafe second passage\n", encoding="utf-8")
     db = open_db(tmp_path / "db.sqlite")
     cfg = RemnantConfig(vault_path=str(vault))
     seed_emb = Embedder()
     try:
+        monkeypatch.setattr("remnant.vault.extract_and_link_entities", lambda *args, **kwargs: None)
         assert index_file(db, cfg, seed_emb, note)
+        db.set_state("trust", {"seed": 0.91}, agent_id="alpha")
+        db.set_state("seen", {"seed": 7}, agent_id="alpha")
+        db.put_cached_embedding("seed-model", "seed-hash", [0.25])
+        db.write_audit(actor="test", action="seed", memory_id=None, details={"seed": True})
+        db.insert_turn(
+            session_id="seed-session", agent_id="alpha", user_text="u", assistant_text="a"
+        )
         before = _db_digest(db)
         before_changes = db._conn.total_changes
         if bad_part == "passage":
-            body = f"# Seed\nordinary note\nlate value {safe_literal}"
-            frontmatter = "tags: [safe]"
+            body = f"safe first passage\n\n## Second\nlater value {safe_literal}"
+            frontmatter = "tags: [safe, seeded]\ncustom:\n  nested: [one, two]"
         elif bad_part == "tags":
-            body = "# Seed\nordinary note"
-            frontmatter = f"tags: [safe, {safe_literal}]"
+            body = "safe first passage\n\n## Second\nsafe second passage"
+            frontmatter = f"tags: [safe, {safe_literal}]\ncustom:\n  nested: [one, two]"
         elif bad_part == "metadata":
-            body = "# Seed\nordinary note"
-            frontmatter = f"nested:\n  value: {safe_literal}"
+            body = "safe first passage\n\n## Second\nsafe second passage"
+            frontmatter = f"tags: [safe, seeded]\ncustom:\n  nested: {safe_literal}"
         else:
-            body = f"# {safe_literal}\nordinary note"
-            frontmatter = "tags: [safe]"
+            body = "safe first passage\n\n## Second\nsafe second passage"
+            frontmatter = (
+                f"title: {safe_literal}\ntags: [safe, seeded]\n"
+                "custom:\n  nested: [one, two]"
+            )
         note.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
         emb = Embedder()
-        with pytest.raises(SecretLikeContentError):
+        with pytest.raises(SecretLikeContentError) as exc:
             index_file(db, cfg, emb, note)
+        expected_field = {"passage": "vault.content", "tags": "vault.tags[1]",
+                          "metadata": "vault.metadata.fm_custom.nested",
+                          "title": "vault.metadata.fm_title"}[bad_part]
+        _assert_rejection(exc, expected_field)
         assert _db_digest(db) == before
         assert db._conn.total_changes == before_changes
         assert emb.calls == 0
