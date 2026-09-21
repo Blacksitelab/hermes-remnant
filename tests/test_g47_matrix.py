@@ -66,7 +66,6 @@ def _assert_rejection(exc, field):
 
 
 def _assert_quiet(caplog, capsys):
-    caplog.set_level(logging.DEBUG)
     captured = capsys.readouterr()
     assert not caplog.records and not captured.out and not captured.err
 
@@ -92,6 +91,7 @@ def _db_digest(db) -> str:
 def test_memory_store_rejects_persisted_metadata_literal_before_output(
     tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
 ):
+    caplog.set_level(logging.DEBUG)
     import remnant.import_sources as sources
     extract = Mock(side_effect=AssertionError("entity extraction reached"))
     shadow = Mock(side_effect=AssertionError("shadow writer reached"))
@@ -125,6 +125,7 @@ def test_memory_store_rejects_persisted_metadata_literal_before_output(
 def test_hindsight_rejects_credential_like_query_before_side_effects(
     tmp_path: Path, import_mode, safe_literal, monkeypatch, caplog, capsys,
 ):
+    caplog.set_level(logging.DEBUG)
     import remnant.import_sources as sources
 
     calls = []
@@ -186,6 +187,7 @@ def test_vault_rejection_leaves_index_unchanged_and_skips_embedding(tmp_path: Pa
 def test_memory_store_rejects_late_batch_without_side_effects(
     tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
 ):
+    caplog.set_level(logging.DEBUG)
     import remnant.import_sources as sources
     extract = Mock(side_effect=AssertionError("entity extraction reached"))
     shadow = Mock(side_effect=AssertionError("shadow writer reached"))
@@ -245,10 +247,14 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
         assert len(passages) > 1
         seed_memory = db.get_memory(passages[0]["memory_id"])
         assert seed_memory and seed_memory["content"]
+        assert safe_literal not in seed_memory["content"]
         assert seed_memory["metadata"]
         db.set_memory_field(passages[0]["memory_id"], "trust_score", 0.91, actor="test")
         for _ in range(6):
             db.increment_seen_count(passages[0]["memory_id"])
+        seeded = db.get_memory(passages[0]["memory_id"])
+        assert seeded
+        assert seeded["trust_score"] == 0.91 and seeded["seen_count"] == 7
         db.put_cached_embedding("seed-model", "seed-hash", [0.25])
         db.write_audit(
             actor="test", action="seed", memory_id=passages[0]["memory_id"],
@@ -294,8 +300,14 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
         note.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
         assert len(body.split("\n\n", 1)[0]) > cfg.vault_passage_chars
         assert safe_literal not in body.split("\n\n", 1)[0]
+        from remnant.vault import _split_passages
+        split = _split_passages(body, cfg.vault_passage_chars, cfg.vault_passage_overlap)
+        assert split[0]["content"] and safe_literal not in split[0]["content"]
+        if bad_part in {"passage", "title"}:
+            assert any(safe_literal in passage["content"] for passage in split[1:])
         input_digest = hashlib.sha256(note.read_bytes()).hexdigest()
         emb = Embedder()
+        caplog.set_level(logging.DEBUG)
         with pytest.raises(SecretLikeContentError) as exc:
             index_file(db, cfg, emb, note)
         expected_field = {"passage": "vault.content", "tags": "vault.tags[1]",
@@ -308,7 +320,10 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
         with db.read() as cur:
             assert cur.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == before_embeddings
         assert hashlib.sha256(note.read_bytes()).hexdigest() == input_digest
-        assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
+        after = db.get_memory(passages[0]["memory_id"])
+        assert after and after["trust_score"] == 0.91 and after["seen_count"] == 7
+        captured = capsys.readouterr()
+        assert not caplog.records and not captured.out and not captured.err
     finally:
         db.close()
 
@@ -316,6 +331,7 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
 def test_hindsight_rejects_late_content_before_side_effects(
     tmp_path: Path, monkeypatch, import_mode, safe_literal, caplog, capsys
 ):
+    caplog.set_level(logging.DEBUG)
     import remnant.import_sources as sources
     extract = Mock(side_effect=AssertionError("entity extraction reached"))
     shadow = Mock(side_effect=AssertionError("shadow writer reached"))
@@ -343,6 +359,7 @@ def test_hindsight_rejects_late_content_before_side_effects(
 def test_hindsight_rejects_nested_recalled_metadata_before_side_effects(
     tmp_path: Path, monkeypatch, import_mode, safe_literal, caplog, capsys
 ):
+    caplog.set_level(logging.DEBUG)
     import remnant.import_sources as sources
 
     extract = Mock(side_effect=AssertionError("entity extraction reached"))
@@ -350,21 +367,21 @@ def test_hindsight_rejects_nested_recalled_metadata_before_side_effects(
     monkeypatch.setattr(sources, "extract_and_link_entities", extract)
     monkeypatch.setattr(sources, "write_shadow_log", shadow)
 
-    monkeypatch.setattr(
-        sources,
-        "_hindsight_recall",
-        lambda query, *, limit, bank_id: [
-            {"content": "safe earlier row"},
-            {"content": "safe", "metadata": {"outer": [{"value": safe_literal}]}}
-        ],
-    )
+    calls = []
+    def recall(query, *, limit, bank_id):
+        calls.append((query, bank_id, limit))
+        return ([{"content": "safe earlier row"}] if query == "safe" else
+                [{"content": "safe", "metadata": {"outer": [{"value": safe_literal}]}}])
+    monkeypatch.setattr(sources, "_hindsight_recall", recall)
     db, emb = _rejecting_db(), Embedder()
     with pytest.raises(SecretLikeContentError) as exc:
         import_hindsight(
-            db, RemnantConfig(agent_id="alpha"), emb, queries=["safe"],
+            db, RemnantConfig(agent_id="alpha"), emb, queries=["safe", "late"],
             hermes_home=tmp_path / "hermes", **import_mode
         )
     _assert_rejection(exc, "import.recalled_metadata.outer[0].value")
+    assert calls == [("safe", "hermes-alpha", sources.HINDSIGHT_QUERY_LIMIT),
+                     ("late", "hermes-alpha", sources.HINDSIGHT_QUERY_LIMIT)]
     assert extract.call_count == shadow.call_count == 0
     assert db.mock_calls == [] and emb.calls == 0
     assert not (tmp_path / "hermes" / "remnant" / "shadow.log").exists()
