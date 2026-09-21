@@ -92,11 +92,21 @@ def test_store_outcome_rejects_nested_and_whitespace_secrets(tmp_path: Path):
             ("authorization Bearer abc", None),
             ("safe", {"nested": {"token": "abc"}}),
             ("safe", [{"authorization": "Bearer abc"}]),
+            ("safe", {"nested": {"password": "abc"}}),
+            ("safe", {"nested": [{"token": "abc"}]}),
+            ("safe", {"nested": {"secret": "abc"}}),
+            ("safe", {"nested": {"bearer": "abc"}}),
+            ("safe", {"nested": {"authorization": "abc"}}),
         ]
         for fact, metadata in cases:
             with pytest.raises(ValueError, match="^outcome rejected$"):
-                store_outcome(db, config, operation_id="op-" + str(cases.index((fact, metadata))),
-                              fact=fact, metadata=metadata)
+                store_outcome(
+                    db,
+                    config,
+                    operation_id="op-" + str(cases.index((fact, metadata))),
+                    fact=fact,
+                    metadata=metadata,
+                )
         assert db.get_memory_operation(agent="owner", operation_id="op-0") is None
     finally:
         db.close()
@@ -114,5 +124,153 @@ def test_operation_insert_keeps_creation_audit_and_receipt(tmp_path: Path):
         assert receipt["memory_id"] == memory_id
         assert receipt["audit_id"] == audit[0]["id"]
         assert audit[0]["action"] == "create"
+    finally:
+        db.close()
+
+
+def _counts(db):
+    return tuple(
+        db._conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        for t in ("memories", "audit_log", "memory_operations")
+    )
+
+
+def test_outcome_receipt_survives_hard_delete_and_replay_is_missing(tmp_path: Path):
+    db = open_db(tmp_path / "missing.db")
+    try:
+        config = RemnantConfig(agent_id="owner")
+        result = store_outcome(db, config, operation_id="op", fact="durable fact")
+        assert db.hard_delete_memory(result["memory_id"])
+        before = _counts(db)
+        with pytest.raises(ValueError, match="^operation target missing$"):
+            store_outcome(db, config, operation_id="op", fact="durable fact")
+        assert _counts(db) == before
+    finally:
+        db.close()
+
+
+def test_outcome_replay_conflict_and_malformed_embedding_are_durable(tmp_path: Path):
+    db = open_db(tmp_path / "replay.db")
+    config = RemnantConfig(agent_id="owner")
+    try:
+        first = store_outcome(db, config, operation_id="op", fact="same", embedding=[1.0])
+        counts = _counts(db)
+        assert (
+            store_outcome(db, config, operation_id="op", fact="same", embedding=[1.0])["status"]
+            == "already_stored"
+        )
+        assert _counts(db) == counts
+        with pytest.raises(ValueError, match="^operation conflict$"):
+            store_outcome(db, config, operation_id="op", fact="different")
+        assert _counts(db) == counts
+        malformed = store_outcome(
+            db, config, operation_id="bad-embedding", fact="lexical", embedding=[float("nan")]
+        )
+        assert (
+            db._conn.execute(
+                "SELECT COUNT(*) FROM embeddings WHERE memory_id=?", (malformed["memory_id"],)
+            ).fetchone()[0]
+            == 0
+        )
+        assert first["memory_id"] != malformed["memory_id"]
+    finally:
+        db.close()
+
+
+def test_outcome_failure_rolls_back_and_retry_stores_once(tmp_path: Path, monkeypatch):
+    db = open_db(tmp_path / "rollback.db")
+    config = RemnantConfig(agent_id="owner")
+    try:
+        monkeypatch.setattr(
+            db, "_write_audit", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("injected"))
+        )
+        with pytest.raises(RuntimeError, match="injected"):
+            store_outcome(db, config, operation_id="op", fact="retry me")
+        assert _counts(db) == (0, 0, 0)
+        monkeypatch.undo()
+        assert store_outcome(db, config, operation_id="op", fact="retry me")["status"] == "stored"
+        assert _counts(db) == (1, 1, 1)
+    finally:
+        db.close()
+
+
+def test_memory_operations_migration_preserves_legacy_row(tmp_path: Path):
+    path = tmp_path / "migrate.db"
+    db = open_db(path)
+    try:
+        mid = db.insert_memory(content="legacy", agent="owner")
+        db._conn.execute("DROP TABLE memory_operations")
+        db._conn.execute(
+            "CREATE TABLE memory_operations("
+            "agent TEXT NOT NULL, operation_id TEXT NOT NULL, payload_hash TEXT NOT NULL, "
+            "memory_id TEXT NOT NULL, audit_id INTEGER NOT NULL, "
+            "PRIMARY KEY(agent, operation_id))"
+        )
+        db._conn.execute(
+            "INSERT INTO memory_operations VALUES('owner','legacy','hash',?,0)", (mid,)
+        )
+    finally:
+        db.close()
+    reopened = open_db(path)
+    try:
+        assert (
+            reopened.get_memory_operation(agent="owner", operation_id="legacy")["memory_id"] == mid
+        )
+        assert (
+            store_outcome(
+                reopened, RemnantConfig(agent_id="owner"), operation_id="new", fact="new"
+            )["status"]
+            == "stored"
+        )
+    finally:
+        reopened.close()
+
+
+def test_same_operation_id_isolated_by_owner_and_outcome_shape(tmp_path: Path):
+    db = open_db(tmp_path / "owners.db")
+    try:
+        a = store_outcome(
+            db, RemnantConfig(agent_id="a"), operation_id="same", fact="A", metadata={"k": "v"}
+        )
+        b = store_outcome(db, RemnantConfig(agent_id="b"), operation_id="same", fact="B")
+        assert a["memory_id"] != b["memory_id"]
+        row = db.get_memory(a["memory_id"])
+        assert {row[k] for k in ("agent", "visibility", "type", "source")} == {
+            "a",
+            "private",
+            "fact",
+            "conversation",
+        }
+        assert row["metadata"] == {"k": "v"}
+        for table in ("claims", "memory_entities", "relation_evidence"):
+            assert (
+                db._conn.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE memory_id=?", (a["memory_id"],)
+                ).fetchone()[0]
+                == 0
+            )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "password hunter2",
+        "token: abc",
+        "secret=abc",
+        "Bearer abc",
+        "authorization abc",
+        "sk-abcdefghijkl",
+        "https://user:pass@example.com",
+    ],
+)
+def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, value: str):
+    db = open_db(tmp_path / "secrets.db")
+    try:
+        with pytest.raises(ValueError, match="^outcome rejected$") as exc:
+            store_outcome(db, RemnantConfig(agent_id="owner"), operation_id="op", fact=value)
+        assert "sentinel" not in str(exc.value).lower()
+        assert _counts(db)[::2] == (0, 0)
     finally:
         db.close()
