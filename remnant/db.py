@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -526,6 +527,15 @@ CREATE TABLE IF NOT EXISTS operation_metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_operation_metrics_kind
     ON operation_metrics(operation, outcome, created_at);
+
+CREATE TABLE IF NOT EXISTS memory_operations (
+    agent TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    payload_hash TEXT NOT NULL,
+    memory_id TEXT NOT NULL,
+    audit_id INTEGER NOT NULL,
+    PRIMARY KEY(agent, operation_id)
+);
 
 -- Bounded, disposable historical-summary projections. Hermes state.db remains
 -- the transcript source of truth; these rows contain only validated summaries
@@ -1812,15 +1822,42 @@ class RemnantDB:
         content_hash: str | None = None,
         embedding: list[float] | None = None,
         embed_model: str | None = None,
+        operation_id: str | None = None,
     ) -> str:
         reject_literal(content, field="content")
         reject_literal(tags, field="tags")
         reject_literal(metadata, field="metadata")
         now = _now_iso()
         mid = _uuid()
+        actor = agent or "system"
+        payload_hash = None
+        if operation_id is not None:
+            if not str(operation_id).strip() or not agent:
+                raise ValueError("operation identity is invalid")
+            canonical = {"content": content, "source": source, "type": type,
+                         "visibility": visibility, "agent": agent, "source_id": source_id,
+                         "tags": tags or [], "metadata": metadata or {},
+                         "confidence": confidence, "trust_score": trust_score,
+                         "content_hash": content_hash}
+            payload_hash = hashlib.sha256(json.dumps(canonical, sort_keys=True,
+                separators=(",", ":"), default=str).encode()).hexdigest()
         tags_json = json.dumps(tags) if tags else None
         meta_json = json.dumps(metadata, default=str) if metadata else None
         with self.transaction() as cur:
+            if operation_id is not None:
+                receipt = cur.execute(
+                    "SELECT payload_hash,memory_id FROM memory_operations "
+                    "WHERE agent=? AND operation_id=?",
+                    (agent, operation_id),
+                ).fetchone()
+                if receipt is not None:
+                    if receipt["payload_hash"] != payload_hash:
+                        raise ValueError("operation conflict")
+                    if cur.execute(
+                        "SELECT 1 FROM memories WHERE id=?", (receipt["memory_id"],)
+                    ).fetchone() is None:
+                        raise ValueError("operation target missing")
+                    return str(receipt["memory_id"])
             cur.execute(
                 "INSERT INTO memories(id, type, content, source, source_id, agent, "
                 "visibility, timestamp, confidence, trust_score, verified, superseded_by, "
@@ -1840,7 +1877,28 @@ class RemnantDB:
                     "dimensions, created_at) VALUES(?,?,?,?,?)",
                     (mid, embed_model, blob, len(embedding), now),
                 )
+            if operation_id is not None:
+                audit_id = self._write_audit(
+                    cur,
+                    actor,
+                    "create",
+                    mid,
+                    {"source": source, "type": type, "operation_id": str(operation_id)},
+                )
+                cur.execute(
+                    "INSERT INTO memory_operations(agent,operation_id,payload_hash,"
+                    "memory_id,audit_id) VALUES(?,?,?,?,?)",
+                    (agent, operation_id, payload_hash, mid, audit_id),
+                )
             return mid
+
+    def get_memory_operation(self, *, agent: str, operation_id: str) -> dict[str, Any] | None:
+        with self.read() as cur:
+            row = cur.execute(
+                "SELECT * FROM memory_operations WHERE agent=? AND operation_id=?",
+                (agent, operation_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def replace_memories_atomic(
         self,
