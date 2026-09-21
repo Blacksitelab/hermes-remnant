@@ -183,14 +183,28 @@ def test_memory_store_rejects_late_batch_without_side_effects(
 )
 def test_vault_rejects_late_content_without_mutating_seeded_state(
     tmp_path: Path, bad_part: str, relative_path: str, seed_index: int,
-    safe_literal: str, caplog, capsys
+    safe_literal: str, caplog, capsys, monkeypatch
 ):
+    import remnant.vault as vault_module
+    from remnant.entity import resolve_and_link, seed_relations
+
+    def deterministic_entities(db, *, memory_id, text, typed_entities, agent_id, min_memories):
+        del typed_entities, min_memories
+        ids = [resolve_and_link(db, memory_id=memory_id, entity_name=name,
+                                entity_type="concept", agent_id=agent_id)[0]
+               for name in ("Alice", "Bob")]
+        seed_relations(db, memory_id=memory_id, entity_ids=ids, text=text)
+
+    monkeypatch.setattr(vault_module, "extract_and_link_entities", deterministic_entities)
     vault = tmp_path / "vault"
     note = vault / relative_path
     note.parent.mkdir(parents=True)
     safe_body = ("Alice and Bob discussed a harmless project note. "
                  "This deliberately contains enough ordinary text to create "
-                 "more than one passage in the configured vault index.\n\n"
+                 "more than one passage in the configured vault index. "
+                 "The first passage is safe and remains independent from the "
+                 "later validation boundary, with enough words to exceed the "
+                 "configured splitter limit without relying on incidental wrapping.\n\n"
                  "## Second\nCarol recorded another harmless fact for the seed.\n")
     note.write_text("---\ntags: [safe, seeded]\ncustom:\n  nested: [one, two]\n---\n"
                     + safe_body, encoding="utf-8")
@@ -199,20 +213,40 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
     seed_emb = Embedder()
     try:
         assert index_file(db, cfg, seed_emb, note)
-        assert len(db.get_vault_passages(relative_path, agent_id=cfg.agent_id)) > 1
-        db.set_state("trust", {"seed": 0.91}, agent_id="alpha")
-        db.set_state("seen", {"seed": 7}, agent_id="alpha")
+        passages = db.get_vault_passages(relative_path, agent_id=cfg.agent_id)
+        assert len(passages) > 1
+        seed_memory = db.get_memory(passages[0]["memory_id"])
+        assert seed_memory and seed_memory["content"]
+        assert seed_memory["metadata"]
+        db.set_memory_field(passages[0]["memory_id"], "trust_score", 0.91, actor="test")
+        for _ in range(6):
+            db.increment_seen_count(passages[0]["memory_id"])
         db.put_cached_embedding("seed-model", "seed-hash", [0.25])
-        db.write_audit(actor="test", action="seed", memory_id=None, details={"seed": True})
+        db.write_audit(
+            actor="test", action="seed", memory_id=passages[0]["memory_id"],
+            details={"seed": True},
+        )
         db.insert_turn(
             session_id="seed-session", agent_id="alpha", user_text="u", assistant_text="a"
         )
+        with db.read() as cur:
+            assert cur.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM embedding_cache").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM memory_entities").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM entities").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM relations").fetchone()[0] > 0
+            assert cur.execute("SELECT COUNT(*) FROM relation_evidence").fetchone()[0] > 0
         caplog.clear()
         before = _db_digest(db)
         before_changes = db._conn.total_changes
+        with db.read() as cur:
+            before_embeddings = cur.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0]
         if bad_part == "passage":
             body = (
-                "Alice and Bob discussed a harmless project note.\n\n"
+                "Alice and Bob discussed a harmless project note. "
+                "This safe first passage is intentionally longer than 128 characters so the "
+                "runtime literal cannot share its passage. More harmless words keep it stable.\n\n"
                 f"## Second\nlater value {safe_literal}"
             )
             frontmatter = "tags: [safe, seeded]\ncustom:\n  nested: [one, two]"
@@ -230,6 +264,8 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
                     f"# {safe_literal}\n")
             frontmatter = "tags: [safe, seeded]\ncustom:\n  nested: [one, two]"
         note.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+        assert len(body.split("\n\n", 1)[0]) > cfg.vault_passage_chars
+        assert safe_literal not in body.split("\n\n", 1)[0]
         input_digest = hashlib.sha256(note.read_bytes()).hexdigest()
         emb = Embedder()
         with pytest.raises(SecretLikeContentError) as exc:
@@ -241,6 +277,8 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
         assert _db_digest(db) == before
         assert db._conn.total_changes == before_changes
         assert emb.calls == 0
+        with db.read() as cur:
+            assert cur.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == before_embeddings
         assert hashlib.sha256(note.read_bytes()).hexdigest() == input_digest
         assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
     finally:
