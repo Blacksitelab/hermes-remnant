@@ -12,7 +12,7 @@ from remnant.config import RemnantConfig
 from remnant.db import RemnantDB, open_db
 from remnant.import_sources import import_hindsight, import_memory_store
 from remnant.ingest import store_memory
-from remnant.secrets import SecretLikeContentError
+from remnant.secrets import SecretLikeContentError, classify_text
 from remnant.vault import index_file
 
 
@@ -45,7 +45,7 @@ def import_mode(request):
 @pytest.fixture
 def safe_literal():
     value = "".join(("sk", "-", "p1fixture", "x" * 24))
-    assert value.startswith("sk-")
+    assert any(item.kind == "literal" for item in classify_text(value))
     return value
 
 
@@ -86,6 +86,10 @@ def test_memory_store_rejects_persisted_metadata_literal_before_output(
     tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
 ):
     import remnant.import_sources as sources
+    extract = Mock(side_effect=AssertionError("entity extraction reached"))
+    shadow = Mock(side_effect=AssertionError("shadow writer reached"))
+    monkeypatch.setattr(sources, "extract_and_link_entities", extract)
+    monkeypatch.setattr(sources, "write_shadow_log", shadow)
     safe_path = tmp_path / "profiles" / "alpha" / "MEMORY.md"
     synthetic_path = tmp_path / "profiles" / "alpha" / f"MEMORY-{safe_literal}.md"
     _profile(tmp_path, "- safe fact\n")
@@ -106,6 +110,7 @@ def test_memory_store_rejects_persisted_metadata_literal_before_output(
     _assert_rejection(exc, "import.metadata.imported_from")
     assert calls == 2
     assert db.mock_calls == [] and emb.calls == 0
+    assert extract.call_count == shadow.call_count == 0
     assert not (tmp_path / "remnant" / "shadow.log").exists()
     captured = capsys.readouterr()
     assert not caplog.records and not captured.out and not captured.err
