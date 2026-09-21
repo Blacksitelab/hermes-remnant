@@ -9,8 +9,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import math
 import os
 import re
@@ -1845,10 +1845,18 @@ class RemnantDB:
         meta_json = json.dumps(metadata, default=str) if metadata else None
         with self.transaction() as cur:
             if operation_id is not None:
-                receipt = cur.execute("SELECT payload_hash,memory_id FROM memory_operations WHERE agent=? AND operation_id=?", (agent, operation_id)).fetchone()
+                receipt = cur.execute(
+                    "SELECT payload_hash,memory_id FROM memory_operations "
+                    "WHERE agent=? AND operation_id=?",
+                    (agent, operation_id),
+                ).fetchone()
                 if receipt is not None:
                     if receipt["payload_hash"] != payload_hash:
                         raise ValueError("operation conflict")
+                    if cur.execute(
+                        "SELECT 1 FROM memories WHERE id=?", (receipt["memory_id"],)
+                    ).fetchone() is None:
+                        raise ValueError("operation target missing")
                     return str(receipt["memory_id"])
             cur.execute(
                 "INSERT INTO memories(id, type, content, source, source_id, agent, "
@@ -1869,16 +1877,31 @@ class RemnantDB:
                     "dimensions, created_at) VALUES(?,?,?,?,?)",
                     (mid, embed_model, blob, len(embedding), now),
                 )
-            audit_id = self._write_audit(cur, actor, "create", mid,
-                {"source": source, "type": type, **({"operation_id": str(operation_id)} if operation_id else {})})
+            audit_id = self._write_audit(
+                cur,
+                actor,
+                "create",
+                mid,
+                {
+                    "source": source,
+                    "type": type,
+                    **({"operation_id": str(operation_id)} if operation_id else {}),
+                },
+            )
             if operation_id is not None:
-                cur.execute("INSERT INTO memory_operations(agent,operation_id,payload_hash,memory_id,audit_id) VALUES(?,?,?,?,?)",
-                            (agent, operation_id, payload_hash, mid, audit_id))
+                cur.execute(
+                    "INSERT INTO memory_operations(agent,operation_id,payload_hash,"
+                    "memory_id,audit_id) VALUES(?,?,?,?,?)",
+                    (agent, operation_id, payload_hash, mid, audit_id),
+                )
             return mid
 
     def get_memory_operation(self, *, agent: str, operation_id: str) -> dict[str, Any] | None:
         with self.read() as cur:
-            row = cur.execute("SELECT * FROM memory_operations WHERE agent=? AND operation_id=?", (agent, operation_id)).fetchone()
+            row = cur.execute(
+                "SELECT * FROM memory_operations WHERE agent=? AND operation_id=?",
+                (agent, operation_id),
+            ).fetchone()
         return dict(row) if row is not None else None
 
     def replace_memories_atomic(

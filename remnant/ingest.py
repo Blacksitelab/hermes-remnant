@@ -23,7 +23,12 @@ from .entity import link_memory_entities
 from .secrets import reject_literal
 
 log = logging.getLogger("remnant.ingest")
-_OUTCOME_SECRET_RE = re.compile(r"(?i)(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+|sk-[A-Za-z0-9_-]{12,}")
+_OUTCOME_SECRET_RE = re.compile(
+    r"(?i)(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+"
+    r"|(?:authorization|bearer)\s*[:=]\s*\S+"
+    r"|https?://[^\s/@]+:[^\s/@]+@"
+    r"|sk-[A-Za-z0-9_-]{12,}"
+)
 
 # Transient-state detector. Rejects facts containing:
 #   - percentages ("32%", "percent")
@@ -445,9 +450,23 @@ def store_outcome(db: RemnantDB, config: RemnantConfig, *, operation_id: str,
     if _OUTCOME_SECRET_RE.search(fact) or _OUTCOME_SECRET_RE.search(str(metadata or "")):
         raise ValueError("outcome rejected")
     prior = db.get_memory_operation(agent=owner, operation_id=operation_id)
-    mid = db.insert_memory(content=fact, source="conversation", agent=owner,
-        visibility="private", type="fact", metadata=metadata or {}, embedding=embedding,
-        embed_model=embed_model or getattr(config, "embed_model", None), operation_id=operation_id)
+    try:
+        mid = db.insert_memory(
+            content=fact, source="conversation", agent=owner,
+            visibility="private", type="fact", metadata=metadata or {},
+            embedding=embedding,
+            embed_model=embed_model or getattr(config, "embed_model", None),
+            operation_id=operation_id,
+        )
+    except (TypeError, ValueError, OverflowError):
+        if embedding is None:
+            raise
+        mid = db.insert_memory(
+            content=fact, source="conversation", agent=owner,
+            visibility="private", type="fact", metadata=metadata or {}, embedding=None,
+            embed_model=embed_model or getattr(config, "embed_model", None),
+            operation_id=operation_id,
+        )
     receipt = db.get_memory_operation(agent=owner, operation_id=operation_id)
     return {"status": "already_stored" if prior else "stored", "memory_id": mid,
             "audit_id": int(receipt["audit_id"])}
