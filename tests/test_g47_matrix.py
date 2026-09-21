@@ -82,18 +82,20 @@ def _db_digest(db) -> str:
     return hashlib.sha256(json.dumps(snapshot, default=str).encode()).hexdigest()
 
 
-def test_memory_store_rejects_persisted_literal_before_output(
+def test_memory_store_rejects_persisted_metadata_literal_before_output(
     tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
 ):
-    _profile(tmp_path, f"- safe fact\n- {safe_literal}\n")
     import remnant.import_sources as sources
-    original = sources.discover_memory_store_entries
+    safe_path = tmp_path / "profiles" / "alpha" / "MEMORY.md"
+    synthetic_path = tmp_path / "profiles" / "alpha" / f"MEMORY-{safe_literal}.md"
+    _profile(tmp_path, "- safe fact\n")
     calls = 0
 
     def discover(home):
         nonlocal calls
         calls += 1
-        yield from original(home)
+        path = safe_path if calls == 1 else synthetic_path
+        yield "alpha", str(path), "- safe fact"
 
     monkeypatch.setattr(sources, "discover_memory_store_entries", discover)
     db, emb = _rejecting_db(), Embedder()
@@ -101,11 +103,12 @@ def test_memory_store_rejects_persisted_literal_before_output(
         import_memory_store(
             db, RemnantConfig(agent_id="alpha"), emb, tmp_path, **import_mode
         )
-    _assert_rejection(exc, "import.content")
-    assert calls == 1
+    _assert_rejection(exc, "import.metadata.imported_from")
+    assert calls == 2
     assert db.mock_calls == [] and emb.calls == 0
     assert not (tmp_path / "remnant" / "shadow.log").exists()
-    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
+    captured = capsys.readouterr()
+    assert not caplog.records and not captured.out and not captured.err
 
 
 def test_hindsight_rejects_credential_like_query_before_side_effects(
