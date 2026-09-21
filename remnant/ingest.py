@@ -24,11 +24,27 @@ from .secrets import reject_literal
 
 log = logging.getLogger("remnant.ingest")
 _OUTCOME_SECRET_RE = re.compile(
-    r"(?i)(?:api[_ -]?key|token|password|secret)\s*[:=]\s*\S+"
-    r"|(?:authorization|bearer)\s*[:=]\s*\S+"
+    r"(?i)(?:api[_ -]?key|token|password|secret|authorization|bearer)"
+    r"(?:\s*[:=]\s*|\s+)\S+"
     r"|https?://[^\s/@]+:[^\s/@]+@"
     r"|sk-[A-Za-z0-9_-]{12,}"
 )
+_OUTCOME_SECRET_KEYS = re.compile(
+    r"(?i)^(?:api[_ -]?key|token|password|secret|authorization|bearer)$"
+)
+
+
+def _outcome_contains_secret(value: Any) -> bool:
+    """Inspect outcome inputs without stringifying structured metadata."""
+    if isinstance(value, dict):
+        return any(
+            _OUTCOME_SECRET_KEYS.fullmatch(str(key)) is not None
+            or _outcome_contains_secret(item)
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple, set)):
+        return any(_outcome_contains_secret(item) for item in value)
+    return isinstance(value, str) and bool(_OUTCOME_SECRET_RE.search(value))
 
 # Transient-state detector. Rejects facts containing:
 #   - percentages ("32%", "percent")
@@ -447,7 +463,7 @@ def store_outcome(db: RemnantDB, config: RemnantConfig, *, operation_id: str,
     fact = str(fact or "").strip()
     if not owner or not operation_id or not fact:
         raise ValueError("invalid outcome")
-    if _OUTCOME_SECRET_RE.search(fact) or _OUTCOME_SECRET_RE.search(str(metadata or "")):
+    if _outcome_contains_secret(fact) or _outcome_contains_secret(metadata or {}):
         raise ValueError("outcome rejected")
     prior = db.get_memory_operation(agent=owner, operation_id=operation_id)
     try:

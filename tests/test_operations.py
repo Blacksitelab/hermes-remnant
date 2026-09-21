@@ -6,6 +6,7 @@ import pytest
 
 from remnant.config import RemnantConfig
 from remnant.db import open_db
+from remnant.ingest import store_outcome
 from remnant.maintenance import (
     availability_report,
     backup_database,
@@ -80,3 +81,22 @@ def test_availability_distinguishes_degraded_and_unavailable(tmp_path: Path):
     unavailable = availability_report(db_path=tmp_path / "missing" / "nested" / "db.sqlite")
     assert unavailable["available"] is False
     assert unavailable["status"] == "unavailable"
+
+
+def test_store_outcome_rejects_nested_and_whitespace_secrets(tmp_path: Path):
+    db = open_db(tmp_path / "outcomes.db")
+    config = RemnantConfig(agent_id="owner")
+    try:
+        cases = [
+            ("password hunter2", None),
+            ("authorization Bearer abc", None),
+            ("safe", {"nested": {"token": "abc"}}),
+            ("safe", [{"authorization": "Bearer abc"}]),
+        ]
+        for fact, metadata in cases:
+            with pytest.raises(ValueError, match="^outcome rejected$"):
+                store_outcome(db, config, operation_id="op-" + str(cases.index((fact, metadata))),
+                              fact=fact, metadata=metadata)
+        assert db.get_memory_operation(agent="owner", operation_id="op-0") is None
+    finally:
+        db.close()
