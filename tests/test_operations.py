@@ -303,17 +303,31 @@ def test_same_operation_id_isolated_by_owner_and_outcome_shape(tmp_path: Path):
 
 
 _SECRET_FORMS = [
-    f"{keyword}{separator}{value}"
+    (f"{keyword}-{separator or 'space'}", f"{keyword}{separator}{value}")
     for keyword in ("password", "token", "secret", "bearer", "authorization")
     for separator, value in ((" ", "hunter2"), (":", "abc"), ("=", "abc"))
-] + ["sk-abcdefghijkl", "https://u:p@example.com"]
+] + [("sk-redaction", "sk-abcdefghijkl"), ("url-credential", "https://u:p@example.com")]
+
+
+@pytest.mark.parametrize("label,fact", _SECRET_FORMS, ids=lambda case: case[0])
+def test_direct_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, label: str, fact: str):
+    db = open_db(tmp_path / "direct-secrets.db")
+    try:
+        with pytest.raises(ValueError, match="^outcome rejected$") as exc:
+            store_outcome(db, RemnantConfig(agent_id="owner"), operation_id="op", fact=fact)
+        assert "sentinel" not in str(exc.value).lower()
+        assert _counts(db) == (0, 0, 0)
+        assert db._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(
-    "fact,metadata",
-    [("safe", {"context": {"value": value}}) for value in _SECRET_FORMS],
+    "label,value",
+    _SECRET_FORMS,
+    ids=lambda case: case[0],
 )
-def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, fact: str, metadata: dict):
+def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, label: str, value: str):
     db = open_db(tmp_path / "secrets.db")
     try:
         with pytest.raises(ValueError, match="^outcome rejected$") as exc:
@@ -321,8 +335,8 @@ def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, fact: str,
                 db,
                 RemnantConfig(agent_id="owner"),
                 operation_id="op",
-                fact=fact,
-                metadata=metadata,
+                fact="safe",
+                metadata={"context": {"value": value}},
             )
         assert "sentinel" not in str(exc.value).lower()
         assert _counts(db) == (0, 0, 0)
