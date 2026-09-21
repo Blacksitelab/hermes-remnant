@@ -100,3 +100,19 @@ def test_store_outcome_rejects_nested_and_whitespace_secrets(tmp_path: Path):
         assert db.get_memory_operation(agent="owner", operation_id="op-0") is None
     finally:
         db.close()
+
+
+def test_operation_insert_keeps_creation_audit_and_receipt(tmp_path: Path):
+    db = open_db(tmp_path / "operation-audit.db")
+    try:
+        memory_id = db.insert_memory(
+            content="durable outcome", agent="owner", operation_id="op-audit"
+        )
+        receipt = db.get_memory_operation(agent="owner", operation_id="op-audit")
+        audit = db.list_audit()
+        assert receipt is not None
+        assert receipt["memory_id"] == memory_id
+        assert receipt["audit_id"] == audit[0]["id"]
+        assert audit[0]["action"] == "create"
+    finally:
+        db.close()

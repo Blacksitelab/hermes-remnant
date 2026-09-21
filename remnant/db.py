@@ -1877,18 +1877,14 @@ class RemnantDB:
                     "dimensions, created_at) VALUES(?,?,?,?,?)",
                     (mid, embed_model, blob, len(embedding), now),
                 )
-            audit_id = self._write_audit(
-                cur,
-                actor,
-                "create",
-                mid,
-                {
-                    "source": source,
-                    "type": type,
-                    **({"operation_id": str(operation_id)} if operation_id else {}),
-                },
-            )
             if operation_id is not None:
+                audit_id = self._write_audit(
+                    cur,
+                    actor,
+                    "create",
+                    mid,
+                    {"source": source, "type": type, "operation_id": str(operation_id)},
+                )
                 cur.execute(
                     "INSERT INTO memory_operations(agent,operation_id,payload_hash,"
                     "memory_id,audit_id) VALUES(?,?,?,?,?)",
