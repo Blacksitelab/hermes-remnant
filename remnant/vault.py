@@ -30,6 +30,7 @@ from .db import RemnantDB
 from .embed import Embedder
 from .entity import extract_and_link_entities
 from .scope import path_in_profile_scope
+from .secrets import reject_literal
 
 log = logging.getLogger("remnant.vault")
 
@@ -355,6 +356,22 @@ def index_file(
     locked = bool(frontmatter.get("locked"))
     if locked:
         metadata["locked"] = True
+
+    # Validate the complete note before touching embeddings or any index rows.
+    reject_literal(tags, field="vault.tags")
+    reject_literal(metadata, field="vault.metadata")
+    for ordinal, passage in enumerate(passages):
+        passage_metadata = {
+            **metadata,
+            "title": title,
+            "parent_vault_path": rel,
+            "passage_ordinal": ordinal,
+            "heading_path": passage["heading_path"],
+            "start_offset": passage["start"],
+            "end_offset": passage["end"],
+        }
+        reject_literal(passage["content"], field="vault.content")
+        reject_literal(passage_metadata, field="vault.metadata")
 
     embed_model = getattr(embedder, "_model", None) if embedder else None
     existing_passages = {p["ordinal"]: p["memory_id"] for p in db.get_vault_passages(

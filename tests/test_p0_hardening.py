@@ -12,6 +12,7 @@ from remnant.config import RemnantConfig
 from remnant.db import default_db_path, open_db
 from remnant.dream import night_dream
 from remnant.extract import ExtractionWorker
+from remnant.ingest import store_memory
 from remnant.llm import chat
 from remnant.search import search
 from remnant.vault import index_vault
@@ -19,6 +20,31 @@ from remnant.vault import index_vault
 
 def _db():
     return open_db(default_db_path())
+
+
+class _CountingEmbedder:
+    _model = "test"
+    calls = 0
+
+    def embed(self, _text):
+        self.calls += 1
+        return [1.0]
+
+
+def test_store_memory_rejects_derived_metadata_before_dedup_or_embedding(tmp_path):
+    db = open_db(tmp_path / "ingest.db")
+    embedder = _CountingEmbedder()
+    try:
+        with pytest.raises(ValueError):
+            store_memory(
+                db, embedder, RemnantConfig(), fact="safe fact", entity="safe",
+                session_id="AbCdEfGhIjKlMnOp12/ZaYbXcWd34/QrStUvWx56",
+                agent_id="agent",
+            )
+        assert embedder.calls == 0
+        assert db.list_memories(agent_id="agent") == []
+    finally:
+        db.close()
 
 
 def test_configured_profile_scope_cannot_be_disabled_by_empty_request():
@@ -263,3 +289,25 @@ def test_llm_adapter_adds_extraction_controls_per_protocol():
     assert "options" not in openai
     assert "format" not in openai
     assert "num_ctx" not in openai
+
+
+def test_derived_session_rejection_preserves_duplicate_state(tmp_path):
+    db = open_db(tmp_path / "ingest.db")
+    embedder = _CountingEmbedder()
+    try:
+        mid = store_memory(
+            db, embedder, RemnantConfig(), fact="stable fact", entity="stable",
+            session_id="safe-session", agent_id="agent",
+        )
+        before = db.get_memory(mid)
+        with pytest.raises(ValueError):
+            store_memory(
+                db, embedder, RemnantConfig(), fact="stable fact", entity="stable",
+                session_id="AbCdEfGhIjKlMnOp12/ZaYbXcWd34/QrStUvWx56",
+                agent_id="agent",
+            )
+        after = db.get_memory(mid)
+        assert after["seen_count"] == before["seen_count"]
+        assert embedder.calls == 1
+    finally:
+        db.close()

@@ -12,7 +12,7 @@ import logging
 from typing import Any
 
 from .config import RemnantConfig
-from .db import RemnantDB
+from .db import MemoryConflictError, RemnantDB
 from .embed import Embedder
 from .lifecycle import MemoryLifecycle
 
@@ -34,7 +34,7 @@ _VISIBILITY_TRANSITIONS = {
 def memory_edit(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     action: str,
     actor: str,
@@ -45,6 +45,9 @@ def memory_edit(
     feedback: str | None = None,
     agent_id: str | None = None,
     session_id: str | None = None,
+    expected_fingerprint: str | None = None,
+    expected_fingerprints: dict[str, str] | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     """Dispatch a `memory_edit` action. Returns a result dict.
 
@@ -62,6 +65,13 @@ def memory_edit(
     action = (action or "").strip().lower()
     if action not in _ACTIONS:
         return {"error": f"unknown action: {action}"}
+    workflow = {}
+    if action in {"update", "merge", "forget"}:
+        workflow = {
+            "expected_fingerprint": expected_fingerprint,
+            "expected_fingerprints": expected_fingerprints,
+            "operation_id": operation_id,
+        }
     return _ACTIONS[action](
         db,
         config,
@@ -74,13 +84,14 @@ def memory_edit(
         feedback=feedback,
         agent_id=agent_id,
         session_id=session_id,
+        **workflow,
     )
 
 
 def _do_update(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,
@@ -90,6 +101,9 @@ def _do_update(
     feedback: str | None,
     agent_id: str | None,
     session_id: str | None,
+    expected_fingerprint: str | None = None,
+    expected_fingerprints: dict[str, str] | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     if not memory_id:
         return {"error": "memory_id is required for update"}
@@ -110,8 +124,12 @@ def _do_update(
             visibility=visibility,
             session_id=session_id,
             action="update",
+            expected_fingerprints=expected_fingerprints or (
+                {memory_id: expected_fingerprint} if expected_fingerprint else None
+            ),
+            operation_id=operation_id,
         )
-    except (KeyError, PermissionError, ValueError) as exc:
+    except (KeyError, MemoryConflictError, PermissionError, ValueError) as exc:
         return {"error": str(exc)}
     return {**result, "superseded_id": memory_id}
 
@@ -119,7 +137,7 @@ def _do_update(
 def _do_merge(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,
@@ -129,6 +147,9 @@ def _do_merge(
     feedback: str | None,
     agent_id: str | None,
     session_id: str | None,
+    expected_fingerprint: str | None = None,
+    expected_fingerprints: dict[str, str] | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     ids = list(memory_ids or [])
     if memory_id and memory_id not in ids:
@@ -156,8 +177,12 @@ def _do_merge(
             visibility=visibility,
             session_id=session_id,
             action="merge",
+            expected_fingerprints=expected_fingerprints or (
+                {memory_id: expected_fingerprint} if memory_id and expected_fingerprint else None
+            ),
+            operation_id=operation_id,
         )
-    except (KeyError, PermissionError, ValueError) as exc:
+    except (KeyError, MemoryConflictError, PermissionError, ValueError) as exc:
         return {"error": str(exc)}
     return {**result, "superseded_ids": ids}
 
@@ -165,7 +190,7 @@ def _do_merge(
 def _do_forget(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,
@@ -175,6 +200,9 @@ def _do_forget(
     feedback: str | None,
     agent_id: str | None,
     session_id: str | None,
+    expected_fingerprint: str | None = None,
+    expected_fingerprints: dict[str, str] | None = None,
+    operation_id: str | None = None,
 ) -> dict[str, Any]:
     if not memory_id:
         return {"error": "memory_id is required for forget"}
@@ -183,16 +211,23 @@ def _do_forget(
         return {"error": f"memory not found: {memory_id}"}
     if not _can_mutate(before, agent_id):
         return {"error": "memory is owned by another agent"}
-    audit_id = MemoryLifecycle(db, config, embedder).forget(
-        memory_id, actor=actor, agent_id=agent_id
-    )
+    try:
+        audit_id = MemoryLifecycle(db, config, embedder).forget(
+            memory_id,
+            actor=actor,
+            agent_id=agent_id,
+            expected_fingerprint=expected_fingerprint,
+            operation_id=operation_id,
+        )
+    except (KeyError, MemoryConflictError, PermissionError, ValueError) as exc:
+        return {"error": str(exc)}
     return {"memory_id": memory_id, "status": "forgotten", "audit_id": audit_id}
 
 
 def _do_feedback(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,
@@ -239,7 +274,7 @@ def _do_feedback(
 def _do_visibility(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     action: str,
     actor: str,
@@ -268,7 +303,7 @@ def _do_visibility(
 def _do_share(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,
@@ -289,7 +324,7 @@ def _do_share(
 def _do_unshare(
     db: RemnantDB,
     config: RemnantConfig,
-    embedder: Embedder,
+    embedder: Embedder | None,
     *,
     actor: str,
     memory_id: str | None,

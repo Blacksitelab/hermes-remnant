@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .scope import VISIBILITY_ORDER, normalize_profile_scope, path_in_profile_scope
+from .secrets import is_locked_memory, memory_fingerprint, redact_value, reject_literal
 
 SCHEMA_VERSION = 18
 HISTORY_SUMMARY_ROW_CAP = 1_000
@@ -678,6 +679,10 @@ def _now_iso() -> str:
 
 def _uuid() -> str:
     return str(uuid.uuid4())
+
+
+class MemoryConflictError(RuntimeError):
+    """The row changed after an approval/report fingerprint was captured."""
 
 
 class RemnantDB:
@@ -1808,6 +1813,9 @@ class RemnantDB:
         embedding: list[float] | None = None,
         embed_model: str | None = None,
     ) -> str:
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
         now = _now_iso()
         mid = _uuid()
         tags_json = json.dumps(tags) if tags else None
@@ -1852,8 +1860,14 @@ class RemnantDB:
         claim_projection: dict[str, Any] | None,
         actor: str,
         action: str,
+        expected_fingerprints: dict[str, str] | None = None,
+        operation_id: str | None = None,
     ) -> dict[str, Any]:
         """Create a replacement and supersede originals in one transaction."""
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
+        reject_literal(claim_projection, field="claim_projection")
         if not original_ids:
             raise ValueError("at least one original memory is required")
         now = _now_iso()
@@ -1863,13 +1877,23 @@ class RemnantDB:
         with self.transaction() as cur:
             placeholders = ",".join("?" for _ in original_ids)
             cur.execute(
-                f"SELECT id, content, agent, visibility, status, trust_score, tags "
-                f"FROM memories WHERE id IN ({placeholders})",
+                f"SELECT * FROM memories WHERE id IN ({placeholders})",
                 original_ids,
             )
             originals = [dict(row) for row in cur.fetchall()]
             if {row["id"] for row in originals} != set(original_ids):
                 raise KeyError("one or more original memories do not exist")
+            if len(originals) != len(original_ids):
+                raise ValueError("duplicate original memory ids are not allowed")
+            if agent is not None and any(row["agent"] != agent for row in originals):
+                raise PermissionError("memory is owned by another agent")
+            if any(is_locked_memory(row) for row in originals):
+                raise PermissionError("locked memory cannot be modified")
+            if expected_fingerprints is not None:
+                for row in originals:
+                    expected = expected_fingerprints.get(str(row["id"]))
+                    if expected is None or expected != memory_fingerprint(row):
+                        raise MemoryConflictError("memory changed since report")
             if any(row["status"] != "active" for row in originals):
                 raise ValueError("all original memories must be active")
             cur.execute(
@@ -1980,6 +2004,7 @@ class RemnantDB:
                     "before": snapshots[0] if len(snapshots) == 1 else snapshots,
                     "after_id": new_id,
                     "merged_from": original_ids if len(original_ids) > 1 else None,
+                    **({"operation_id": operation_id} if operation_id else {}),
                 },
             )
         return {"memory_id": new_id, "claim_id": new_claim_id, "audit_id": audit_id}
@@ -1992,6 +2017,9 @@ class RemnantDB:
         visibility: str | None = None,
         actor: str,
         action: str,
+        expected_fingerprint: str | None = None,
+        operation_id: str | None = None,
+        expected_agent: str | None = None,
     ) -> int:
         """Atomically transition memory, claims, relation evidence, and audit."""
         if status is None and visibility is None:
@@ -2002,6 +2030,15 @@ class RemnantDB:
             before = cur.fetchone()
             if before is None:
                 raise KeyError(memory_id)
+            before_dict = dict(before)
+            if expected_agent is not None and before_dict.get("agent") != expected_agent:
+                raise PermissionError("memory is owned by another agent")
+            if is_locked_memory(before_dict):
+                raise PermissionError("locked memory cannot be modified")
+            if expected_fingerprint is not None and (
+                expected_fingerprint != memory_fingerprint(before_dict)
+            ):
+                raise MemoryConflictError("memory changed since report")
             if status is not None:
                 cur.execute(
                     "UPDATE memories SET status=?, updated_at=? WHERE id=?",
@@ -2045,6 +2082,7 @@ class RemnantDB:
                     "before_visibility": before["visibility"],
                     "after_visibility": visibility or before["visibility"],
                     "after": visibility or before["visibility"],
+                    **({"operation_id": operation_id} if operation_id else {}),
                 },
             )
 
@@ -3099,6 +3137,9 @@ class RemnantDB:
         """
         import hashlib
 
+        reject_literal(content, field="content")
+        reject_literal(tags, field="tags")
+        reject_literal(metadata, field="metadata")
         before = self.get_memory(memory_id)
         if before is None:
             raise KeyError(memory_id)
@@ -3162,6 +3203,8 @@ class RemnantDB:
         }
         if field not in allowed:
             raise ValueError(f"field not mutable: {field}")
+        if field in {"content", "tags", "metadata"}:
+            reject_literal(value, field=field)
         before = self.get_memory(memory_id)
         if before is None:
             raise KeyError(memory_id)
@@ -3203,7 +3246,7 @@ class RemnantDB:
         cur.execute(
             "INSERT INTO audit_log(actor, action, memory_id, details, created_at) "
             "VALUES(?,?,?,?,?)",
-            (actor, action, memory_id, json.dumps(details, default=str), _now_iso()),
+            (actor, action, memory_id, json.dumps(redact_value(details), default=str), _now_iso()),
         )
         return int(cur.lastrowid)
 
@@ -3899,6 +3942,7 @@ def open_db(db_path: str | Path) -> RemnantDB:
 
 __all__ = [
     "RemnantDB",
+    "MemoryConflictError",
     "open_db",
     "default_db_path",
     "DEFAULT_DB_HOME",

@@ -42,6 +42,7 @@ from .db import RemnantDB
 from .embed import Embedder
 from .entity import extract_and_link_entities
 from .ingest import is_transient
+from .secrets import reject_literal
 
 log = logging.getLogger("remnant.import_sources")
 
@@ -320,6 +321,15 @@ def import_memory_store(
     actor = config.agent_id
 
     source_profile = source_profile_name(hermes_home, config.agent_id)
+    # Preflight the complete batch so a late rejection cannot leave earlier
+    # entries persisted.  This also keeps dry-run/shadow rejection atomic.
+    for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
+        if prof != (profile or source_profile):
+            continue
+        for entry in parse_memory_file(raw_line):
+            if entry.strip():
+                reject_literal(entry, field="import.content")
+                reject_literal({"imported_from": fpath, "profile": prof}, field="import.metadata")
     for prof, fpath, raw_line in discover_memory_store_entries(hermes_home):
         if prof != (profile or source_profile):
             continue
@@ -337,6 +347,13 @@ def import_memory_store(
             vis = classify_visibility(entry, agent=prof)
             stats["visibility"][vis] += 1
             chash = _content_hash(entry)
+            meta: dict[str, Any] = {
+                "imported_from": fpath,
+                "profile": prof,
+                "content_hash": chash,
+            }
+            reject_literal(entry, field="import.content")
+            reject_literal(meta, field="import.metadata")
             existing = db.get_memory_by_content_hash(chash, agent_id=actor)
             duplicate = existing is not None
             if not duplicate and not dry_run and not shadow:
@@ -381,11 +398,6 @@ def import_memory_store(
 
             embedding = embedder.embed(entry) if embedder else None
             embed_model = getattr(embedder, "_model", None) if embedder else None
-            meta: dict[str, Any] = {
-                "imported_from": fpath,
-                "profile": prof,
-                "content_hash": chash,
-            }
             mid = db.insert_memory(
                 content=entry,
                 source="import",
@@ -512,11 +524,26 @@ def import_hindsight(
     seen_hashes: set[str] = set()
     imported = 0
 
+    recalled_batches: list[tuple[str, list[dict[str, Any]]]] = []
     for q in qs:
-        stats["queries"] += 1
-        rows = _hindsight_recall(
+        reject_literal(q, field="import.query")
+        recalled_batches.append((q, _hindsight_recall(
             q, limit=HINDSIGHT_QUERY_LIMIT, bank_id=f"hermes-{actor}",
-        )
+        )))
+    # Preflight every recalled row before any write, including shadow output.
+    for q, rows in recalled_batches:
+        for row in rows:
+            reject_literal(row.get("metadata"), field="import.recalled_metadata")
+            content = _extract_content(row)
+            if content:
+                reject_literal(content, field="import.content")
+                reject_literal(
+                    {"hindsight_query": q, "content_hash": _content_hash(content)},
+                    field="import.metadata",
+                )
+
+    for q, rows in recalled_batches:
+        stats["queries"] += 1
         for row in rows:
             stats["recalled"] += 1
             content = _extract_content(row)
@@ -529,6 +556,9 @@ def import_hindsight(
                 stats["skipped"] += 1
                 continue
             chash = _content_hash(content)
+            meta: dict[str, Any] = {"hindsight_query": q, "content_hash": chash}
+            reject_literal(content, field="import.content")
+            reject_literal(meta, field="import.metadata")
             if chash in seen_hashes:
                 stats["duplicates"] += 1
                 continue
@@ -575,10 +605,6 @@ def import_hindsight(
             else:
                 embedding = embedder.embed(content) if embedder else None
                 embed_model = getattr(embedder, "_model", None) if embedder else None
-                meta: dict[str, Any] = {
-                    "hindsight_query": q,
-                    "content_hash": chash,
-                }
                 mid = db.insert_memory(
                     content=content,
                     source="hindsight",
