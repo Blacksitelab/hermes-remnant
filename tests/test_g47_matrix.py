@@ -183,19 +183,23 @@ def test_memory_store_rejects_late_batch_without_side_effects(
 )
 def test_vault_rejects_late_content_without_mutating_seeded_state(
     tmp_path: Path, bad_part: str, relative_path: str, seed_index: int,
-    safe_literal: str, monkeypatch
+    safe_literal: str, caplog, capsys
 ):
     vault = tmp_path / "vault"
     note = vault / relative_path
     note.parent.mkdir(parents=True)
+    safe_body = ("Alice and Bob discussed a harmless project note. "
+                 "This deliberately contains enough ordinary text to create "
+                 "more than one passage in the configured vault index.\n\n"
+                 "## Second\nCarol recorded another harmless fact for the seed.\n")
     note.write_text("---\ntags: [safe, seeded]\ncustom:\n  nested: [one, two]\n---\n"
-                    "safe first passage\n\n## Second\nsafe second passage\n", encoding="utf-8")
+                    + safe_body, encoding="utf-8")
     db = open_db(tmp_path / "db.sqlite")
-    cfg = RemnantConfig(vault_path=str(vault))
+    cfg = RemnantConfig(vault_path=str(vault), vault_passage_chars=128)
     seed_emb = Embedder()
     try:
-        monkeypatch.setattr("remnant.vault.extract_and_link_entities", lambda *args, **kwargs: None)
         assert index_file(db, cfg, seed_emb, note)
+        assert len(db.get_vault_passages(relative_path, agent_id=cfg.agent_id)) > 1
         db.set_state("trust", {"seed": 0.91}, agent_id="alpha")
         db.set_state("seen", {"seed": 7}, agent_id="alpha")
         db.put_cached_embedding("seed-model", "seed-hash", [0.25])
@@ -203,34 +207,42 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
         db.insert_turn(
             session_id="seed-session", agent_id="alpha", user_text="u", assistant_text="a"
         )
+        caplog.clear()
         before = _db_digest(db)
         before_changes = db._conn.total_changes
         if bad_part == "passage":
-            body = f"safe first passage\n\n## Second\nlater value {safe_literal}"
+            body = (
+                "Alice and Bob discussed a harmless project note.\n\n"
+                f"## Second\nlater value {safe_literal}"
+            )
             frontmatter = "tags: [safe, seeded]\ncustom:\n  nested: [one, two]"
         elif bad_part == "tags":
-            body = "safe first passage\n\n## Second\nsafe second passage"
+            body = safe_body
             frontmatter = f"tags: [safe, {safe_literal}]\ncustom:\n  nested: [one, two]"
         elif bad_part == "metadata":
-            body = "safe first passage\n\n## Second\nsafe second passage"
+            body = safe_body
             frontmatter = f"tags: [safe, seeded]\ncustom:\n  nested: {safe_literal}"
         else:
-            body = "safe first passage\n\n## Second\nsafe second passage"
-            frontmatter = (
-                f"title: {safe_literal}\ntags: [safe, seeded]\n"
-                "custom:\n  nested: [one, two]"
-            )
+            body = ("Alice and Bob discussed a harmless project note. "
+                    "This prefix is intentionally long enough to be the safe first passage "
+                    "before the later title heading and its validation boundary. "
+                    "More harmless words keep the first passage independent.\n\n"
+                    f"# {safe_literal}\n")
+            frontmatter = "tags: [safe, seeded]\ncustom:\n  nested: [one, two]"
         note.write_text(f"---\n{frontmatter}\n---\n{body}", encoding="utf-8")
+        input_digest = hashlib.sha256(note.read_bytes()).hexdigest()
         emb = Embedder()
         with pytest.raises(SecretLikeContentError) as exc:
             index_file(db, cfg, emb, note)
         expected_field = {"passage": "vault.content", "tags": "vault.tags[1]",
                           "metadata": "vault.metadata.fm_custom.nested",
-                          "title": "vault.metadata.fm_title"}[bad_part]
+                          "title": "vault.metadata.title"}[bad_part]
         _assert_rejection(exc, expected_field)
         assert _db_digest(db) == before
         assert db._conn.total_changes == before_changes
         assert emb.calls == 0
+        assert hashlib.sha256(note.read_bytes()).hexdigest() == input_digest
+        assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
     finally:
         db.close()
 
