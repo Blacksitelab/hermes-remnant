@@ -306,7 +306,7 @@ _SECRET_FORMS = [
     (f"{keyword}-{separator or 'space'}", f"{keyword}{separator}{value}")
     for keyword in ("password", "token", "secret", "bearer", "authorization")
     for separator, value in ((" ", "hunter2"), (":", "abc"), ("=", "abc"))
-] + [("sk-redaction", "sk-abcdefghijkl"), ("url-credential", "https://u:p@example.com")]
+] + [("sk-redaction", "sk-synthetic-outcome-token-1234567890"), ("url-credential", "https://u:p@example.com")]
 
 
 @pytest.mark.parametrize("label,fact", _SECRET_FORMS, ids=lambda case: case[0])
