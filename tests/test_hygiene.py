@@ -4,6 +4,7 @@ import hashlib
 import json
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -33,7 +34,8 @@ class _Embedder:
 
 def _seed(path: Path):
     db = open_db(path)
-    owner = db.insert_memory(
+    owner = _legacy_memory(
+        db,
         content=f"A note containing {TOKEN}",
         agent="owner",
         source_id=f"note-{TOKEN}",
@@ -46,17 +48,27 @@ def _seed(path: Path):
         predicate="uses",
         object=f"object-{TOKEN}",
     )
-    pointer = db.insert_memory(
+    pointer = _legacy_memory(
+        db,
         content="The API key is held by the credential owner.",
         agent="owner",
     )
-    locked = db.insert_memory(
+    locked = _legacy_memory(
+        db,
         content=f"locked {TOKEN}",
         agent="owner",
         metadata={"locked": True, "token": TOKEN},
     )
-    foreign = db.insert_memory(content=f"foreign {TOKEN}", agent="other")
+    foreign = _legacy_memory(db, content=f"foreign {TOKEN}", agent="other")
     return db, owner, pointer, locked, foreign
+
+
+def _legacy_memory(db, *, content: str, agent: str, tags=None, metadata=None, source_id=None):
+    """Seed pre-guard rows while retaining normal SQLite/FTS trigger behavior."""
+    with patch("remnant.db.reject_literal"), patch("remnant.lifecycle.reject_literal"):
+        return db.insert_memory(
+            content=content, agent=agent, tags=tags, metadata=metadata, source_id=source_id
+        )
 
 
 def _operation(report: dict, memory_id: str, action: str, **extra):
@@ -119,7 +131,7 @@ def test_structured_keys_and_executable_identities_do_not_leak(tmp_path: Path):
 
     db = open_db(tmp_path / "identity.db")
     try:
-        memory_id = db.insert_memory(content="ordinary", agent="owner", metadata={TOKEN: "value"})
+        memory_id = _legacy_memory(db, content="ordinary", agent="owner", metadata={TOKEN: "value"})
         report = report_snapshot(db.path, "owner")
         rows = [row for row in report["rows"] if row["memory_id"] == memory_id]
         assert rows and all(TOKEN not in json.dumps(row) for row in rows)
@@ -224,7 +236,7 @@ def test_report_is_read_only_redacted_and_secure(tmp_path: Path):
 def test_report_snapshot_preserves_wal_delete_and_unsupported_sources(tmp_path: Path):
     wal_path = tmp_path / "wal.db"
     db = open_db(wal_path)
-    db.insert_memory(content=f"password {TOKEN}", agent="owner")
+    _legacy_memory(db, content=f"password {TOKEN}", agent="owner")
     active_before = _directory_state(tmp_path)
     report = report_snapshot(wal_path, "owner")
     assert report["counts"]["literal_findings"] == 1
@@ -292,9 +304,10 @@ def test_dry_run_and_audited_update_forget_merge(tmp_path: Path):
         assert dry["status"] == "dry-run"
         assert (db.memory_generation, len(db.list_audit())) == before
         receipt_dir = tmp_path / "update-receipts"
-        applied = apply_hygiene(
-            db.path, update_manifest, agent_id="owner", receipt_dir=receipt_dir
-        )
+        with patch("remnant.db.reject_literal"), patch("remnant.lifecycle.reject_literal"):
+            applied = apply_hygiene(
+                db.path, update_manifest, agent_id="owner", receipt_dir=receipt_dir
+            )
         assert applied["status"] == "applied"
         replacement = applied["receipts"][0]["replacement_id"]
         receipt_files = list(receipt_dir.glob("*.json"))
@@ -312,7 +325,8 @@ def test_dry_run_and_audited_update_forget_merge(tmp_path: Path):
             operations=[_operation(report, pointer, "forget")],
             report_manifest_path=report_manifest,
         )
-        forgotten = apply_hygiene(db.path, forget_manifest, agent_id="owner")
+        with patch("remnant.db.reject_literal"), patch("remnant.lifecycle.reject_literal"):
+            forgotten = apply_hygiene(db.path, forget_manifest, agent_id="owner")
         assert forgotten["status"] == "applied"
         assert db.get_memory(pointer)["status"] == "forgotten"
         replayed_forget = apply_hygiene(db.path, forget_manifest, agent_id="owner")
@@ -325,10 +339,12 @@ def test_dry_run_and_audited_update_forget_merge(tmp_path: Path):
 def test_approved_merge_uses_existing_lifecycle_projections(tmp_path: Path):
     db = open_db(tmp_path / "merge.db")
     try:
-        first = db.insert_memory(
+        first = _legacy_memory(
+            db,
             content="api_key=sk-" + "proj-MergeFixture1234567890", agent="owner"
         )
-        second = db.insert_memory(
+        second = _legacy_memory(
+            db,
             content="token=tok-MergeFixture1234567890", agent="owner"
         )
         report = report_snapshot(db.path, "owner")
@@ -443,10 +459,10 @@ def test_stale_foreign_locked_and_concurrent_rows_stop_without_replay(tmp_path: 
 def test_batch_counts_distinguish_noop_conflict_and_stopped_tail(tmp_path: Path):
     db = open_db(tmp_path / "counts.db")
     try:
-        noop_id = db.insert_memory(content=f"noop {TOKEN}", agent="owner")
-        applied_id = db.insert_memory(content=f"apply {TOKEN}", agent="owner")
-        conflict_id = db.insert_memory(content=f"conflict {TOKEN}", agent="owner")
-        tail_id = db.insert_memory(content=f"tail {TOKEN}", agent="owner")
+        noop_id = _legacy_memory(db, content=f"noop {TOKEN}", agent="owner")
+        applied_id = _legacy_memory(db, content=f"apply {TOKEN}", agent="owner")
+        conflict_id = _legacy_memory(db, content=f"conflict {TOKEN}", agent="owner")
+        tail_id = _legacy_memory(db, content=f"tail {TOKEN}", agent="owner")
         report = report_snapshot(db.path, "owner")
         report_manifest = _report_manifest(report, tmp_path, "counts-report")
         operations = [
@@ -496,8 +512,9 @@ def test_crash_after_commit_reconciles_audit_without_duplicate(tmp_path: Path, m
             "_write_receipt",
             lambda *_args: (_ for _ in ()).throw(RuntimeError("crash")),
         )
-        with pytest.raises(RuntimeError, match="crash"):
-            apply_hygiene(db.path, manifest, agent_id="owner", receipt_dir=receipt_dir)
+        with patch("remnant.db.reject_literal"), patch("remnant.lifecycle.reject_literal"):
+            with pytest.raises(RuntimeError, match="crash"):
+                apply_hygiene(db.path, manifest, agent_id="owner", receipt_dir=receipt_dir)
         monkeypatch.setattr(hygiene, "_write_receipt", original)
         replay = apply_hygiene(db.path, manifest, agent_id="owner", receipt_dir=receipt_dir)
         assert replay["status"] == "applied"
@@ -512,10 +529,10 @@ def test_commit_before_receipt_reconciles_forget_update_and_merge(
 ):
     db = open_db(tmp_path / "crash-all.db")
     try:
-        forget_id = db.insert_memory(content=f"forget {TOKEN}", agent="owner")
-        update_id = db.insert_memory(content=f"update {TOKEN}", agent="owner")
-        merge_a = db.insert_memory(content=f"merge-a {TOKEN}", agent="owner")
-        merge_b = db.insert_memory(content=f"merge-b {TOKEN}", agent="owner")
+        forget_id = _legacy_memory(db, content=f"forget {TOKEN}", agent="owner")
+        update_id = _legacy_memory(db, content=f"update {TOKEN}", agent="owner")
+        merge_a = _legacy_memory(db, content=f"merge-a {TOKEN}", agent="owner")
+        merge_b = _legacy_memory(db, content=f"merge-b {TOKEN}", agent="owner")
         report = report_snapshot(db.path, "owner")
         report_manifest = _report_manifest(report, tmp_path, "crash-all-report")
         rows = {row["memory_id"]: row for row in report["rows"]}
@@ -660,7 +677,7 @@ def test_report_binding_rejects_missing_tampered_and_unreported_evidence(
         with pytest.raises(HygieneValidationError):
             apply_hygiene(db.path, fabricated, agent_id="owner")
 
-        unreported = db.insert_memory(content=f"unreported {TOKEN}", agent="owner")
+        unreported = _legacy_memory(db, content=f"unreported {TOKEN}", agent="owner")
         unreported_manifest = dict(manifest)
         unreported_manifest["operations"] = [
             {
