@@ -135,16 +135,26 @@ def _counts(db):
     )
 
 
+def _rows(db, table, where="", params=()):
+    return [dict(row) for row in db._conn.execute(f"SELECT * FROM {table} {where}", params)]
+
+
 def test_outcome_receipt_survives_hard_delete_and_replay_is_missing(tmp_path: Path):
     db = open_db(tmp_path / "missing.db")
     try:
         config = RemnantConfig(agent_id="owner")
         result = store_outcome(db, config, operation_id="op", fact="durable fact")
+        receipt = db.get_memory_operation(agent="owner", operation_id="op")
+        assert receipt is not None
+        assert db.get_memory(result["memory_id"]) is not None
         assert db.hard_delete_memory(result["memory_id"])
-        before = _counts(db)
+        before = {table: _rows(db, table) for table in ("audit_log", "memory_operations")}
+        counts = _counts(db)
         with pytest.raises(ValueError, match="^operation target missing$"):
             store_outcome(db, config, operation_id="op", fact="durable fact")
-        assert _counts(db) == before
+        assert _counts(db) == counts
+        assert {table: _rows(db, table) for table in before} == before
+        assert db.get_memory_operation(agent="owner", operation_id="op") == receipt
     finally:
         db.close()
 
@@ -154,18 +164,33 @@ def test_outcome_replay_conflict_and_malformed_embedding_are_durable(tmp_path: P
     config = RemnantConfig(agent_id="owner")
     try:
         first = store_outcome(db, config, operation_id="op", fact="same", embedding=[1.0])
+        snapshots = {
+            table: _rows(db, table) for table in ("memories", "audit_log", "memory_operations")
+        }
         counts = _counts(db)
         assert (
             store_outcome(db, config, operation_id="op", fact="same", embedding=[1.0])["status"]
             == "already_stored"
         )
         assert _counts(db) == counts
+        assert {table: _rows(db, table) for table in snapshots} == snapshots
         with pytest.raises(ValueError, match="^operation conflict$"):
             store_outcome(db, config, operation_id="op", fact="different")
         assert _counts(db) == counts
         malformed = store_outcome(
             db, config, operation_id="bad-embedding", fact="lexical", embedding=[float("nan")]
         )
+        lexical = db.get_memory(malformed["memory_id"])
+        assert lexical is not None
+        assert lexical["content"] == "lexical"
+        malformed_receipt = db.get_memory_operation(agent="owner", operation_id="bad-embedding")
+        assert malformed_receipt is not None
+        assert malformed_receipt["memory_id"] == malformed["memory_id"]
+        assert malformed_receipt["agent"] == "owner"
+        audit = db.list_audit()
+        creation = next(row for row in audit if row["memory_id"] == malformed["memory_id"])
+        assert creation["action"] == "create"
+        assert creation["details"]["operation_id"] == "bad-embedding"
         assert (
             db._conn.execute(
                 "SELECT COUNT(*) FROM embeddings WHERE memory_id=?", (malformed["memory_id"],)
@@ -242,35 +267,43 @@ def test_same_operation_id_isolated_by_owner_and_outcome_shape(tmp_path: Path):
             "conversation",
         }
         assert row["metadata"] == {"k": "v"}
-        for table in ("claims", "memory_entities", "relation_evidence"):
-            assert (
-                db._conn.execute(
-                    f"SELECT COUNT(*) FROM {table} WHERE memory_id=?", (a["memory_id"],)
-                ).fetchone()[0]
-                == 0
-            )
+        for table in ("entities", "relations", "memory_entities", "relation_evidence", "claims"):
+            assert _rows(db, table) == []
+        assert _rows(db, "relations", "WHERE source_memory_id IS NOT NULL") == []
     finally:
         db.close()
 
 
 @pytest.mark.parametrize(
-    "value",
+    "fact,metadata",
     [
-        "password hunter2",
-        "token: abc",
-        "secret=abc",
-        "Bearer abc",
-        "authorization abc",
-        "sk-abcdefghijkl",
-        "https://user:pass@example.com",
+        ("password hunter2", {"safe": "ok"}),
+        ("token: abc", {"safe": "ok"}),
+        ("secret=abc", {"safe": "ok"}),
+        ("Bearer abc", {"safe": "ok"}),
+        ("authorization abc", {"safe": "ok"}),
+        ("sk-abcdefghijkl", {"safe": "ok"}),
+        ("https://user:pass@example.com", {"safe": "ok"}),
+        ("safe", {"nested": {"password": "abc"}}),
+        ("safe", {"nested": {"token": "abc"}}),
+        ("safe", {"nested": {"secret": "abc"}}),
+        ("safe", {"nested": {"bearer": "abc"}}),
+        ("safe", {"nested": {"authorization": "abc"}}),
+        ("safe", {"nested": {"credential": "https://u:p@example.com"}}),
     ],
 )
-def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, value: str):
+def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, fact: str, metadata: dict):
     db = open_db(tmp_path / "secrets.db")
     try:
         with pytest.raises(ValueError, match="^outcome rejected$") as exc:
-            store_outcome(db, RemnantConfig(agent_id="owner"), operation_id="op", fact=value)
+            store_outcome(
+                db,
+                RemnantConfig(agent_id="owner"),
+                operation_id="op",
+                fact=fact,
+                metadata=metadata,
+            )
         assert "sentinel" not in str(exc.value).lower()
-        assert _counts(db)[::2] == (0, 0)
+        assert _counts(db) == (0, 0, 0)
     finally:
         db.close()
