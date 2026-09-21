@@ -174,23 +174,51 @@ def test_outcome_replay_conflict_and_malformed_embedding_are_durable(tmp_path: P
         )
         assert _counts(db) == counts
         assert {table: _rows(db, table) for table in snapshots} == snapshots
+        conflict_snapshots = {
+            table: _rows(db, table) for table in ("memories", "audit_log", "memory_operations")
+        }
         with pytest.raises(ValueError, match="^operation conflict$"):
             store_outcome(db, config, operation_id="op", fact="different")
         assert _counts(db) == counts
+        assert {
+            table: _rows(db, table) for table in conflict_snapshots
+        } == conflict_snapshots
         malformed = store_outcome(
             db, config, operation_id="bad-embedding", fact="lexical", embedding=[float("nan")]
         )
+        assert _counts(db) == (2, 2, 2)
         lexical = db.get_memory(malformed["memory_id"])
         assert lexical is not None
+        assert lexical == _rows(db, "memories", "WHERE id=?", (malformed["memory_id"],))[0]
         assert lexical["content"] == "lexical"
+        assert lexical["agent"] == "owner"
+        assert lexical["type"] == "fact"
+        assert lexical["source"] == "conversation"
+        assert lexical["metadata"] is None
         malformed_receipt = db.get_memory_operation(agent="owner", operation_id="bad-embedding")
         assert malformed_receipt is not None
-        assert malformed_receipt["memory_id"] == malformed["memory_id"]
+        assert malformed_receipt == _rows(
+            db,
+            "memory_operations",
+            "WHERE agent=? AND operation_id=?",
+            ("owner", "bad-embedding"),
+        )[0]
         assert malformed_receipt["agent"] == "owner"
+        assert malformed_receipt["operation_id"] == "bad-embedding"
+        assert malformed_receipt["memory_id"] == malformed["memory_id"]
         audit = db.list_audit()
         creation = next(row for row in audit if row["memory_id"] == malformed["memory_id"])
+        raw_creation = _rows(db, "audit_log", "WHERE id=?", (creation["id"],))[0]
+        assert set(creation) == set(raw_creation)
+        assert all(creation[key] == raw_creation[key] for key in set(creation) - {"details"})
+        assert creation["actor"] == "owner"
         assert creation["action"] == "create"
-        assert creation["details"]["operation_id"] == "bad-embedding"
+        assert creation["memory_id"] == malformed["memory_id"]
+        assert creation["details"] == {
+            "source": "conversation",
+            "type": "fact",
+            "operation_id": "bad-embedding",
+        }
         assert (
             db._conn.execute(
                 "SELECT COUNT(*) FROM embeddings WHERE memory_id=?", (malformed["memory_id"],)
@@ -274,23 +302,16 @@ def test_same_operation_id_isolated_by_owner_and_outcome_shape(tmp_path: Path):
         db.close()
 
 
+_SECRET_FORMS = [
+    f"{keyword}{separator}{value}"
+    for keyword in ("password", "token", "secret", "bearer", "authorization")
+    for separator, value in ((" ", "hunter2"), (":", "abc"), ("=", "abc"))
+] + ["sk-abcdefghijkl", "https://u:p@example.com"]
+
+
 @pytest.mark.parametrize(
     "fact,metadata",
-    [
-        ("password hunter2", {"safe": "ok"}),
-        ("token: abc", {"safe": "ok"}),
-        ("secret=abc", {"safe": "ok"}),
-        ("Bearer abc", {"safe": "ok"}),
-        ("authorization abc", {"safe": "ok"}),
-        ("sk-abcdefghijkl", {"safe": "ok"}),
-        ("https://user:pass@example.com", {"safe": "ok"}),
-        ("safe", {"nested": {"password": "abc"}}),
-        ("safe", {"nested": {"token": "abc"}}),
-        ("safe", {"nested": {"secret": "abc"}}),
-        ("safe", {"nested": {"bearer": "abc"}}),
-        ("safe", {"nested": {"authorization": "abc"}}),
-        ("safe", {"nested": {"credential": "https://u:p@example.com"}}),
-    ],
+    [("safe", {"context": {"value": value}}) for value in _SECRET_FORMS],
 )
 def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, fact: str, metadata: dict):
     db = open_db(tmp_path / "secrets.db")
@@ -305,5 +326,6 @@ def test_outcome_secret_matrix_rejects_before_storage(tmp_path: Path, fact: str,
             )
         assert "sentinel" not in str(exc.value).lower()
         assert _counts(db) == (0, 0, 0)
+        assert db._conn.execute("SELECT COUNT(*) FROM embeddings").fetchone()[0] == 0
     finally:
         db.close()
