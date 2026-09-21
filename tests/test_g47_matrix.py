@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 from pathlib import Path
 from unittest.mock import Mock
@@ -64,6 +65,12 @@ def _assert_rejection(exc, field):
     assert exc.value.field == field
 
 
+def _assert_quiet(caplog, capsys):
+    caplog.set_level(logging.DEBUG)
+    captured = capsys.readouterr()
+    assert not caplog.records and not captured.out and not captured.err
+
+
 def _db_digest(db) -> str:
     conn = db._conn
     objects = conn.execute(
@@ -112,8 +119,7 @@ def test_memory_store_rejects_persisted_metadata_literal_before_output(
     assert db.mock_calls == [] and emb.calls == 0
     assert extract.call_count == shadow.call_count == 0
     assert not (tmp_path / "remnant" / "shadow.log").exists()
-    captured = capsys.readouterr()
-    assert not caplog.records and not captured.out and not captured.err
+    _assert_quiet(caplog, capsys)
 
 
 def test_hindsight_rejects_credential_like_query_before_side_effects(
@@ -121,9 +127,18 @@ def test_hindsight_rejects_credential_like_query_before_side_effects(
 ):
     import remnant.import_sources as sources
 
+    calls = []
+    extract = Mock(side_effect=AssertionError("entity extraction reached"))
+    shadow = Mock(side_effect=AssertionError("shadow writer reached"))
+    monkeypatch.setattr(sources, "extract_and_link_entities", extract)
+    monkeypatch.setattr(sources, "write_shadow_log", shadow)
+
+    def recall(query, *, limit, bank_id):
+        calls.append((query, bank_id, limit))
+        return [{"content": "safe hindsight fact"}]
+
     monkeypatch.setattr(
-        sources, "_hindsight_recall",
-        lambda query, *, limit, bank_id: [{"content": "safe hindsight fact"}],
+        sources, "_hindsight_recall", recall,
     )
     db, emb = _rejecting_db(), Embedder()
     with pytest.raises(SecretLikeContentError) as exc:
@@ -133,9 +148,11 @@ def test_hindsight_rejects_credential_like_query_before_side_effects(
             hermes_home=tmp_path / "hermes", **import_mode,
         )
     _assert_rejection(exc, "import.query")
+    assert calls == [("safe query", "hermes-alpha", sources.HINDSIGHT_QUERY_LIMIT)]
+    assert extract.call_count == shadow.call_count == 0
     assert db.mock_calls == [] and emb.calls == 0
     assert not (tmp_path / "hermes" / "remnant" / "shadow.log").exists()
-    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
+    _assert_quiet(caplog, capsys)
 
 
 def test_exempt_memory_path_still_rejects_explicit_credential(tmp_path: Path):
@@ -167,8 +184,13 @@ def test_vault_rejection_leaves_index_unchanged_and_skips_embedding(tmp_path: Pa
 
 
 def test_memory_store_rejects_late_batch_without_side_effects(
-    tmp_path: Path, import_mode, safe_literal, caplog, capsys
+    tmp_path: Path, import_mode, safe_literal, caplog, capsys, monkeypatch
 ):
+    import remnant.import_sources as sources
+    extract = Mock(side_effect=AssertionError("entity extraction reached"))
+    shadow = Mock(side_effect=AssertionError("shadow writer reached"))
+    monkeypatch.setattr(sources, "extract_and_link_entities", extract)
+    monkeypatch.setattr(sources, "write_shadow_log", shadow)
     _profile(tmp_path, f"- safe fact\n- late {safe_literal}\n")
     db, emb = _rejecting_db(), Embedder()
     with pytest.raises(SecretLikeContentError) as exc:
@@ -177,8 +199,9 @@ def test_memory_store_rejects_late_batch_without_side_effects(
         )
     _assert_rejection(exc, "import.content")
     assert db.mock_calls == [] and emb.calls == 0
+    assert extract.call_count == shadow.call_count == 0
     assert not (tmp_path / "remnant" / "shadow.log").exists()
-    assert not caplog.records and not capsys.readouterr().out and not capsys.readouterr().err
+    _assert_quiet(caplog, capsys)
 
 
 @pytest.mark.parametrize(
@@ -291,9 +314,13 @@ def test_vault_rejects_late_content_without_mutating_seeded_state(
 
 
 def test_hindsight_rejects_late_content_before_side_effects(
-    tmp_path: Path, monkeypatch, import_mode, safe_literal
+    tmp_path: Path, monkeypatch, import_mode, safe_literal, caplog, capsys
 ):
     import remnant.import_sources as sources
+    extract = Mock(side_effect=AssertionError("entity extraction reached"))
+    shadow = Mock(side_effect=AssertionError("shadow writer reached"))
+    monkeypatch.setattr(sources, "extract_and_link_entities", extract)
+    monkeypatch.setattr(sources, "write_shadow_log", shadow)
 
     def recall(query, *, limit, bank_id):
         return [{"content": "safe"}] if query == "safe" else [
@@ -308,18 +335,26 @@ def test_hindsight_rejects_late_content_before_side_effects(
             queries=["safe", "late"], hermes_home=home, **import_mode
         )
     _assert_rejection(exc, "import.content")
+    assert extract.call_count == shadow.call_count == 0
     assert db.mock_calls == [] and emb.calls == 0 and not (home / "remnant" / "shadow.log").exists()
+    _assert_quiet(caplog, capsys)
 
 
 def test_hindsight_rejects_nested_recalled_metadata_before_side_effects(
-    tmp_path: Path, monkeypatch, import_mode, safe_literal
+    tmp_path: Path, monkeypatch, import_mode, safe_literal, caplog, capsys
 ):
     import remnant.import_sources as sources
+
+    extract = Mock(side_effect=AssertionError("entity extraction reached"))
+    shadow = Mock(side_effect=AssertionError("shadow writer reached"))
+    monkeypatch.setattr(sources, "extract_and_link_entities", extract)
+    monkeypatch.setattr(sources, "write_shadow_log", shadow)
 
     monkeypatch.setattr(
         sources,
         "_hindsight_recall",
         lambda query, *, limit, bank_id: [
+            {"content": "safe earlier row"},
             {"content": "safe", "metadata": {"outer": [{"value": safe_literal}]}}
         ],
     )
@@ -330,10 +365,15 @@ def test_hindsight_rejects_nested_recalled_metadata_before_side_effects(
             hermes_home=tmp_path / "hermes", **import_mode
         )
     _assert_rejection(exc, "import.recalled_metadata.outer[0].value")
+    assert extract.call_count == shadow.call_count == 0
     assert db.mock_calls == [] and emb.calls == 0
+    assert not (tmp_path / "hermes" / "remnant" / "shadow.log").exists()
+    _assert_quiet(caplog, capsys)
 
 
-def test_store_memory_rejects_nested_caller_metadata_before_db_or_embedding(safe_literal):
+def test_store_memory_rejects_nested_caller_metadata_before_db_or_embedding(
+    safe_literal, caplog, capsys
+):
     db, emb = _rejecting_db(), Embedder()
     with pytest.raises(SecretLikeContentError) as exc:
         store_memory(
@@ -343,3 +383,4 @@ def test_store_memory_rejects_nested_caller_metadata_before_db_or_embedding(safe
         )
     _assert_rejection(exc, "metadata.outer[0].value")
     assert db.mock_calls == [] and emb.calls == 0
+    _assert_quiet(caplog, capsys)
